@@ -196,6 +196,8 @@ fn request_permission_for(
         | ("GET", "/api/v1/metadata")
         | ("GET" | "POST", "/api/v1/query_exemplars")
         | ("POST", "/api/v1/read")
+        | ("POST", "/api/v1/select")
+        | ("POST", "/api/v1/select_points")
         | ("GET", "/api/v1/status/tsdb") => {
             Some(RbacPermission::new(RbacAction::Read, tenant_id()?))
         }
@@ -408,7 +410,32 @@ mod tests {
             );
         }
 
-        // Task 5 extends this table with the read routes (`/api/v1/select`,
-        // `/api/v1/select_points`).
+        let read_routes = [
+            ("POST", "/api/v1/select"),
+            ("POST", "/api/v1/select_points"),
+        ];
+        for (method, path) in read_routes {
+            let permission = request_permission_for(&permission_request(method, path, None), false)
+                .expect("permission lookup should succeed")
+                .expect("read route must be registered in the RBAC path table");
+            assert_eq!(
+                permission,
+                RbacPermission::new(
+                    RbacAction::Read,
+                    RbacResource::tenant(tenant::DEFAULT_TENANT_ID)
+                ),
+                "{method} {path} must require the tenant read permission"
+            );
+
+            let permission =
+                request_permission_for(&permission_request(method, path, Some("team-a")), false)
+                    .expect("permission lookup should succeed")
+                    .expect("read route must be registered in the RBAC path table");
+            assert_eq!(
+                permission,
+                RbacPermission::new(RbacAction::Read, RbacResource::tenant("team-a")),
+                "{method} {path} must be scoped to the requesting tenant"
+            );
+        }
     }
 }

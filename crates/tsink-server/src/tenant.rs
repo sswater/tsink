@@ -1056,6 +1056,8 @@ pub fn public_request_access(request: &HttpRequest) -> Option<TenantAccessScope>
         | "/api/v1/metadata"
         | "/api/v1/query_exemplars"
         | "/api/v1/read"
+        | "/api/v1/select"
+        | "/api/v1/select_points"
         | "/api/v1/status/tsdb" => Some(TenantAccessScope::Read),
         "/api/v1/write"
         | "/api/v1/rows"
@@ -1658,6 +1660,58 @@ impl Storage for TenantScopedStorage {
         }
     }
 
+    fn select_desc(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        limit: usize,
+    ) -> TsinkResult<Vec<DataPoint>> {
+        let scoped_labels = self.scoped_labels(labels)?;
+        match self
+            .inner
+            .select_desc(metric, &scoped_labels, start, end, limit)
+        {
+            Ok(points) => {
+                if !points.is_empty() || !self.is_default_tenant() {
+                    Ok(points)
+                } else {
+                    self.inner.select_desc(metric, labels, start, end, limit)
+                }
+            }
+            Err(TsinkError::NoDataPoints { .. }) if self.is_default_tenant() => {
+                self.inner.select_desc(metric, labels, start, end, limit)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn select_at_timestamps(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        timestamps: &[i64],
+    ) -> TsinkResult<Vec<DataPoint>> {
+        let scoped_labels = self.scoped_labels(labels)?;
+        match self
+            .inner
+            .select_at_timestamps(metric, &scoped_labels, timestamps)
+        {
+            Ok(points) => {
+                if !points.is_empty() || !self.is_default_tenant() {
+                    Ok(points)
+                } else {
+                    self.inner.select_at_timestamps(metric, labels, timestamps)
+                }
+            }
+            Err(TsinkError::NoDataPoints { .. }) if self.is_default_tenant() => {
+                self.inner.select_at_timestamps(metric, labels, timestamps)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn select_all(
         &self,
         metric: &str,
@@ -1957,6 +2011,24 @@ mod tests {
             public_request_access(&request),
             Some(TenantAccessScope::Write)
         );
+    }
+
+    #[test]
+    fn public_request_access_registers_select_endpoints_as_read() {
+        for path in ["/api/v1/select", "/api/v1/select_points"] {
+            let request = HttpRequest {
+                method: "POST".to_string(),
+                path: path.to_string(),
+                headers: HashMap::new(),
+                body: Vec::new(),
+            };
+
+            assert_eq!(
+                public_request_access(&request),
+                Some(TenantAccessScope::Read),
+                "{path} must participate in tenant read scoping"
+            );
+        }
     }
 
     #[test]

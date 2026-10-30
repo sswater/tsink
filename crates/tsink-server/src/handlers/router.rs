@@ -204,7 +204,9 @@ pub(super) async fn route_request(
             )
             .await
         }
-        ("POST", "/api/v1/rows") if cluster_context.is_some() => cluster_mode_rows_response(),
+        ("POST", "/api/v1/rows") if cluster_context.is_some() => {
+            cluster_mode_unsupported_response()
+        }
         ("POST", "/api/v1/rows") => {
             handle_rows_write(
                 storage,
@@ -215,6 +217,25 @@ pub(super) async fn route_request(
                 usage_accounting,
             )
             .await
+        }
+        ("POST", "/api/v1/select") if cluster_context.is_some() => {
+            cluster_mode_unsupported_response()
+        }
+        ("POST", "/api/v1/select") => {
+            handle_rows_select(
+                storage,
+                &request,
+                timestamp_precision,
+                cluster_context,
+                &public_read_context,
+            )
+            .await
+        }
+        ("POST", "/api/v1/select_points") if cluster_context.is_some() => {
+            cluster_mode_unsupported_response()
+        }
+        ("POST", "/api/v1/select_points") => {
+            handle_rows_select_points(storage, &request, timestamp_precision, cluster_context).await
         }
         ("POST", "/v1/metrics") => {
             handle_otlp_metrics(
@@ -679,9 +700,10 @@ fn label_values_path(path: &str) -> Option<&str> {
 }
 
 /// Shared guard for the row-level bytes API: routing rows in cluster mode
-/// would silently write/read the local shard, so all row endpoints fail loudly
-/// instead (spec §2 非目标). Reused by the select endpoints.
-fn cluster_mode_rows_response() -> HttpResponse {
+/// would silently write/read the local shard, so all three row endpoints
+/// (`/api/v1/rows`, `/api/v1/select`, `/api/v1/select_points`) fail loudly
+/// instead (spec §2 非目标). The response bytes are identical for all three.
+pub(super) fn cluster_mode_unsupported_response() -> HttpResponse {
     text_response(501, "row endpoints are not supported in cluster mode")
 }
 

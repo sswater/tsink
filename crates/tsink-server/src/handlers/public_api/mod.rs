@@ -3,6 +3,7 @@ mod metadata;
 mod promql;
 mod remote_read;
 mod rows;
+mod select;
 pub(crate) mod typed_value;
 
 #[cfg(test)]
@@ -20,9 +21,7 @@ pub(super) use self::promql::handle_instant_query_with_admission;
 pub(super) use self::promql::{handle_instant_query, handle_query_exemplars, handle_range_query};
 pub(super) use self::remote_read::handle_remote_read;
 pub(super) use self::rows::handle_rows_write;
-// Consumed by the select handlers added in Task 5.
-#[allow(unused_imports)]
-pub(crate) use self::typed_value::{from_tsink_value, MAX_LIMIT, MAX_TIMESTAMPS};
+pub(super) use self::select::{handle_rows_select, handle_rows_select_points};
 
 #[cfg(test)]
 mod tests {
