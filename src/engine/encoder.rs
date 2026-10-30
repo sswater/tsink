@@ -29,7 +29,7 @@ pub struct EncodedChunk {
     pub payload: Vec<u8>,
 }
 
-const TIMESTAMP_SEARCH_BLOCK_POINTS: usize = 64;
+pub(crate) const TIMESTAMP_SEARCH_BLOCK_POINTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TimestampSearchIndex {

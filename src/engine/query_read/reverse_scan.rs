@@ -1,14 +1,13 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::engine::encoder::{Encoder, TimestampSearchIndex};
+use parking_lot::RwLockReadGuard;
+
+use crate::engine::encoder::{Encoder, TimestampSearchIndex, TIMESTAMP_SEARCH_BLOCK_POINTS};
 use crate::validation::{validate_labels, validate_metric};
 use crate::{DataPoint, Label, Result, TsinkError};
 
 use super::super::state::ActivePartitionSnapshot;
 use super::*;
-
-const TIMESTAMP_SEARCH_BLOCK_POINTS: usize = 64;
 
 /// Relative freshness of a chunk source. Active in-memory heads are always newer
 /// than the sealed copy of the same chunk, which is newer than persisted copies.
@@ -21,12 +20,15 @@ pub(super) enum SourceRecency {
 
 /// One candidate chunk (or active partition head) overlapping the query window.
 ///
-/// Bound metadata comes from chunk headers / active snapshots, so ordering the
-/// candidates never decodes a chunk.
+/// `max_ts` is the candidate's **latest in-window timestamp**, not merely the
+/// chunk header maximum: when a chunk straddles `end`, collection peeks at the
+/// tail block to find the actual newest point below `end`. This keeps the global
+/// ordering honest without decoding any values.
 pub(super) struct ChunkCandidate {
     pub max_ts: i64,
     pub recency: SourceRecency,
     sequence: u64,
+    peeked: bool,
     pub(super) source: CandidateSource,
 }
 
@@ -36,18 +38,21 @@ pub(super) enum CandidateSource {
     Active(ActivePartitionSnapshot),
 }
 
-/// Honest work counters for a reverse scan. `points_decoded` counts only points
-/// whose values were actually materialized, not candidates that were only ordered.
+/// Honest work counters for a reverse scan. `points_decoded` counts every point
+/// whose value was materialized (before any output truncation), not only the
+/// points that survive `limit`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReverseScanStats {
     pub chunks_touched: usize,
     pub points_decoded: usize,
 }
 
-#[derive(Default)]
-pub(super) struct DescScanSnapshot {
+/// Candidate snapshot plus the persisted-index read guard that keeps captured
+/// chunk refs and their lazily built timestamp indexes alive for the whole scan.
+pub(super) struct DescScanSnapshot<'a> {
     pub(super) candidates: Vec<ChunkCandidate>,
-    pub(super) segment_maps: HashMap<usize, Arc<PlatformMmap>>,
+    pub(super) persisted_index: RwLockReadGuard<'a, PersistedIndexState>,
+    peeked_chunks: usize,
 }
 
 impl ChunkStorage {
@@ -105,17 +110,24 @@ impl ChunkStorage {
         limit: usize,
         plan: TieredQueryPlan,
     ) -> Result<(Vec<DataPoint>, ReverseScanStats)> {
-        let mut out = Vec::new();
-        let mut stats = ReverseScanStats::default();
-        if limit == 0 || start >= end {
-            return Ok((out, stats));
+        if start >= end {
+            return Err(TsinkError::InvalidTimeRange { start, end });
+        }
+        if limit == 0 {
+            return Ok((Vec::new(), ReverseScanStats::default()));
         }
 
         let snapshot = self.collect_candidates(series_id, start, end, plan)?;
         if snapshot.candidates.is_empty() {
-            return Ok((out, stats));
+            return Ok((Vec::new(), ReverseScanStats::default()));
         }
 
+        let mut out = Vec::new();
+        let mut stats = ReverseScanStats {
+            // Candidates already peeked during ordering were touched once there.
+            chunks_touched: snapshot.peeked_chunks,
+            points_decoded: 0,
+        };
         let retention_cutoff = self.active_retention_cutoff();
         let mut seen_timestamps = HashSet::with_capacity(limit.min(4096));
         self.tombstone_read_context().with_series_tombstone_ranges(
@@ -157,53 +169,27 @@ impl ChunkStorage {
     }
 
     /// Collects every persisted, sealed, and active source overlapping `[start, end)`
-    /// and orders them by `(max_ts desc, recency desc, sequence desc)`.
+    /// and orders them by `(latest-in-window ts desc, recency desc, sequence desc)`.
+    ///
+    /// Enumeration itself is header/metadata based: a wide window may visit every
+    /// overlapping chunk to build the candidate list. Spec §5.1 accepts this cost
+    /// (metadata enumeration is parked); INV-1 bounds the number of chunks and
+    /// values actually decoded, which stays independent of window width.
+    ///
+    /// The persisted-index read guard is captured in the snapshot so the lazily
+    /// cached timestamp index cannot disappear between collection and decode while
+    /// captured segment payloads are still readable.
     pub(super) fn collect_candidates(
         &self,
         series_id: SeriesId,
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
-    ) -> Result<DescScanSnapshot> {
+    ) -> Result<DescScanSnapshot<'_>> {
         let context = self.query_snapshot_context();
-        let _visibility_guard = context.visibility_read_fence();
-        let mut snapshot = DescScanSnapshot::default();
-
-        {
-            let persisted_index = context.persisted_index.read();
-            let mut segment_slots = BTreeSet::<usize>::new();
-            if let Some(chunks) = persisted_index.chunk_refs.get(&series_id) {
-                let end_idx = chunks.partition_point(|chunk| chunk.min_ts < end);
-                for chunk_ref in &chunks[..end_idx] {
-                    if chunk_ref.max_ts < start {
-                        continue;
-                    }
-                    let tier = persisted_index
-                        .segment_tiers
-                        .get(&chunk_ref.segment_slot)
-                        .copied()
-                        .unwrap_or(PersistedSegmentTier::Hot);
-                    if !ChunkStorage::plan_includes_persisted_tier(plan, tier) {
-                        continue;
-                    }
-
-                    segment_slots.insert(chunk_ref.segment_slot);
-                    snapshot.candidates.push(ChunkCandidate {
-                        max_ts: chunk_ref.max_ts,
-                        recency: SourceRecency::Persisted,
-                        sequence: chunk_ref.sequence,
-                        source: CandidateSource::Persisted(*chunk_ref),
-                    });
-                }
-            }
-
-            for slot in segment_slots {
-                let segment_map = persisted_index.segment_maps.get(&slot).ok_or_else(|| {
-                    TsinkError::DataCorruption(format!("missing mapped segment slot {slot}"))
-                })?;
-                snapshot.segment_maps.insert(slot, Arc::clone(segment_map));
-            }
-        }
+        let visibility_guard = context.visibility_read_fence();
+        let mut candidates = Vec::new();
+        let mut peeked_chunks = 0usize;
 
         {
             let sealed = context.chunks.sealed_shard(series_id).read();
@@ -213,10 +199,21 @@ impl ChunkStorage {
                     if chunk.header.max_ts < start {
                         continue;
                     }
-                    snapshot.candidates.push(ChunkCandidate {
-                        max_ts: chunk.header.max_ts,
+                    let (max_ts, peeked) = if chunk.header.max_ts < end {
+                        (chunk.header.max_ts, false)
+                    } else {
+                        let Some(max_ts) = self.latest_sealed_in_window_ts(chunk, start, end)?
+                        else {
+                            continue;
+                        };
+                        peeked_chunks = peeked_chunks.saturating_add(1);
+                        (max_ts, true)
+                    };
+                    candidates.push(ChunkCandidate {
+                        max_ts,
                         recency: SourceRecency::Sealed,
                         sequence: key.sequence,
+                        peeked,
                         source: CandidateSource::Sealed(Arc::clone(chunk)),
                     });
                 }
@@ -245,10 +242,11 @@ impl ChunkStorage {
                         max_ts = max_ts.max(point.ts);
                     }
 
-                    snapshot.candidates.push(ChunkCandidate {
+                    candidates.push(ChunkCandidate {
                         max_ts,
                         recency: SourceRecency::Active,
                         sequence: u64::MAX,
+                        peeked: false,
                         source: CandidateSource::Active(ActivePartitionSnapshot::from_points(
                             points,
                         )),
@@ -257,51 +255,150 @@ impl ChunkStorage {
             }
         }
 
-        snapshot.candidates.sort_by(|left, right| {
+        let persisted_index = context.persisted_index.read();
+        if let Some(chunks) = persisted_index.chunk_refs.get(&series_id) {
+            let end_idx = chunks.partition_point(|chunk| chunk.min_ts < end);
+            for chunk_ref in &chunks[..end_idx] {
+                if chunk_ref.max_ts < start {
+                    continue;
+                }
+                let tier = persisted_index
+                    .segment_tiers
+                    .get(&chunk_ref.segment_slot)
+                    .copied()
+                    .unwrap_or(PersistedSegmentTier::Hot);
+                if !ChunkStorage::plan_includes_persisted_tier(plan, tier) {
+                    continue;
+                }
+
+                let (max_ts, peeked) = if chunk_ref.max_ts < end {
+                    (chunk_ref.max_ts, false)
+                } else {
+                    let Some(max_ts) = self.latest_persisted_in_window_ts(
+                        &persisted_index,
+                        chunk_ref,
+                        start,
+                        end,
+                    )?
+                    else {
+                        continue;
+                    };
+                    peeked_chunks = peeked_chunks.saturating_add(1);
+                    (max_ts, true)
+                };
+                candidates.push(ChunkCandidate {
+                    max_ts,
+                    recency: SourceRecency::Persisted,
+                    sequence: chunk_ref.sequence,
+                    peeked,
+                    source: CandidateSource::Persisted(*chunk_ref),
+                });
+            }
+        }
+        drop(visibility_guard);
+
+        candidates.sort_by(|left, right| {
             right
                 .max_ts
                 .cmp(&left.max_ts)
                 .then_with(|| right.recency.cmp(&left.recency))
                 .then_with(|| right.sequence.cmp(&left.sequence))
         });
-        Ok(snapshot)
+
+        Ok(DescScanSnapshot {
+            candidates,
+            persisted_index,
+            peeked_chunks,
+        })
+    }
+
+    fn latest_sealed_in_window_ts(
+        &self,
+        chunk: &Chunk,
+        start: i64,
+        end: i64,
+    ) -> Result<Option<i64>> {
+        if chunk.encoded_payload.is_empty() {
+            return Ok(chunk
+                .points
+                .iter()
+                .filter(|point| point.ts >= start && point.ts < end)
+                .map(|point| point.ts)
+                .max());
+        }
+
+        let descriptor = EncodedChunkDescriptor {
+            lane: chunk.header.lane,
+            ts_codec: chunk.header.ts_codec,
+            value_codec: chunk.header.value_codec,
+            point_count: chunk.header.point_count as usize,
+        };
+        let search_index = Encoder::build_timestamp_search_index_from_payload(
+            chunk.header.ts_codec,
+            descriptor.point_count,
+            &chunk.encoded_payload,
+        )?;
+        latest_in_window_timestamp(
+            descriptor,
+            &chunk.encoded_payload,
+            &search_index,
+            start,
+            end,
+        )
+    }
+
+    fn latest_persisted_in_window_ts(
+        &self,
+        persisted_index: &PersistedIndexState,
+        chunk_ref: &PersistedChunkRef,
+        start: i64,
+        end: i64,
+    ) -> Result<Option<i64>> {
+        let search_index =
+            self.persisted_chunk_timestamp_search_index(persisted_index, chunk_ref)?;
+        let payload = persisted_chunk_payload(&persisted_index.segment_maps, chunk_ref)?;
+        let descriptor = EncodedChunkDescriptor {
+            lane: chunk_ref.lane,
+            ts_codec: chunk_ref.ts_codec,
+            value_codec: chunk_ref.value_codec,
+            point_count: chunk_ref.point_count as usize,
+        };
+        latest_in_window_timestamp(descriptor, payload.as_ref(), search_index, start, end)
     }
 
     fn decode_candidate_tail(
         &self,
-        snapshot: &DescScanSnapshot,
+        snapshot: &DescScanSnapshot<'_>,
         candidate: &ChunkCandidate,
         start: i64,
         end: i64,
         max_points: usize,
         stats: &mut ReverseScanStats,
     ) -> Result<Vec<DataPoint>> {
-        stats.chunks_touched = stats.chunks_touched.saturating_add(1);
+        if !candidate.peeked {
+            stats.chunks_touched = stats.chunks_touched.saturating_add(1);
+        }
 
         match &candidate.source {
             CandidateSource::Active(points) => {
-                let mut decoded = points
-                    .iter_points()
-                    .filter(|point| point.ts >= start && point.ts < end)
-                    .map(|point| DataPoint::new(point.ts, point.value.clone()))
-                    .collect::<Vec<_>>();
-                decoded.sort_by_key(|point| point.timestamp);
-                decoded.reverse();
-                decoded.truncate(max_points);
+                let decoded = tail_points(
+                    points
+                        .iter_points()
+                        .filter(|point| point.ts >= start && point.ts < end),
+                    max_points,
+                );
                 stats.points_decoded = stats.points_decoded.saturating_add(decoded.len());
                 Ok(decoded)
             }
             CandidateSource::Sealed(chunk) => {
                 if chunk.encoded_payload.is_empty() {
-                    let mut decoded = chunk
-                        .points
-                        .iter()
-                        .filter(|point| point.ts >= start && point.ts < end)
-                        .map(|point| DataPoint::new(point.ts, point.value.clone()))
-                        .collect::<Vec<_>>();
-                    decoded.sort_by_key(|point| point.timestamp);
-                    decoded.reverse();
-                    decoded.truncate(max_points);
+                    let decoded = tail_points(
+                        chunk
+                            .points
+                            .iter()
+                            .filter(|point| point.ts >= start && point.ts < end),
+                        max_points,
+                    );
                     stats.points_decoded = stats.points_decoded.saturating_add(decoded.len());
                     return Ok(decoded);
                 }
@@ -328,10 +425,10 @@ impl ChunkStorage {
                 )
             }
             CandidateSource::Persisted(chunk_ref) => {
-                let persisted_index = self.persisted.persisted_index.read();
-                let search_index =
-                    self.persisted_chunk_timestamp_search_index(&persisted_index, chunk_ref)?;
-                let payload = persisted_chunk_payload(&snapshot.segment_maps, chunk_ref)?;
+                let search_index = self
+                    .persisted_chunk_timestamp_search_index(&snapshot.persisted_index, chunk_ref)?;
+                let payload =
+                    persisted_chunk_payload(&snapshot.persisted_index.segment_maps, chunk_ref)?;
                 let descriptor = EncodedChunkDescriptor {
                     lane: chunk_ref.lane,
                     ts_codec: chunk_ref.ts_codec,
@@ -350,6 +447,53 @@ impl ChunkStorage {
             }
         }
     }
+}
+
+/// Returns the newest `max_points` in-memory points as descending `DataPoint`s.
+///
+/// Only the selected tail values are cloned; the rest of the snapshot is never
+/// materialized as values, so `points_decoded` remains tail-bounded.
+fn tail_points<'a>(
+    points: impl Iterator<Item = &'a ChunkPoint>,
+    max_points: usize,
+) -> Vec<DataPoint> {
+    let mut selected = points.collect::<Vec<_>>();
+    selected.sort_by_key(|point| point.ts);
+    selected.reverse();
+    selected.truncate(max_points);
+    selected
+        .into_iter()
+        .map(|point| DataPoint::new(point.ts, point.value.clone()))
+        .collect()
+}
+
+/// Finds the newest timestamp in `[start, end)` for a chunk whose header maximum
+/// crosses `end`, using the anchor index to decode only the candidate tail block.
+fn latest_in_window_timestamp(
+    descriptor: EncodedChunkDescriptor,
+    payload: &[u8],
+    search_index: &TimestampSearchIndex,
+    start: i64,
+    end: i64,
+) -> Result<Option<i64>> {
+    if descriptor.point_count == 0 {
+        return Ok(None);
+    }
+
+    let ts_payload = Encoder::timestamp_payload_from_chunk_payload(payload)?;
+    let Some(block_idx) =
+        search_index.candidate_block_for_ceiling(descriptor.point_count, end.saturating_sub(1))
+    else {
+        return Ok(None);
+    };
+    let block_timestamps =
+        search_index.decode_block(descriptor.point_count, ts_payload, block_idx)?;
+    Ok(block_timestamps
+        .iter()
+        .rev()
+        .find(|timestamp| **timestamp < end)
+        .copied()
+        .filter(|timestamp| *timestamp >= start))
 }
 
 /// Decodes only the descending tail of one encoded chunk needed to fill `max_points`.
@@ -441,14 +585,13 @@ fn decode_encoded_tail(
         range_start,
         end,
     )?;
+    stats.points_decoded = stats.points_decoded.saturating_add(decoded.len());
 
-    let mut points = Vec::with_capacity(decoded.len());
-    for point in decoded.into_iter().rev() {
-        points.push(DataPoint::new(point.ts, point.value));
-    }
-    points.truncate(max_points);
-    stats.points_decoded = stats.points_decoded.saturating_add(points.len());
-    Ok(points)
+    Ok(decoded
+        .into_iter()
+        .rev()
+        .map(|point| DataPoint::new(point.ts, point.value))
+        .collect())
 }
 
 fn timestamp_at_index(
