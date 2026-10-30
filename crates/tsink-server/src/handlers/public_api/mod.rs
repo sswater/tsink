@@ -2,6 +2,7 @@ mod ingest;
 mod metadata;
 mod promql;
 mod remote_read;
+pub(crate) mod typed_value;
 
 #[cfg(test)]
 pub(super) use self::ingest::handle_remote_write_with_admission;
@@ -17,6 +18,12 @@ pub(super) use self::metadata::{
 pub(super) use self::promql::handle_instant_query_with_admission;
 pub(super) use self::promql::{handle_instant_query, handle_query_exemplars, handle_range_query};
 pub(super) use self::remote_read::handle_remote_read;
+// Consumed by the rows/select handlers added in follow-up tasks.
+#[allow(unused_imports)]
+pub(crate) use self::typed_value::{
+    from_tsink_value, into_tsink_value, TypedValueDto, MAX_BODY_BYTES, MAX_LIMIT,
+    MAX_ROWS_PER_REQUEST, MAX_TIMESTAMPS, MAX_VALUE_BYTES,
+};
 
 #[cfg(test)]
 mod tests {
