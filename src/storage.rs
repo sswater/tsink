@@ -641,6 +641,26 @@ pub trait Storage: Send + Sync {
 
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>>;
 
+    /// Selects at most `limit` points in strictly descending timestamp order.
+    ///
+    /// The window is `[start, end)`. Backends that can answer this without scanning
+    /// the whole window should override the default so that cost is independent of
+    /// window width.
+    fn select_desc(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        limit: usize,
+    ) -> Result<Vec<DataPoint>> {
+        let _ = (metric, labels, start, end, limit);
+        Err(TsinkError::UnsupportedOperation {
+            operation: "select_desc",
+            reason: "not implemented for this storage backend".to_string(),
+        })
+    }
+
     fn select_all(
         &self,
         metric: &str,

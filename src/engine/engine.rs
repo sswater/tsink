@@ -370,6 +370,17 @@ impl Storage for ChunkStorage {
         self.select_with_options_api(metric, opts)
     }
 
+    fn select_desc(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        limit: usize,
+    ) -> Result<Vec<DataPoint>> {
+        self.select_desc_api(metric, labels, start, end, limit)
+    }
+
     fn select_all(
         &self,
         metric: &str,

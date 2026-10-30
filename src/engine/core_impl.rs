@@ -233,7 +233,7 @@ impl ChunkStorage {
         )
     }
 
-    fn persisted_chunk_timestamp_search_index<'a>(
+    pub(super) fn persisted_chunk_timestamp_search_index<'a>(
         &self,
         persisted_index: &'a PersistedIndexState,
         chunk_ref: &PersistedChunkRef,

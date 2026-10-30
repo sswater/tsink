@@ -17,6 +17,8 @@ mod append_sort;
 mod merge;
 #[path = "query_read/pagination.rs"]
 mod pagination;
+#[path = "query_read/reverse_scan.rs"]
+mod reverse_scan;
 #[path = "query_read/snapshot.rs"]
 mod snapshot;
 

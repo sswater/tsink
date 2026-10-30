@@ -359,3 +359,57 @@ fn merge_and_append_sort_paths_match_for_persisted_and_active_exact_duplicates()
 
     storage.close().unwrap();
 }
+
+#[test]
+fn inv1_decoded_points_bounded() {
+    let storage = live_storage(2048);
+    let rows = (0..100_000i64)
+        .map(|idx| Row::new("inv1_desc", DataPoint::new(idx * 10, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let limit = 100;
+    let end = 100_000i64 * 10 + 1;
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("inv1_desc", &[])
+        .unwrap()
+        .series_id;
+
+    let run = |start: i64| {
+        let plan = storage.query_tier_plan(start, end);
+        storage
+            .select_desc_for_series_with_plan(series_id, start, end, limit, plan)
+            .unwrap()
+    };
+
+    // Both windows share the same newest edge; only the window width changes.
+    let (wide_points, wide_stats) = run(0);
+    let (narrow_points, narrow_stats) = run(end - 500 * 10);
+
+    assert_eq!(wide_points.len(), limit);
+    assert_eq!(narrow_points, wide_points);
+    assert!(wide_stats.chunks_touched > 0);
+    assert_eq!(wide_stats.chunks_touched, narrow_stats.chunks_touched);
+
+    let wide_bound = limit + 64 * wide_stats.chunks_touched + 64;
+    let narrow_bound = limit + 64 * narrow_stats.chunks_touched + 64;
+    assert!(
+        wide_stats.points_decoded <= wide_bound,
+        "wide scan decoded {} points across {} chunks (bound {})",
+        wide_stats.points_decoded,
+        wide_stats.chunks_touched,
+        wide_bound
+    );
+    assert!(
+        narrow_stats.points_decoded <= narrow_bound,
+        "narrow scan decoded {} points across {} chunks (bound {})",
+        narrow_stats.points_decoded,
+        narrow_stats.chunks_touched,
+        narrow_bound
+    );
+
+    storage.close().unwrap();
+}
