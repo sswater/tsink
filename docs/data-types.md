@@ -93,6 +93,22 @@ When queried via `as_f64()`, the conversion succeeds only if the integer can be 
 
 Custom Rust types can be embedded as `bytes` via the `Codec` trait — see [Custom Types via the Codec Trait](#custom-types-via-the-codec-trait).
 
+#### HTTP transport
+
+The `POST /api/v1/rows`, `POST /api/v1/select` and `POST /api/v1/select_points` endpoints carry `bytes` values as **base64 strings** (RFC 4648 STANDARD alphabet, padded) inside a type-tagged JSON object:
+
+```json
+{"type": "bytes", "value": "yv4="}
+```
+
+The raw payload above is `[0xCA, 0xFE]`. The engine never sees the encoding: the server decodes on write and re-encodes on read, so values round-trip byte for byte. Base64 enlarges the payload by ~33% on the wire.
+
+A single value may be at most **64 KiB raw** — the `bytes` length, or the UTF-8 byte length of a `string` value. This is a storage-shape constraint rather than an arbitrary API limit: chunks seal at 2 048 points and have no byte dimension, so a 1 MiB value would produce ~2 GiB chunks (and approach the encoder's `u32::MAX` length bound). Deployments that legitimately approach the cap should lower `with_chunk_points` (see [Configuration](configuration.md)) so a full chunk stays manageable — for example, 256 points keeps a chunk near 16 MiB.
+
+`string` values are transported as raw UTF-8 text, not base64. `\uXXXX` escapes in a request are accepted as an equivalent spelling, but responses always contain the UTF-8 characters themselves. Use `string` for meaningful text and `bytes` for opaque binary, including text that the client has already encoded.
+
+Native histograms do not travel over the row endpoints — writes and reads return `400`. Use the Prometheus remote-write and Remote Read protocols for histogram samples.
+
 ### string
 
 `Value::String(String)` stores UTF-8 text. Like `bytes`, it is stored on the blob lane using the bytes delta block codec and does not participate in numeric aggregation.

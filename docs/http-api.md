@@ -232,6 +232,184 @@ Range PromQL evaluation.
 
 ---
 
+## Typed row API
+
+The row endpoints exchange single points as type-tagged JSON instead of the Prometheus protobuf or text formats. They are the only public HTTP surface that carries `bytes` payloads end to end; PromQL and Remote Read still expose such samples as NaN.
+
+All three endpoints share the following behaviour:
+
+- **Uncompressed JSON only.** Request bodies are parsed as plain JSON: there is no `Content-Encoding` support (gzip, deflate and snappy bodies are not decoded), and the request `Content-Type` is not enforced.
+- **Authentication and RBAC.** They use the same bearer-token / OIDC flow as the other public endpoints. `POST /api/v1/rows` requires the tenant **write** permission; `POST /api/v1/select` and `POST /api/v1/select_points` require the tenant **read** permission.
+- **Multi-tenancy.** The target tenant is selected with `x-tsink-tenant` (default `default`) for both writes and reads.
+- **Timestamps.** `i64` values in the units selected by `--timestamp-precision`; they are stored and returned verbatim, never rescaled.
+- **Range semantics.** `[start, end)` — `end` is exclusive.
+- **Cluster mode.** The endpoints are single-node only. When clustering is active all three answer `501 text/plain` with the body `row endpoints are not supported in cluster mode` instead of touching the local shard.
+- **Histograms.** Native histogram values are not supported: writes and reads return `400`.
+
+Successful responses use the standard success envelope. Query errors use the PromQL error envelope described in [Common response envelope](#common-response-envelope) — `errorType` is `bad_data` for validation failures and `execution` for backend failures. Write-endpoint validation failures are plain-text `400` responses.
+
+### Limits
+
+| Limit | Value |
+|---|---|
+| Raw size of a single value (`bytes` length or `string` UTF-8 byte length) | 64 KiB (65 536 bytes) |
+| Rows per `POST /api/v1/rows` request | 10 000 |
+| Request body size | 32 MiB |
+| Timestamps per `POST /api/v1/select_points` request | 10 000 |
+| `limit` for `POST /api/v1/select` | required, `1..=100 000` |
+
+Base64 inflates `bytes` payloads by ~33%. The 64 KiB value cap follows from the storage shape — chunks seal at 2 048 points and have no byte dimension — so deployments that legitimately approach it should lower `with_chunk_points` (see [Data Types](data-types.md#http-transport)).
+
+### Value encoding
+
+Every point payload is a `{"type": <tag>, "value": <payload>}` object. The encoding is identical for writes and reads:
+
+| `type` | `value` in JSON | Notes |
+|---|---|---|
+| `bytes` | base64 string (STANDARD alphabet, padded) | Opaque binary. The raw bytes `[0xCA, 0xFE]` are encoded as `"yv4="`. |
+| `f64` | number | Non-finite values are exchanged as the strings `"NaN"`, `"Infinity"` and `"-Infinity"`. |
+| `i64` | integer | Signed 64-bit. |
+| `u64` | non-negative integer | Unsigned 64-bit. |
+| `bool` | boolean | |
+| `string` | string | UTF-8 text, stored losslessly. `\uXXXX` escapes are accepted, but responses always emit the raw UTF-8 characters. |
+
+`type` and `value` may appear in either order. An unknown `type` tag, a missing `value`, or a payload of the wrong JSON kind is rejected with `400`.
+
+A series is single-family: every point returned for one series has the same `type`. Different series in one write batch may use different types.
+
+---
+
+### `POST /api/v1/rows`
+
+Typed batch write for up to 10 000 rows. `bytes` is the primary use case, but every non-histogram type is accepted.
+
+**Request body:**
+
+```json
+{
+  "rows": [
+    {"metric": "device_data", "labels": [["device_id", "A"]],
+     "timestamp": 1730000000000,
+     "value": {"type": "bytes", "value": "yv4="}},
+    {"metric": "temperature", "labels": [["device_id", "A"]],
+     "timestamp": 1730000000000,
+     "value": {"type": "f64", "value": 21.5}}
+  ]
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `rows` | Yes | Array of row objects. |
+| `rows[].metric` | Yes | Non-empty metric name. |
+| `rows[].labels` | No | Array of `[name, value]` string pairs; defaults to no labels. |
+| `rows[].timestamp` | Yes | `i64` timestamp in the configured precision. |
+| `rows[].value` | Yes | Type-tagged value object (see [Value encoding](#value-encoding)). The `type` field defaults to `bytes`, so `{"value": "yv4="}` is a valid `bytes` payload. |
+
+- Rows are written under the tenant selected by `x-tsink-tenant`.
+- Writing a value family that differs from the family already stored for a series is rejected with `400` (`ValueTypeMismatch`); the rejected batch is not persisted.
+- An empty `rows` array is accepted and reports zero inserted rows.
+
+**Response:** `200 application/json`
+
+```json
+{
+  "status": "success",
+  "data": {"inserted_rows": 2}
+}
+```
+
+**Error codes:** `400` invalid JSON, missing or invalid fields, invalid base64, or a value/row/body limit exceeded; `413` per-tenant write quota or non-retryable admission resource limit; `429` admission backpressure (`X-Tsink-Write-Error-Code: write_overloaded`, `Retry-After: 1`); `500` internal failure.
+
+---
+
+### `POST /api/v1/select`
+
+Range query over a single series with explicit ordering and a mandatory `limit`.
+
+**Request body:**
+
+```json
+{
+  "metric": "device_data",
+  "labels": [["device_id", "A"]],
+  "start": 1730000000000,
+  "end": 1730086400000,
+  "order": "desc",
+  "limit": 100
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `metric` | Yes | Non-empty metric name. |
+| `labels` | No | Exact label set as `[name, value]` pairs. PromQL matchers are not supported. |
+| `start` | Yes | Inclusive window start. |
+| `end` | Yes | Exclusive window end; must be greater than `start`. |
+| `order` | No | `asc` (default) or `desc`. |
+| `limit` | Yes | Maximum number of points to return, `1..=100 000`. |
+| `offset` | No | `asc` only. Number of leading points to skip for paging. |
+
+**Ordering and paging:**
+
+- `asc` returns oldest-first through the existing ascending pipeline. `offset` and `limit` page through a window; an offset past the end returns an empty `points` array.
+- `desc` returns newest-first through the reverse tail scan. `offset` is rejected with `400`: continue paging by setting `end` to the oldest timestamp of the previous page (because `end` is exclusive, pages remain contiguous). The cost of a `desc` query is bounded by `limit`, not by the width of the window.
+- `limit` is mandatory for both orders; a missing, zero, or out-of-range `limit` is rejected with `400`. Results beyond one page are fetched with `offset` (`asc`) or by narrowing the window and moving `end` (`desc`).
+
+**Duplicate timestamps:** `desc` collapses points that share the same `(series, timestamp)` into a single point, keeping the newest stored copy. `asc` preserves the existing engine behaviour and may return several points for the same timestamp. The divergence is intentional: duplicate timestamps come from retries or crash replay, where the stored values are identical.
+
+**Response:** `200 application/json`
+
+```json
+{
+  "status": "success",
+  "data": {
+    "points": [
+      {"timestamp": 1730086399000, "value": {"type": "bytes", "value": "yv4="}},
+      {"timestamp": 1730086300000, "value": {"type": "bytes", "value": "yv8="}}
+    ]
+  }
+}
+```
+
+An empty window returns `200` with `"points": []`.
+
+**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, invalid range, missing/out-of-range `limit`, `offset` with `order: "desc"`, per-tenant read-query quota, or a histogram result; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
+
+---
+
+### `POST /api/v1/select_points`
+
+Point lookup for a caller-supplied timestamp list.
+
+**Request body:**
+
+```json
+{
+  "metric": "device_data",
+  "labels": [["device_id", "A"]],
+  "timestamps": [1730000001000, 1730000060000, 1730000120000]
+}
+```
+
+| Field | Required | Description |
+|---|---|---|
+| `metric` | Yes | Non-empty metric name. |
+| `labels` | No | Exact label set as `[name, value]` pairs. |
+| `timestamps` | Yes | Up to 10 000 `i64` timestamps. May be unsorted, duplicated, or empty. |
+
+- There is no `limit` parameter; the length of the `timestamps` array is the bound (10 000).
+- **No output-order guarantee.** The current implementation returns points in ascending timestamp order, but clients must align results by `timestamp` rather than rely on ordering.
+- Duplicate input timestamps are collapsed, and timestamps with no stored point are omitted — no `null` placeholders are returned.
+- When several stored points share the requested timestamp, the newest stored copy wins (the same collapse rule as `desc`).
+- All requested timestamps are resolved against one series in a single call, so each touched chunk is decompressed at most once regardless of how many requested timestamps it contains.
+
+**Response:** `200 application/json` — identical shape to [`POST /api/v1/select`](#post-apiv1select).
+
+**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, more than 10 000 timestamps, per-tenant read-query quota, or a histogram result; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
+
+---
+
 ## Metadata queries
 
 ### `GET /api/v1/series`
