@@ -23,11 +23,13 @@ pub(super) enum SourceRecency {
 /// `max_ts` is the candidate's **latest in-window timestamp**, not merely the
 /// chunk header maximum: when a chunk straddles `end`, collection peeks at the
 /// tail block to find the actual newest point below `end`. This keeps the global
-/// ordering honest without decoding any values.
+/// ordering honest without decoding any values. Point lookups skip that peek and
+/// keep the header maximum instead.
 pub(super) struct ChunkCandidate {
+    pub min_ts: i64,
     pub max_ts: i64,
     pub recency: SourceRecency,
-    sequence: u64,
+    pub(super) sequence: u64,
     peeked: bool,
     pub(super) source: CandidateSource,
 }
@@ -49,7 +51,7 @@ pub(super) struct ReverseScanStats {
 
 /// Candidate snapshot plus the persisted-index read guard that keeps captured
 /// chunk refs and their lazily built timestamp indexes alive for the whole scan.
-pub(super) struct DescScanSnapshot<'a> {
+pub(super) struct CandidateSnapshot<'a> {
     pub(super) candidates: Vec<ChunkCandidate>,
     pub(super) persisted_index: RwLockReadGuard<'a, PersistedIndexState>,
     peeked_chunks: usize,
@@ -185,7 +187,32 @@ impl ChunkStorage {
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
-    ) -> Result<DescScanSnapshot<'_>> {
+    ) -> Result<CandidateSnapshot<'_>> {
+        self.collect_candidates_with_mode(series_id, start, end, plan, true)
+    }
+
+    /// Collects candidates for point lookups, using chunk header min/max as-is
+    /// and never peeking at a tail block. Enumeration therefore fetches no chunk
+    /// payload at all, leaving at most one payload fetch per touched group to the
+    /// point scan itself (INV-2).
+    pub(super) fn collect_candidates_without_tail_peek(
+        &self,
+        series_id: SeriesId,
+        start: i64,
+        end: i64,
+        plan: TieredQueryPlan,
+    ) -> Result<CandidateSnapshot<'_>> {
+        self.collect_candidates_with_mode(series_id, start, end, plan, false)
+    }
+
+    fn collect_candidates_with_mode(
+        &self,
+        series_id: SeriesId,
+        start: i64,
+        end: i64,
+        plan: TieredQueryPlan,
+        peek_tail: bool,
+    ) -> Result<CandidateSnapshot<'_>> {
         let context = self.query_snapshot_context();
         let visibility_guard = context.visibility_read_fence();
         let mut candidates = Vec::new();
@@ -199,17 +226,18 @@ impl ChunkStorage {
                     if chunk.header.max_ts < start {
                         continue;
                     }
-                    let (max_ts, peeked) = if chunk.header.max_ts < end {
-                        (chunk.header.max_ts, false)
+                    let (min_ts, max_ts, peeked) = if !peek_tail || chunk.header.max_ts < end {
+                        (chunk.header.min_ts, chunk.header.max_ts, false)
                     } else {
                         let Some(max_ts) = self.latest_sealed_in_window_ts(chunk, start, end)?
                         else {
                             continue;
                         };
                         peeked_chunks = peeked_chunks.saturating_add(1);
-                        (max_ts, true)
+                        (chunk.header.min_ts, max_ts, true)
                     };
                     candidates.push(ChunkCandidate {
+                        min_ts,
                         max_ts,
                         recency: SourceRecency::Sealed,
                         sequence: key.sequence,
@@ -237,12 +265,15 @@ impl ChunkStorage {
                         continue;
                     }
 
+                    let mut min_ts = i64::MAX;
                     let mut max_ts = i64::MIN;
                     for point in points.iter_points() {
+                        min_ts = min_ts.min(point.ts);
                         max_ts = max_ts.max(point.ts);
                     }
 
                     candidates.push(ChunkCandidate {
+                        min_ts,
                         max_ts,
                         recency: SourceRecency::Active,
                         sequence: u64::MAX,
@@ -271,7 +302,7 @@ impl ChunkStorage {
                     continue;
                 }
 
-                let (max_ts, peeked) = if chunk_ref.max_ts < end {
+                let (max_ts, peeked) = if !peek_tail || chunk_ref.max_ts < end {
                     (chunk_ref.max_ts, false)
                 } else {
                     let Some(max_ts) = self.latest_persisted_in_window_ts(
@@ -287,6 +318,7 @@ impl ChunkStorage {
                     (max_ts, true)
                 };
                 candidates.push(ChunkCandidate {
+                    min_ts: chunk_ref.min_ts,
                     max_ts,
                     recency: SourceRecency::Persisted,
                     sequence: chunk_ref.sequence,
@@ -305,7 +337,7 @@ impl ChunkStorage {
                 .then_with(|| right.sequence.cmp(&left.sequence))
         });
 
-        Ok(DescScanSnapshot {
+        Ok(CandidateSnapshot {
             candidates,
             persisted_index,
             peeked_chunks,
@@ -368,7 +400,7 @@ impl ChunkStorage {
 
     fn decode_candidate_tail(
         &self,
-        snapshot: &DescScanSnapshot<'_>,
+        snapshot: &CandidateSnapshot<'_>,
         candidate: &ChunkCandidate,
         start: i64,
         end: i64,

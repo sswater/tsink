@@ -661,6 +661,25 @@ pub trait Storage: Send + Sync {
         })
     }
 
+    /// Selects the points at the given timestamps.
+    ///
+    /// Duplicate timestamps are collapsed to a single point carrying the newest
+    /// source version, missing timestamps are omitted, and the output is ordered
+    /// ascending by timestamp. There is no limit parameter and no ordering
+    /// guarantee beyond the natural ascending implementation order.
+    fn select_at_timestamps(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        timestamps: &[i64],
+    ) -> Result<Vec<DataPoint>> {
+        let _ = (metric, labels, timestamps);
+        Err(TsinkError::UnsupportedOperation {
+            operation: "select_at_timestamps",
+            reason: "not implemented for this storage backend".to_string(),
+        })
+    }
+
     fn select_all(
         &self,
         metric: &str,

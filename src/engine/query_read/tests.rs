@@ -413,3 +413,116 @@ fn inv1_decoded_points_bounded() {
 
     storage.close().unwrap();
 }
+
+fn persistent_numeric_and_blob_storage(
+    path: &std::path::Path,
+    chunk_point_cap: usize,
+) -> ChunkStorage {
+    ChunkStorage::new_with_data_path_and_options(
+        chunk_point_cap,
+        None,
+        Some(path.join(NUMERIC_LANE_ROOT)),
+        Some(path.join(BLOB_LANE_ROOT)),
+        1,
+        test_options(None),
+    )
+    .unwrap()
+}
+
+#[test]
+fn point_scan_single_decompression_per_chunk_group() {
+    let temp_dir = TempDir::new().unwrap();
+    // 50 clustered timestamps fit in exactly one chunk; large zero-filled blob
+    // values make the persisted chunk payload a zstd candidate.
+    let storage = persistent_numeric_and_blob_storage(temp_dir.path(), 50);
+    let rows = (0..50i64)
+        .map(|ts| {
+            Row::new(
+                "point_scan_inv2",
+                DataPoint::new(ts, Value::Bytes(vec![0u8; 512])),
+            )
+        })
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+    storage.flush_all_active().unwrap();
+    assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("point_scan_inv2", &[])
+        .unwrap()
+        .series_id;
+
+    // The persisted chunk must actually take the zstd/decompress path.
+    {
+        let persisted_index = storage.persisted.persisted_index.read();
+        let chunk_ref = persisted_index.chunk_refs.get(&series_id).unwrap()[0];
+        let payload = persisted_chunk_payload(&persisted_index.segment_maps, &chunk_ref).unwrap();
+        assert!(
+            matches!(payload, std::borrow::Cow::Owned(_)),
+            "test chunk should be persisted with zstd compression"
+        );
+    }
+
+    let timestamps = (0..50i64).collect::<Vec<_>>();
+    let (points, stats) = storage
+        .select_at_timestamps_for_series(series_id, &timestamps)
+        .unwrap();
+
+    assert_eq!(points.len(), 50);
+    assert!(points
+        .windows(2)
+        .all(|window| window[0].timestamp < window[1].timestamp));
+    assert_eq!(
+        stats.chunk_groups_touched, 1,
+        "INV-2: 50 clustered timestamps in one chunk must decode the chunk once"
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn point_scan_cross_layer_overlap_decodes_only_newest_group() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = persistent_numeric_and_blob_storage(temp_dir.path(), 4);
+
+    storage
+        .insert_rows(&[Row::new(
+            "point_scan_overlap_inv2",
+            DataPoint::new(100, Value::Bytes(vec![1])),
+        )])
+        .unwrap();
+    storage.flush_all_active().unwrap();
+    assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+
+    // Crash-replay style overlap: the same timestamp now exists in the persisted
+    // layer and in a newer active head.
+    storage
+        .insert_rows(&[Row::new(
+            "point_scan_overlap_inv2",
+            DataPoint::new(100, Value::Bytes(vec![2])),
+        )])
+        .unwrap();
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("point_scan_overlap_inv2", &[])
+        .unwrap()
+        .series_id;
+
+    let (points, stats) = storage
+        .select_at_timestamps_for_series(series_id, &[100])
+        .unwrap();
+
+    assert_eq!(points, vec![DataPoint::new(100, Value::Bytes(vec![2]))]);
+    assert_eq!(
+        stats.chunk_groups_touched, 1,
+        "the resolved timestamp must belong to exactly one group (the active layer)"
+    );
+
+    storage.close().unwrap();
+}

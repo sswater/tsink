@@ -238,7 +238,25 @@ impl ChunkStorage {
         persisted_index: &'a PersistedIndexState,
         chunk_ref: &PersistedChunkRef,
     ) -> Result<&'a crate::engine::encoder::TimestampSearchIndex> {
-        let timestamp_search_index = persisted_index
+        let timestamp_search_index =
+            Self::persisted_chunk_timestamp_search_index_lock(persisted_index, chunk_ref)?;
+        if let Some(timestamp_search_index) = timestamp_search_index.get() {
+            return Ok(timestamp_search_index);
+        }
+
+        let payload = persisted_chunk_payload(&persisted_index.segment_maps, chunk_ref)?;
+        self.build_persisted_chunk_timestamp_search_index(
+            persisted_index,
+            chunk_ref,
+            payload.as_ref(),
+        )
+    }
+
+    fn persisted_chunk_timestamp_search_index_lock<'a>(
+        persisted_index: &'a PersistedIndexState,
+        chunk_ref: &PersistedChunkRef,
+    ) -> Result<&'a std::sync::OnceLock<crate::engine::encoder::TimestampSearchIndex>> {
+        persisted_index
             .chunk_timestamp_indexes
             .get(&chunk_ref.sequence)
             .ok_or_else(|| {
@@ -246,16 +264,32 @@ impl ChunkStorage {
                     "missing timestamp search index for persisted chunk sequence {}",
                     chunk_ref.sequence
                 ))
-            })?;
+            })
+    }
+
+    /// Returns the cached timestamp search index for a persisted chunk, building
+    /// it from an already-fetched payload when necessary.
+    ///
+    /// Point lookups fetch the chunk payload exactly once (INV-2) and must not
+    /// trigger a second decompression through
+    /// [`Self::persisted_chunk_timestamp_search_index`], so they pass their
+    /// borrowed payload here instead.
+    pub(super) fn build_persisted_chunk_timestamp_search_index<'a>(
+        &self,
+        persisted_index: &'a PersistedIndexState,
+        chunk_ref: &PersistedChunkRef,
+        payload: &[u8],
+    ) -> Result<&'a crate::engine::encoder::TimestampSearchIndex> {
+        let timestamp_search_index =
+            Self::persisted_chunk_timestamp_search_index_lock(persisted_index, chunk_ref)?;
         if let Some(timestamp_search_index) = timestamp_search_index.get() {
             return Ok(timestamp_search_index);
         }
 
-        let payload = persisted_chunk_payload(&persisted_index.segment_maps, chunk_ref)?;
         let built = Encoder::build_timestamp_search_index_from_payload(
             chunk_ref.ts_codec,
             chunk_ref.point_count as usize,
-            payload.as_ref(),
+            payload,
         )?;
         let built_bytes = built.memory_usage_bytes();
         if timestamp_search_index.set(built).is_ok() {

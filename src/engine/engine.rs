@@ -381,6 +381,15 @@ impl Storage for ChunkStorage {
         self.select_desc_api(metric, labels, start, end, limit)
     }
 
+    fn select_at_timestamps(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        timestamps: &[i64],
+    ) -> Result<Vec<DataPoint>> {
+        self.select_at_timestamps_api(metric, labels, timestamps)
+    }
+
     fn select_all(
         &self,
         metric: &str,

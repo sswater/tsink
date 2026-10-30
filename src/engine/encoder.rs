@@ -438,6 +438,68 @@ impl Encoder {
             .map(|(ts, value)| ChunkPoint { ts, value })
             .collect())
     }
+
+    /// Decodes only the values at the given point indexes, in the given order.
+    ///
+    /// Point lookups locate the exact indexes through the timestamp search
+    /// index / a single timestamp decode and then touch only the contiguous
+    /// value runs they need. `indexes` must be sorted ascending.
+    pub(crate) fn decode_chunk_values_at_indexes(
+        lane: ValueLane,
+        value_codec: ValueCodecId,
+        point_count: usize,
+        payload: &[u8],
+        indexes: &[usize],
+    ) -> Result<Vec<Value>> {
+        if indexes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut pos = 0usize;
+        let ts_len = read_u32(payload, &mut pos)? as usize;
+        let _ts_payload = read_bytes(payload, &mut pos, ts_len)?;
+        let value_len = read_u32(payload, &mut pos)? as usize;
+        let value_payload = read_bytes(payload, &mut pos, value_len)?;
+
+        if pos != payload.len() {
+            return Err(TsinkError::DataCorruption(
+                "encoded chunk payload has trailing bytes".to_string(),
+            ));
+        }
+
+        let mut out = Vec::with_capacity(indexes.len());
+        let mut run_start = 0usize;
+        while run_start < indexes.len() {
+            let first = indexes[run_start];
+            if first >= point_count {
+                return Err(TsinkError::DataCorruption(format!(
+                    "value index {first} exceeds point count {point_count}"
+                )));
+            }
+            let mut run_end = run_start + 1;
+            while run_end < indexes.len() && indexes[run_end] == indexes[run_end - 1] + 1 {
+                run_end = run_end.saturating_add(1);
+            }
+            let last = indexes[run_end - 1].saturating_add(1);
+            let values = decode_values_in_index_range(
+                value_codec,
+                lane,
+                value_payload,
+                point_count,
+                first,
+                last,
+            )?;
+            if values.len() != last.saturating_sub(first) {
+                return Err(TsinkError::DataCorruption(
+                    "timestamp/value count mismatch after indexed decode".to_string(),
+                ));
+            }
+            out.extend(values);
+            run_start = run_end;
+        }
+
+        Ok(out)
+    }
 }
 
 fn choose_smallest<T>(mut candidates: Vec<(T, Vec<u8>)>) -> Result<(T, Vec<u8>)> {
