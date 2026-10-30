@@ -173,6 +173,11 @@ fn parse_row(index: usize, raw_row: &JsonValue) -> Result<Row, String> {
     if row.metric.is_empty() {
         return Err(format!("row {index}: metric name is required"));
     }
+    if row.labels.iter().any(|(name, _)| name == "__name__") {
+        return Err(format!(
+            "row {index}: `__name__` label is not allowed; use the `metric` field"
+        ));
+    }
     let labels = row
         .labels
         .into_iter()
@@ -690,6 +695,28 @@ mod tests {
                 .expect("post-rejection read should succeed")
                 .is_empty(),
             "suspended managed tenant must not persist rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_rejects_name_label_in_labels() {
+        let storage = make_storage(TimestampPrecision::Milliseconds);
+        let body = json!({
+            "rows": [{
+                "metric": "device_data",
+                "labels": [["__name__", "ignored_metric"]],
+                "timestamp": 1_730_000_000_000_i64,
+                "value": {"type": "bytes", "value": "yv4="}
+            }]
+        });
+
+        let response =
+            write_rows(&storage, TimestampPrecision::Milliseconds, body.to_string()).await;
+        assert_eq!(response.status, 400, "{}", response_text(&response));
+        assert!(
+            response_text(&response).contains("__name__"),
+            "got {}",
+            response_text(&response)
         );
     }
 }

@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 
 use parking_lot::RwLockReadGuard;
@@ -22,7 +24,7 @@ pub(super) enum SourceRecency {
 ///
 /// `max_ts` is the candidate's **latest in-window timestamp**, not merely the
 /// chunk header maximum: when a chunk straddles `end`, collection peeks at the
-/// tail block to find the actual newest point below `end`. This keeps the global
+/// tail block to find the actual newest point below `end`. This keeps the merge
 /// ordering honest without decoding any values. Point lookups skip that peek and
 /// keep the header maximum instead.
 pub(super) struct ChunkCandidate {
@@ -40,9 +42,12 @@ pub(super) enum CandidateSource {
     Active(ActivePartitionSnapshot),
 }
 
-/// Honest work counters for a reverse scan. `points_decoded` counts every point
-/// whose value was materialized (before any output truncation), not only the
-/// points that survive `limit`.
+/// Honest work counters for a reverse scan.
+///
+/// `points_decoded` counts every point whose **value** was materialized, before
+/// any output filtering or truncation. Timestamps decoded by cursor batches are
+/// not counted; batches are aligned to search blocks, so each cursor step decodes
+/// at most one block (64 timestamps) per chunk.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReverseScanStats {
     pub chunks_touched: usize,
@@ -132,36 +137,69 @@ impl ChunkStorage {
         };
         let retention_cutoff = self.active_retention_cutoff();
         let mut seen_timestamps = HashSet::with_capacity(limit.min(4096));
+
+        // One descending cursor per candidate, merged by point timestamp. Each
+        // cursor decodes in batches of at most one anchor block, so the merge
+        // never materializes more than the current batch per active cursor.
+        let mut cursors = snapshot
+            .candidates
+            .iter()
+            .map(|_| CursorState::default())
+            .collect::<Vec<_>>();
+        let mut heap = BinaryHeap::with_capacity(snapshot.candidates.len());
+        for (index, candidate) in snapshot.candidates.iter().enumerate() {
+            heap.push(HeapEntry {
+                timestamp: candidate.max_ts,
+                recency: candidate.recency,
+                sequence: candidate.sequence,
+                candidate_index: index,
+            });
+        }
+
         self.tombstone_read_context().with_series_tombstone_ranges(
             series_id,
             |tombstone_ranges| -> Result<()> {
-                'candidates: for candidate in &snapshot.candidates {
-                    let remaining = limit.saturating_sub(out.len());
-                    if remaining == 0 {
+                while out.len() < limit {
+                    let Some(entry) = heap.pop() else {
                         break;
+                    };
+                    let candidate_index = entry.candidate_index;
+                    let Some(point) = cursors[candidate_index].next_point(
+                        self,
+                        &snapshot,
+                        candidate_index,
+                        start,
+                        end,
+                        &mut stats,
+                    )?
+                    else {
+                        continue;
+                    };
+
+                    // Re-queue the cursor for its next point before filtering.
+                    // Filtered or duplicate-dropped points advance the same
+                    // cursor, so a chunk refills itself instead of moving on.
+                    if let Some(next_timestamp) = cursors[candidate_index].head_timestamp() {
+                        heap.push(HeapEntry {
+                            timestamp: next_timestamp,
+                            recency: entry.recency,
+                            sequence: entry.sequence,
+                            candidate_index,
+                        });
                     }
 
-                    let points = self.decode_candidate_tail(
-                        &snapshot, candidate, start, end, remaining, &mut stats,
-                    )?;
-
-                    for point in points {
-                        if retention_cutoff.is_some_and(|cutoff| point.timestamp < cutoff) {
-                            continue;
-                        }
-                        if tombstone_ranges.is_some_and(|ranges| {
-                            tombstone::timestamp_is_tombstoned(point.timestamp, ranges)
-                        }) {
-                            continue;
-                        }
-                        if !seen_timestamps.insert(point.timestamp) {
-                            continue;
-                        }
-                        out.push(point);
-                        if out.len() >= limit {
-                            break 'candidates;
-                        }
+                    if retention_cutoff.is_some_and(|cutoff| point.timestamp < cutoff) {
+                        continue;
                     }
+                    if tombstone_ranges.is_some_and(|ranges| {
+                        tombstone::timestamp_is_tombstoned(point.timestamp, ranges)
+                    }) {
+                        continue;
+                    }
+                    if !seen_timestamps.insert(point.timestamp) {
+                        continue;
+                    }
+                    out.push(point);
                 }
                 Ok(())
             },
@@ -397,42 +435,104 @@ impl ChunkStorage {
         };
         latest_in_window_timestamp(descriptor, payload.as_ref(), search_index, start, end)
     }
+}
 
-    fn decode_candidate_tail(
-        &self,
-        snapshot: &CandidateSnapshot<'_>,
-        candidate: &ChunkCandidate,
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct HeapEntry {
+    timestamp: i64,
+    recency: SourceRecency,
+    sequence: u64,
+    candidate_index: usize,
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.timestamp
+            .cmp(&other.timestamp)
+            .then_with(|| self.recency.cmp(&other.recency))
+            .then_with(|| self.sequence.cmp(&other.sequence))
+            .then_with(|| self.candidate_index.cmp(&other.candidate_index))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Default)]
+struct CursorState<'a> {
+    data: Option<CursorData<'a>>,
+    initialized: bool,
+}
+
+impl<'a> CursorState<'a> {
+    fn next_point(
+        &mut self,
+        storage: &ChunkStorage,
+        snapshot: &'a CandidateSnapshot<'_>,
+        candidate_index: usize,
         start: i64,
         end: i64,
-        max_points: usize,
         stats: &mut ReverseScanStats,
-    ) -> Result<Vec<DataPoint>> {
-        if !candidate.peeked {
-            stats.chunks_touched = stats.chunks_touched.saturating_add(1);
+    ) -> Result<Option<DataPoint>> {
+        if !self.initialized {
+            self.initialized = true;
+            let candidate = &snapshot.candidates[candidate_index];
+            if !candidate.peeked {
+                stats.chunks_touched = stats.chunks_touched.saturating_add(1);
+            }
+            self.data = Some(CursorData::new(
+                storage, snapshot, candidate, start, end, stats,
+            )?);
         }
 
+        self.data
+            .as_mut()
+            .map_or(Ok(None), |data| data.next_point(stats))
+    }
+
+    fn head_timestamp(&self) -> Option<i64> {
+        self.data.as_ref().and_then(CursorData::head_timestamp)
+    }
+}
+
+enum CursorData<'a> {
+    /// In-memory active/partition or payload-less sealed points, ordered descending.
+    Refs {
+        points: Vec<&'a ChunkPoint>,
+        pos: usize,
+    },
+    /// Full fallback decode for an inconsistent (unsorted) encoded chunk.
+    Buffered { points: Vec<DataPoint>, pos: usize },
+    /// Anchor-backed encoded chunk cursor.
+    Encoded(EncodedCursor<'a>),
+}
+
+impl<'a> CursorData<'a> {
+    fn new(
+        storage: &ChunkStorage,
+        snapshot: &'a CandidateSnapshot<'_>,
+        candidate: &'a ChunkCandidate,
+        start: i64,
+        end: i64,
+        stats: &mut ReverseScanStats,
+    ) -> Result<Self> {
         match &candidate.source {
-            CandidateSource::Active(points) => {
-                let decoded = tail_points(
-                    points
-                        .iter_points()
-                        .filter(|point| point.ts >= start && point.ts < end),
-                    max_points,
-                );
-                stats.points_decoded = stats.points_decoded.saturating_add(decoded.len());
-                Ok(decoded)
-            }
+            CandidateSource::Active(points) => Ok(Self::from_refs(
+                points
+                    .iter_points()
+                    .filter(|point| point.ts >= start && point.ts < end),
+            )),
             CandidateSource::Sealed(chunk) => {
                 if chunk.encoded_payload.is_empty() {
-                    let decoded = tail_points(
+                    return Ok(Self::from_refs(
                         chunk
                             .points
                             .iter()
                             .filter(|point| point.ts >= start && point.ts < end),
-                        max_points,
-                    );
-                    stats.points_decoded = stats.points_decoded.saturating_add(decoded.len());
-                    return Ok(decoded);
+                    ));
                 }
 
                 let descriptor = EncodedChunkDescriptor {
@@ -441,24 +541,25 @@ impl ChunkStorage {
                     value_codec: chunk.header.value_codec,
                     point_count: chunk.header.point_count as usize,
                 };
-                let search_index = Encoder::build_timestamp_search_index_from_payload(
-                    chunk.header.ts_codec,
+                let search_index = Cow::Owned(Encoder::build_timestamp_search_index_from_payload(
+                    descriptor.ts_codec,
                     descriptor.point_count,
                     &chunk.encoded_payload,
-                )?;
-                decode_encoded_tail(
+                )?);
+                Self::new_encoded(
                     descriptor,
-                    &chunk.encoded_payload,
-                    &search_index,
+                    Cow::Borrowed(chunk.encoded_payload.as_slice()),
+                    search_index,
                     start,
                     end,
-                    max_points,
                     stats,
                 )
             }
             CandidateSource::Persisted(chunk_ref) => {
-                let search_index = self
-                    .persisted_chunk_timestamp_search_index(&snapshot.persisted_index, chunk_ref)?;
+                let search_index = Cow::Borrowed(storage.persisted_chunk_timestamp_search_index(
+                    &snapshot.persisted_index,
+                    chunk_ref,
+                )?);
                 let payload =
                     persisted_chunk_payload(&snapshot.persisted_index.segment_maps, chunk_ref)?;
                 let descriptor = EncodedChunkDescriptor {
@@ -467,36 +568,248 @@ impl ChunkStorage {
                     value_codec: chunk_ref.value_codec,
                     point_count: chunk_ref.point_count as usize,
                 };
-                decode_encoded_tail(
-                    descriptor,
-                    payload.as_ref(),
-                    search_index,
-                    start,
-                    end,
-                    max_points,
-                    stats,
-                )
+                Self::new_encoded(descriptor, payload, search_index, start, end, stats)
             }
+        }
+    }
+
+    fn from_refs(points: impl Iterator<Item = &'a ChunkPoint>) -> Self {
+        let mut points = points.collect::<Vec<_>>();
+        points.sort_by_key(|point| point.ts);
+        points.reverse();
+        Self::Refs { points, pos: 0 }
+    }
+
+    fn new_encoded(
+        descriptor: EncodedChunkDescriptor,
+        payload: Cow<'a, [u8]>,
+        search_index: Cow<'a, TimestampSearchIndex>,
+        start: i64,
+        end: i64,
+        stats: &mut ReverseScanStats,
+    ) -> Result<Self> {
+        if descriptor.point_count == 0 {
+            return Ok(Self::Buffered {
+                points: Vec::new(),
+                pos: 0,
+            });
+        }
+
+        let Some(last_index) =
+            last_in_window_index(descriptor, payload.as_ref(), &search_index, end)
+        else {
+            // Anchor miss where the candidate said data exists: fall back to the
+            // full decode path for this chunk only.
+            return Self::full_fallback(descriptor, payload.as_ref(), start, end, None, stats);
+        };
+        let first_index =
+            first_in_window_index(descriptor, payload.as_ref(), &search_index, start)?;
+        if first_index > last_index {
+            return Self::full_fallback(descriptor, payload.as_ref(), start, end, None, stats);
+        }
+
+        let encoded = EncodedCursor {
+            descriptor,
+            payload,
+            search_index,
+            first_index,
+            next_index: Some(last_index),
+            buffer: Vec::new(),
+            previous_batch_min_ts: None,
+            start,
+            end,
+            last_emitted_ts: None,
+        };
+        Ok(Self::Encoded(encoded))
+    }
+
+    fn full_fallback(
+        descriptor: EncodedChunkDescriptor,
+        payload: &[u8],
+        start: i64,
+        end: i64,
+        last_emitted_ts: Option<i64>,
+        stats: &mut ReverseScanStats,
+    ) -> Result<Self> {
+        let decoded = Encoder::decode_chunk_points_from_payload(
+            descriptor.lane,
+            descriptor.ts_codec,
+            descriptor.value_codec,
+            descriptor.point_count,
+            payload,
+        )?;
+        stats.points_decoded = stats.points_decoded.saturating_add(decoded.len());
+
+        let mut points = decoded
+            .into_iter()
+            .filter(|point| {
+                point.ts >= start
+                    && point.ts < end
+                    && last_emitted_ts.is_none_or(|floor| point.ts < floor)
+            })
+            .map(|point| DataPoint::new(point.ts, point.value))
+            .collect::<Vec<_>>();
+        points.sort_by_key(|point| point.timestamp);
+        points.reverse();
+        Ok(Self::Buffered { points, pos: 0 })
+    }
+
+    fn next_point(&mut self, stats: &mut ReverseScanStats) -> Result<Option<DataPoint>> {
+        let fallback = if let Self::Encoded(cursor) = self {
+            cursor.buffer.is_empty() && cursor.next_index.is_some()
+        } else {
+            false
+        };
+        if fallback {
+            let inconsistent = {
+                let Self::Encoded(cursor) = self else {
+                    unreachable!("checked encoded cursor above");
+                };
+                cursor.load_batch(stats)?
+            };
+            if inconsistent {
+                let replacement = {
+                    let Self::Encoded(cursor) = self else {
+                        unreachable!("checked encoded cursor above");
+                    };
+                    Self::full_fallback(
+                        cursor.descriptor,
+                        cursor.payload.as_ref(),
+                        cursor.start,
+                        cursor.end,
+                        cursor.last_emitted_ts,
+                        stats,
+                    )?
+                };
+                *self = replacement;
+                return self.next_point(stats);
+            }
+        }
+
+        match self {
+            Self::Refs { points, pos } => {
+                let Some(point) = points.get(*pos) else {
+                    return Ok(None);
+                };
+                *pos = pos.saturating_add(1);
+                Ok(Some(DataPoint::new(point.ts, point.value.clone())))
+            }
+            Self::Buffered { points, pos } => {
+                let Some(point) = points.get(*pos) else {
+                    return Ok(None);
+                };
+                *pos = pos.saturating_add(1);
+                Ok(Some(point.clone()))
+            }
+            Self::Encoded(cursor) => {
+                let point = cursor.buffer.pop();
+                if let Some(point) = &point {
+                    cursor.last_emitted_ts = Some(point.timestamp);
+                }
+
+                // Pull the next batch eagerly so the heap head key is known
+                // without a separate timestamp lookahead decode.
+                let mut replacement = None;
+                if cursor.buffer.is_empty()
+                    && cursor.next_index.is_some()
+                    && cursor.load_batch(stats)?
+                {
+                    replacement = Some(Self::full_fallback(
+                        cursor.descriptor,
+                        cursor.payload.as_ref(),
+                        cursor.start,
+                        cursor.end,
+                        cursor.last_emitted_ts,
+                        stats,
+                    )?);
+                }
+                if let Some(replacement) = replacement {
+                    *self = replacement;
+                }
+                Ok(point)
+            }
+        }
+    }
+
+    fn head_timestamp(&self) -> Option<i64> {
+        match self {
+            Self::Refs { points, pos } => points.get(*pos).map(|point| point.ts),
+            Self::Buffered { points, pos } => points.get(*pos).map(|point| point.timestamp),
+            Self::Encoded(cursor) => cursor.buffer.last().map(|point| point.timestamp),
         }
     }
 }
 
-/// Returns the newest `max_points` in-memory points as descending `DataPoint`s.
-///
-/// Only the selected tail values are cloned; the rest of the snapshot is never
-/// materialized as values, so `points_decoded` remains tail-bounded.
-fn tail_points<'a>(
-    points: impl Iterator<Item = &'a ChunkPoint>,
-    max_points: usize,
-) -> Vec<DataPoint> {
-    let mut selected = points.collect::<Vec<_>>();
-    selected.sort_by_key(|point| point.ts);
-    selected.reverse();
-    selected.truncate(max_points);
-    selected
-        .into_iter()
-        .map(|point| DataPoint::new(point.ts, point.value.clone()))
-        .collect()
+struct EncodedCursor<'a> {
+    descriptor: EncodedChunkDescriptor,
+    payload: Cow<'a, [u8]>,
+    search_index: Cow<'a, TimestampSearchIndex>,
+    first_index: usize,
+    next_index: Option<usize>,
+    /// Decoded batch in ascending order; `pop()` yields the newest point first.
+    buffer: Vec<DataPoint>,
+    previous_batch_min_ts: Option<i64>,
+    start: i64,
+    end: i64,
+    last_emitted_ts: Option<i64>,
+}
+
+impl<'a> EncodedCursor<'a> {
+    /// Loads the next block-aligned batch and returns `true` when the timestamp
+    /// stream is inconsistent (non-ascending within a batch or across a batch
+    /// boundary).
+    fn load_batch(&mut self, stats: &mut ReverseScanStats) -> Result<bool> {
+        let Some(next_index) = self.next_index else {
+            return Ok(false);
+        };
+        let block_start = (next_index / TIMESTAMP_SEARCH_BLOCK_POINTS)
+            .saturating_mul(TIMESTAMP_SEARCH_BLOCK_POINTS);
+        let batch_start = block_start.max(self.first_index);
+        let timestamps = timestamps_in_index_range(
+            self.descriptor,
+            self.payload.as_ref(),
+            &self.search_index,
+            batch_start,
+            next_index,
+        )?;
+
+        let ascending = timestamps.windows(2).all(|window| window[0] <= window[1]);
+        let boundary_ok = match (self.previous_batch_min_ts, timestamps.last()) {
+            (Some(previous_min), Some(batch_max)) => *batch_max <= previous_min,
+            _ => true,
+        };
+        if !ascending || !boundary_ok {
+            return Ok(true);
+        }
+        self.previous_batch_min_ts = timestamps.first().copied();
+
+        let indexes = (batch_start..=next_index).collect::<Vec<_>>();
+        let values = Encoder::decode_chunk_values_at_indexes(
+            self.descriptor.lane,
+            self.descriptor.value_codec,
+            self.descriptor.point_count,
+            self.payload.as_ref(),
+            &indexes,
+        )?;
+        if values.len() != timestamps.len() {
+            return Err(TsinkError::DataCorruption(
+                "timestamp/value count mismatch while decoding reverse batch".to_string(),
+            ));
+        }
+        stats.points_decoded = stats.points_decoded.saturating_add(values.len());
+
+        self.buffer = timestamps
+            .into_iter()
+            .zip(values)
+            .map(|(timestamp, value)| DataPoint::new(timestamp, value))
+            .collect();
+        self.next_index = if batch_start > self.first_index {
+            Some(batch_start - 1)
+        } else {
+            None
+        };
+        Ok(false)
+    }
 }
 
 /// Finds the newest timestamp in `[start, end)` for a chunk whose header maximum
@@ -528,130 +841,75 @@ fn latest_in_window_timestamp(
         .filter(|timestamp| *timestamp >= start))
 }
 
-/// Decodes only the descending tail of one encoded chunk needed to fill `max_points`.
-///
-/// The timestamp search index locates the block containing the last point below
-/// `end`; at most one additional block is decoded to find the starting index.
-/// Values are then decoded for the selected index range only. Chunks with an
-/// unsorted timestamp stream fall back to a full decode followed by an explicit
-/// descending sort, and count every decoded value honestly.
-fn decode_encoded_tail(
+/// Returns the highest point index whose timestamp is below `end`.
+fn last_in_window_index(
+    descriptor: EncodedChunkDescriptor,
+    payload: &[u8],
+    search_index: &TimestampSearchIndex,
+    end: i64,
+) -> Option<usize> {
+    if descriptor.point_count == 0 {
+        return None;
+    }
+    let ts_payload = Encoder::timestamp_payload_from_chunk_payload(payload).ok()?;
+    let block_idx =
+        search_index.candidate_block_for_ceiling(descriptor.point_count, end.saturating_sub(1))?;
+    let block_timestamps = search_index
+        .decode_block(descriptor.point_count, ts_payload, block_idx)
+        .ok()?;
+    let position = block_timestamps
+        .iter()
+        .rposition(|timestamp| *timestamp < end)?;
+    Some(
+        block_idx
+            .saturating_mul(TIMESTAMP_SEARCH_BLOCK_POINTS)
+            .saturating_add(position),
+    )
+}
+
+/// Returns the lowest point index whose timestamp is at or above `start`.
+fn first_in_window_index(
     descriptor: EncodedChunkDescriptor,
     payload: &[u8],
     search_index: &TimestampSearchIndex,
     start: i64,
-    end: i64,
-    max_points: usize,
-    stats: &mut ReverseScanStats,
-) -> Result<Vec<DataPoint>> {
-    if max_points == 0 || start >= end || descriptor.point_count == 0 {
-        return Ok(Vec::new());
-    }
-
-    let timestamps = Encoder::decode_timestamps_from_payload(
-        descriptor.ts_codec,
-        descriptor.point_count,
-        payload,
-    )?;
-    if !timestamps.windows(2).all(|window| window[0] <= window[1]) {
-        let decoded = Encoder::decode_chunk_points_from_payload(
-            descriptor.lane,
-            descriptor.ts_codec,
-            descriptor.value_codec,
-            descriptor.point_count,
-            payload,
-        )?;
-        stats.points_decoded = stats.points_decoded.saturating_add(decoded.len());
-
-        let mut points = decoded
-            .into_iter()
-            .filter(|point| point.ts >= start && point.ts < end)
-            .map(|point| DataPoint::new(point.ts, point.value))
-            .collect::<Vec<_>>();
-        points.sort_by_key(|point| point.timestamp);
-        points.reverse();
-        points.truncate(max_points);
-        return Ok(points);
-    }
-
+) -> Result<usize> {
     let ts_payload = Encoder::timestamp_payload_from_chunk_payload(payload)?;
     let Some(block_idx) =
-        search_index.candidate_block_for_ceiling(descriptor.point_count, end.saturating_sub(1))
+        search_index.candidate_block_for_ceiling(descriptor.point_count, start.saturating_sub(1))
     else {
-        return Ok(Vec::new());
+        return Ok(0);
     };
-
     let block_timestamps =
         search_index.decode_block(descriptor.point_count, ts_payload, block_idx)?;
-    let block_start_idx = block_idx.saturating_mul(TIMESTAMP_SEARCH_BLOCK_POINTS);
-    let Some(last_pos) = block_timestamps
+    let position = block_timestamps
         .iter()
-        .rposition(|timestamp| *timestamp < end)
-    else {
-        return Ok(Vec::new());
-    };
-    let last_idx = block_start_idx.saturating_add(last_pos);
-    if block_timestamps[last_pos] < start {
-        return Ok(Vec::new());
-    }
-
-    let tail_len = last_idx.saturating_add(1);
-    let decode_start_idx = tail_len.saturating_sub(max_points.min(tail_len));
-    let decode_start_ts = timestamp_at_index(
-        descriptor.point_count,
-        ts_payload,
-        search_index,
-        block_idx,
-        block_start_idx,
-        &block_timestamps,
-        decode_start_idx,
-    )?;
-    let range_start = decode_start_ts.max(start);
-
-    let decoded = Encoder::decode_chunk_points_from_payload_in_range(
-        descriptor.lane,
-        descriptor.ts_codec,
-        descriptor.value_codec,
-        descriptor.point_count,
-        payload,
-        range_start,
-        end,
-    )?;
-    stats.points_decoded = stats.points_decoded.saturating_add(decoded.len());
-
-    Ok(decoded
-        .into_iter()
-        .rev()
-        .map(|point| DataPoint::new(point.ts, point.value))
-        .collect())
+        .rposition(|timestamp| *timestamp < start)
+        .map_or(0, |position| position.saturating_add(1));
+    Ok(block_idx
+        .saturating_mul(TIMESTAMP_SEARCH_BLOCK_POINTS)
+        .saturating_add(position))
 }
 
-fn timestamp_at_index(
-    point_count: usize,
-    ts_payload: &[u8],
+fn timestamps_in_index_range(
+    descriptor: EncodedChunkDescriptor,
+    payload: &[u8],
     search_index: &TimestampSearchIndex,
-    block_idx: usize,
-    block_start_idx: usize,
-    block_timestamps: &[i64],
-    target_idx: usize,
-) -> Result<i64> {
-    if target_idx >= block_start_idx && target_idx < block_start_idx + block_timestamps.len() {
-        return Ok(block_timestamps[target_idx - block_start_idx]);
+    from: usize,
+    to_inclusive: usize,
+) -> Result<Vec<i64>> {
+    let ts_payload = Encoder::timestamp_payload_from_chunk_payload(payload)?;
+    let start_block = from / TIMESTAMP_SEARCH_BLOCK_POINTS;
+    let end_block = to_inclusive / TIMESTAMP_SEARCH_BLOCK_POINTS;
+    let mut out = Vec::with_capacity(to_inclusive.saturating_sub(from).saturating_add(1));
+    for block_idx in start_block..=end_block {
+        let block = search_index.decode_block(descriptor.point_count, ts_payload, block_idx)?;
+        let block_start = block_idx.saturating_mul(TIMESTAMP_SEARCH_BLOCK_POINTS);
+        let lo = from.saturating_sub(block_start).min(block.len());
+        let hi = (to_inclusive.saturating_sub(block_start).saturating_add(1)).min(block.len());
+        if lo < hi {
+            out.extend_from_slice(&block[lo..hi]);
+        }
     }
-
-    let target_block = target_idx / TIMESTAMP_SEARCH_BLOCK_POINTS;
-    if target_block == block_idx {
-        return Err(TsinkError::DataCorruption(format!(
-            "timestamp index {target_idx} not present in decoded block {block_idx}"
-        )));
-    }
-    let timestamps = search_index.decode_block(point_count, ts_payload, target_block)?;
-    timestamps
-        .get(target_idx % TIMESTAMP_SEARCH_BLOCK_POINTS)
-        .copied()
-        .ok_or_else(|| {
-            TsinkError::DataCorruption(format!(
-                "timestamp index {target_idx} is missing from block {target_block}"
-            ))
-        })
+    Ok(out)
 }

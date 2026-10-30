@@ -120,6 +120,10 @@ pub(crate) async fn handle_rows_select(
         Ok(query) => query,
         Err(err) => return select_bad_request_response(&err),
     };
+    if let Err(err) = tenant::enforce_query_points_quota(tenant_plan.policy(), query.limit) {
+        tenant_plan.record_rejected(tenant::TenantAdmissionSurface::Query, 1, err.clone());
+        return select_bad_request_response(&err);
+    }
 
     let storage = tenant::scoped_storage(Arc::clone(storage), &tenant_id);
     let outcome = tokio::task::spawn_blocking(move || match query.order {
@@ -217,6 +221,12 @@ pub(crate) async fn handle_rows_select_points(
         Ok(query) => query,
         Err(err) => return select_bad_request_response(&err),
     };
+    if let Err(err) =
+        tenant::enforce_query_points_quota(tenant_plan.policy(), query.timestamps.len())
+    {
+        tenant_plan.record_rejected(tenant::TenantAdmissionSurface::Query, 1, err.clone());
+        return select_bad_request_response(&err);
+    }
 
     let storage = tenant::scoped_storage(Arc::clone(storage), &tenant_id);
     let outcome = tokio::task::spawn_blocking(move || {
@@ -1152,5 +1162,98 @@ mod tests {
                 "tenant {tenant_id} select_points visibility mismatch"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn tenant_point_quota_bounds_select_limit_and_select_points() {
+        let storage = make_storage();
+        let registry = tenant::TenantRegistry::from_json_str(
+            r#"{
+                "tenants": {
+                    "team-quota": {
+                        "quotas": { "maxRangePointsPerQuery": 2 }
+                    }
+                }
+            }"#,
+        )
+        .expect("tenant registry should parse");
+        let context = PublicReadContext::new(None, Some(&registry), None, None);
+
+        let run = |path: &'static str, body: JsonValue| {
+            let storage = Arc::clone(&storage);
+            let context = &context;
+            async move {
+                let mut request = request(path, body);
+                request
+                    .headers
+                    .insert(tenant::TENANT_HEADER.to_string(), "team-quota".to_string());
+                match path {
+                    "/api/v1/select" => {
+                        handle_rows_select(
+                            &storage,
+                            &request,
+                            TimestampPrecision::Milliseconds,
+                            None,
+                            context,
+                        )
+                        .await
+                    }
+                    _ => {
+                        handle_rows_select_points(
+                            &storage,
+                            &request,
+                            TimestampPrecision::Milliseconds,
+                            None,
+                            context,
+                        )
+                        .await
+                    }
+                }
+            }
+        };
+
+        for (path, body) in [
+            ("/api/v1/select", select_body(Some("desc"), Some(3), None)),
+            (
+                "/api/v1/select_points",
+                json!({
+                    "metric": METRIC,
+                    "labels": [["device_id", "A"]],
+                    "timestamps": [BASE_TS, BASE_TS + STEP, BASE_TS + 2 * STEP],
+                }),
+            ),
+        ] {
+            let response = run(path, body).await;
+            assert_eq!(response.status, 400, "{path}: {}", response_text(&response));
+            assert!(
+                response_text(&response).contains("tenant range query point limit exceeded"),
+                "{path} got {}",
+                response_text(&response)
+            );
+        }
+
+        // Within the quota both endpoints are admitted.
+        let select_ok = run("/api/v1/select", select_body(Some("desc"), Some(2), None)).await;
+        assert_eq!(
+            select_ok.status,
+            200,
+            "select within quota: {}",
+            response_text(&select_ok)
+        );
+        let points_ok = run(
+            "/api/v1/select_points",
+            json!({
+                "metric": METRIC,
+                "labels": [["device_id", "A"]],
+                "timestamps": [BASE_TS, BASE_TS + STEP],
+            }),
+        )
+        .await;
+        assert_eq!(
+            points_ok.status,
+            200,
+            "select_points within quota: {}",
+            response_text(&points_ok)
+        );
     }
 }

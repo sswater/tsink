@@ -302,3 +302,118 @@ fn desc_matches_exact_labels_only() {
     assert_eq!(timestamps(&points), vec![102, 101, 100]);
     storage.close().unwrap();
 }
+
+#[test]
+fn desc_overlapping_sealed_and_late_active_same_partition() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = build_storage(&temp_dir, 4, Duration::from_secs(3600));
+
+    // 4th point seals [500,1000,1001,1002]; the late 900/950 writes land in the
+    // same partition's active head and overlap the sealed chunk's range.
+    storage
+        .insert_rows(
+            &[500i64, 1000, 1001, 1002]
+                .into_iter()
+                .map(|ts| Row::new("desc_overlap", DataPoint::new(ts, ts as f64)))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    storage
+        .insert_rows(&[
+            Row::new("desc_overlap", DataPoint::new(900, 900.0)),
+            Row::new("desc_overlap", DataPoint::new(950, 950.0)),
+        ])
+        .unwrap();
+
+    let points = storage
+        .select_desc("desc_overlap", &[], 0, 2_000, 5)
+        .unwrap();
+    assert_eq!(timestamps(&points), vec![1002, 1001, 1000, 950, 900]);
+    assert_strictly_descending(&points);
+
+    let newest = storage
+        .select_desc("desc_overlap", &[], 0, 2_000, 2)
+        .unwrap();
+    assert_eq!(timestamps(&newest), vec![1002, 1001]);
+    storage.close().unwrap();
+}
+
+#[test]
+fn desc_tombstoned_tail_refills_from_same_chunk() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let storage = build_storage(&temp_dir, 256, Duration::from_secs(3600));
+        let rows = (100..=200i64)
+            .map(|ts| Row::new("desc_refill", DataPoint::new(ts, ts as f64)))
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+        storage.close().unwrap();
+    }
+
+    let storage = build_storage(&temp_dir, 256, Duration::from_secs(3600));
+    storage
+        .delete_series(
+            &SeriesSelection::new()
+                .with_metric("desc_refill")
+                .with_time_range(196, 201),
+        )
+        .unwrap();
+
+    let points = storage
+        .select_desc("desc_refill", &[], 0, 1_000, 5)
+        .unwrap();
+    assert_eq!(timestamps(&points), vec![195, 194, 193, 192, 191]);
+    storage.close().unwrap();
+}
+
+#[test]
+fn desc_crash_replay_partial_overlap() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let storage = build_storage(&temp_dir, 32, Duration::from_secs(3600));
+        let rows = (100..=110i64)
+            .map(|ts| Row::new("desc_replay", DataPoint::new(ts, ts as f64)))
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+        storage.close().unwrap();
+    }
+
+    let storage = build_storage(&temp_dir, 32, Duration::from_secs(3600));
+    // Simulate crash replay re-publishing the newest tail in the active head.
+    storage
+        .insert_rows(
+            &[108i64, 109, 110]
+                .into_iter()
+                .map(|ts| Row::new("desc_replay", DataPoint::new(ts, ts as f64)))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+    let points = storage.select_desc("desc_replay", &[], 0, 200, 11).unwrap();
+    assert_eq!(
+        timestamps(&points),
+        (100..=110i64).rev().collect::<Vec<_>>()
+    );
+    storage.close().unwrap();
+}
+
+#[test]
+fn desc_persisted_straddling_end_peek() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let storage = build_storage(&temp_dir, 32, Duration::from_secs(3600));
+        let rows = (100..=110i64)
+            .map(|ts| Row::new("desc_peek", DataPoint::new(ts, ts as f64)))
+            .collect::<Vec<_>>();
+        storage.insert_rows(&rows).unwrap();
+        storage.close().unwrap();
+    }
+
+    let storage = build_storage(&temp_dir, 32, Duration::from_secs(3600));
+    let points = storage.select_desc("desc_peek", &[], 0, 105, 5).unwrap();
+    assert_eq!(timestamps(&points), vec![104, 103, 102, 101, 100]);
+
+    let newest = storage.select_desc("desc_peek", &[], 0, 105, 3).unwrap();
+    assert_eq!(timestamps(&newest), vec![104, 103, 102]);
+    storage.close().unwrap();
+}

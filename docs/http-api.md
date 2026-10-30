@@ -321,7 +321,7 @@ Typed batch write for up to 10 000 rows. `bytes` is the primary use case, but ev
 }
 ```
 
-**Error codes:** `400` invalid JSON, missing or invalid fields, invalid base64, or a value/row/body limit exceeded; `413` per-tenant write quota or non-retryable admission resource limit; `429` admission backpressure (`X-Tsink-Write-Error-Code: write_overloaded`, `Retry-After: 1`); `501` in cluster mode; `500` internal failure.
+**Error codes:** `400` invalid JSON, missing or invalid fields, invalid base64, or a value/row/body limit exceeded; `413` per-tenant write quota or non-retryable admission resource limit; `422` (`OutOfRetention`) a sample for a retention-enforcing storage is older than the retention window; `429` admission backpressure (`X-Tsink-Write-Error-Code: write_overloaded`, `Retry-After: 1`); `501` in cluster mode; `500` internal failure.
 
 ---
 
@@ -355,8 +355,10 @@ Range query over a single series with explicit ordering and a mandatory `limit`.
 **Ordering and paging:**
 
 - `asc` returns oldest-first through the existing ascending pipeline. `offset` and `limit` page through a window; an offset past the end returns an empty `points` array.
-- `desc` returns newest-first through the reverse tail scan. `offset` is rejected with `400`: continue paging by setting `end` to the oldest timestamp of the previous page (because `end` is exclusive, pages remain contiguous). The cost of a `desc` query is bounded by `limit`, not by the width of the window.
+- `desc` returns newest-first through the reverse tail scan. `offset` is rejected with `400`: continue paging by setting `end` to the oldest timestamp of the previous page (because `end` is exclusive, pages remain contiguous). Decode work is bounded by `limit` plus at most one tail block per touched chunk; metadata enumeration still visits the persisted chunk headers before `end` for the series, so a wider window can add header-scan cost even though it does not add point-decode cost.
 - `limit` is mandatory for both orders; a missing, zero, or out-of-range `limit` is rejected with `400`. Results beyond one page are fetched with `offset` (`asc`) or by narrowing the window and moving `end` (`desc`).
+
+**Memory:** the handler buffers the full response in memory. Worst case is `limit × value size`; at the maximum `limit` of 100 000 and a 64 KiB value that is roughly 6.4 GiB before serialization. For large-value series use a correspondingly smaller `limit`; streaming or a response-budget mechanism is deferred.
 
 **Duplicate timestamps:** `desc` collapses points that share the same `(series, timestamp)` into a single point, keeping the newest stored copy. `asc` preserves the existing engine behaviour and may return several points for the same timestamp. The divergence is intentional: duplicate timestamps come from retries or crash replay, where the stored values are identical.
 
@@ -376,7 +378,7 @@ Range query over a single series with explicit ordering and a mandatory `limit`.
 
 A window with no matching points returns `200` with `"points": []`.
 
-**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, invalid range, missing/out-of-range `limit`, `offset` with `order: "desc"`, per-tenant read-query quota, or a histogram result; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
+**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, invalid range, missing/out-of-range `limit`, `offset` with `order: "desc"`, per-tenant read-query or range-point quota, or a histogram result; `403` suspended/managed tenant or insufficient scope; `413` (`X-Tsink-Read-Error-Code: read_resource_limit_exceeded`) non-retryable read admission resource limit; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
 
 ---
 
@@ -408,7 +410,7 @@ Point lookup for a caller-supplied timestamp list.
 
 **Response:** `200 application/json` — identical shape to [`POST /api/v1/select`](#post-apiv1select).
 
-**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, more than 10 000 timestamps, per-tenant read-query quota, or a histogram result; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
+**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, more than 10 000 timestamps, per-tenant read-query or range-point quota, or a histogram result; `403` suspended/managed tenant or insufficient scope; `413` (`X-Tsink-Read-Error-Code: read_resource_limit_exceeded`) non-retryable read admission resource limit; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
 
 ---
 

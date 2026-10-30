@@ -1298,15 +1298,24 @@ pub fn enforce_range_points_quota(
     end: i64,
     step: i64,
 ) -> Result<(), String> {
-    let Some(limit) = policy.max_range_points_per_query else {
-        return Ok(());
-    };
     let span = end.saturating_sub(start);
     let steps = span.checked_div(step).unwrap_or(i64::MAX);
     let points = usize::try_from(steps.saturating_add(1)).unwrap_or(usize::MAX);
-    if points > limit {
+    enforce_query_points_quota(policy, points)
+}
+
+/// Enforces the tenant's per-query point budget for an already-known point
+/// count (range `limit` or point-lookup timestamp count).
+pub fn enforce_query_points_quota(
+    policy: &TenantRequestPolicy,
+    requested_points: usize,
+) -> Result<(), String> {
+    let Some(limit) = policy.max_range_points_per_query else {
+        return Ok(());
+    };
+    if requested_points > limit {
         return Err(format!(
-            "tenant range query point limit exceeded: {points} > {limit}"
+            "tenant range query point limit exceeded: {requested_points} > {limit}"
         ));
     }
     Ok(())
