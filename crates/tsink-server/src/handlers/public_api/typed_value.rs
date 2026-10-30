@@ -26,7 +26,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
-/// Maximum encoded size of a single value (64 KiB).
+/// Maximum raw size of a single value (64 KiB). Encoded base64 is ~+33%.
 pub(crate) const MAX_VALUE_BYTES: usize = 64 * 1024;
 /// Maximum rows accepted by a single write request.
 pub(crate) const MAX_ROWS_PER_REQUEST: usize = 10_000;
@@ -39,6 +39,18 @@ pub(crate) const MAX_LIMIT: usize = 100_000;
 
 const FIELD_TYPE: &str = "type";
 const FIELD_VALUE: &str = "value";
+
+/// Prometheus JSON convention for non-finite floats, which JSON numbers
+/// cannot represent.
+fn non_finite_f64_sentinel(value: f64) -> &'static str {
+    if value.is_nan() {
+        "NaN"
+    } else if value.is_sign_positive() {
+        "Infinity"
+    } else {
+        "-Infinity"
+    }
+}
 
 /// Type-tagged value exchanged over the public HTTP JSON API.
 ///
@@ -67,7 +79,11 @@ impl Serialize for TypedValueDto {
             }
             Self::F64(value) => {
                 object.serialize_field(FIELD_TYPE, "f64")?;
-                object.serialize_field(FIELD_VALUE, value)?;
+                if value.is_finite() {
+                    object.serialize_field(FIELD_VALUE, value)?;
+                } else {
+                    object.serialize_field(FIELD_VALUE, non_finite_f64_sentinel(*value))?;
+                }
             }
             Self::I64(value) => {
                 object.serialize_field(FIELD_TYPE, "i64")?;
@@ -141,7 +157,7 @@ impl<'de> Visitor<'de> for TypedValueVisitor {
     }
 }
 
-fn from_tagged_json<E: de::Error>(
+pub(crate) fn from_tagged_json<E: de::Error>(
     type_tag: &str,
     raw_value: serde_json::Value,
 ) -> Result<TypedValueDto, E> {
@@ -155,10 +171,7 @@ fn from_tagged_json<E: de::Error>(
                 .map_err(|err| E::custom(format!("invalid base64 value: {err}")))?;
             Ok(TypedValueDto::Bytes(bytes))
         }
-        "f64" => raw_value
-            .as_f64()
-            .map(TypedValueDto::F64)
-            .ok_or_else(|| E::custom("f64 value must be a JSON number")),
+        "f64" => from_json_f64(&raw_value),
         "i64" => raw_value
             .as_i64()
             .map(TypedValueDto::I64)
@@ -176,6 +189,26 @@ fn from_tagged_json<E: de::Error>(
             .map(|value| TypedValueDto::Str(value.to_string()))
             .ok_or_else(|| E::custom("string value must be a JSON string")),
         other => Err(E::custom(format!("unknown value type `{other}`"))),
+    }
+}
+
+fn from_json_f64<E: de::Error>(raw_value: &serde_json::Value) -> Result<TypedValueDto, E> {
+    match raw_value {
+        serde_json::Value::Number(_) => raw_value
+            .as_f64()
+            .map(TypedValueDto::F64)
+            .ok_or_else(|| E::custom("f64 value must be a JSON number")),
+        serde_json::Value::String(sentinel) => match sentinel.as_str() {
+            "NaN" => Ok(TypedValueDto::F64(f64::NAN)),
+            "Infinity" => Ok(TypedValueDto::F64(f64::INFINITY)),
+            "-Infinity" => Ok(TypedValueDto::F64(f64::NEG_INFINITY)),
+            _ => Err(E::custom(
+                "f64 string value must be one of NaN, Infinity, -Infinity",
+            )),
+        },
+        _ => Err(E::custom(
+            "f64 value must be a JSON number or a NaN/Infinity/-Infinity string",
+        )),
     }
 }
 
@@ -252,6 +285,54 @@ mod tests {
         let err =
             serde_json::from_str::<TypedValueDto>(r#"{"type":"bytes","value":"not_base64!!"}"#);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn non_finite_f64_uses_prometheus_string_sentinels() {
+        let cases = [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ];
+
+        for (value, sentinel) in cases {
+            let encoded = serde_json::to_string(&TypedValueDto::F64(value))
+                .expect("serialize should succeed");
+            assert_eq!(encoded, format!(r#"{{"type":"f64","value":"{sentinel}"}}"#));
+
+            let decoded: TypedValueDto =
+                serde_json::from_str(&encoded).expect("deserialize should succeed");
+            let TypedValueDto::F64(decoded) = decoded else {
+                panic!("expected an f64 DTO");
+            };
+            assert_eq!(decoded.to_bits(), value.to_bits());
+        }
+
+        let finite =
+            serde_json::to_string(&TypedValueDto::F64(21.5)).expect("serialize should succeed");
+        assert_eq!(finite, r#"{"type":"f64","value":21.5}"#);
+        assert_eq!(
+            serde_json::from_str::<TypedValueDto>(&finite).expect("deserialize should succeed"),
+            TypedValueDto::F64(21.5)
+        );
+    }
+
+    #[test]
+    fn deserializer_accepts_reversed_fields_and_rejects_wrong_kinds() {
+        let reversed: TypedValueDto = serde_json::from_str(r#"{"value":21.5,"type":"f64"}"#)
+            .expect("reversed field order should parse");
+        assert_eq!(reversed, TypedValueDto::F64(21.5));
+
+        for invalid in [
+            r#"{"type":"f64","value":"21.5"}"#,
+            r#"{"type":"bytes","value":123}"#,
+            r#"{"type":"unknown","value":1}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<TypedValueDto>(invalid).is_err(),
+                "expected rejection of {invalid}"
+            );
+        }
     }
 
     #[test]
