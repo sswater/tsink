@@ -204,6 +204,16 @@ pub(super) async fn route_request(
             )
             .await
         }
+        ("POST", "/api/v1/rows") => {
+            handle_rows_write(
+                storage,
+                &request,
+                timestamp_precision,
+                tenant_registry,
+                usage_accounting,
+            )
+            .await
+        }
         ("POST", "/v1/metrics") => {
             handle_otlp_metrics(
                 storage,
@@ -791,6 +801,44 @@ mod tests {
         assert!(body["data"]
             .as_array()
             .is_some_and(|values| values.iter().any(|value| value == "router-a")));
+    }
+
+    #[tokio::test]
+    async fn route_request_dispatches_rows_write_endpoint() {
+        let storage = make_storage();
+        let metadata_store = Arc::new(MetricMetadataStore::in_memory());
+        let exemplar_store = Arc::new(ExemplarStore::in_memory());
+        let engine = make_engine(&storage);
+
+        let response = route_request(
+            app_context(&storage, &metadata_store, &exemplar_store, &engine),
+            request_context(
+                HttpRequest {
+                    method: "POST".to_string(),
+                    path: "/api/v1/rows".to_string(),
+                    headers: HashMap::from([(
+                        "content-type".to_string(),
+                        "application/json".to_string(),
+                    )]),
+                    body: br#"{"rows":[{"metric":"device_data","labels":[["device_id","router"]],
+                        "timestamp":1700000000000,"value":{"value":"yv4="}}]}"#
+                        .to_vec(),
+                },
+                false,
+            ),
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&response.body)
+        );
+
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("response body should be valid JSON");
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["data"]["inserted_rows"], 1);
     }
 
     #[tokio::test]

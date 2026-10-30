@@ -200,6 +200,7 @@ fn request_permission_for(
             Some(RbacPermission::new(RbacAction::Read, tenant_id()?))
         }
         ("POST", "/api/v1/write")
+        | ("POST", "/api/v1/rows")
         | ("POST", "/api/v1/import/prometheus")
         | ("POST", "/v1/metrics")
         | ("POST", "/write")
@@ -359,5 +360,55 @@ mod tests {
     fn bearer_token_extraction_is_case_insensitive_and_trims_token() {
         let request = request_with_auth("bearer   secret-token   ");
         assert_eq!(extract_bearer_token(&request), Some("secret-token"));
+    }
+
+    fn permission_request(
+        method: &str,
+        path: &str,
+        tenant: Option<&str>,
+    ) -> crate::http::HttpRequest {
+        let mut headers = HashMap::new();
+        if let Some(tenant) = tenant {
+            headers.insert(tenant::TENANT_HEADER.to_string(), tenant.to_string());
+        }
+        crate::http::HttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn new_endpoints_map_to_tenant_permissions() {
+        // Every new public row endpoint must be registered here: a missing arm
+        // means silent authorization bypass (see spec §4).
+        let write_routes = [("POST", "/api/v1/rows")];
+        for (method, path) in write_routes {
+            let permission = request_permission_for(&permission_request(method, path, None), false)
+                .expect("permission lookup should succeed")
+                .expect("write route must be registered in the RBAC path table");
+            assert_eq!(
+                permission,
+                RbacPermission::new(
+                    RbacAction::Write,
+                    RbacResource::tenant(tenant::DEFAULT_TENANT_ID)
+                ),
+                "{method} {path} must require the tenant write permission"
+            );
+
+            let permission =
+                request_permission_for(&permission_request(method, path, Some("team-a")), false)
+                    .expect("permission lookup should succeed")
+                    .expect("write route must be registered in the RBAC path table");
+            assert_eq!(
+                permission,
+                RbacPermission::new(RbacAction::Write, RbacResource::tenant("team-a")),
+                "{method} {path} must be scoped to the requesting tenant"
+            );
+        }
+
+        // Task 5 extends this table with the read routes (`/api/v1/select`,
+        // `/api/v1/select_points`).
     }
 }

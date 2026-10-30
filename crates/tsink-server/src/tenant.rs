@@ -1058,6 +1058,7 @@ pub fn public_request_access(request: &HttpRequest) -> Option<TenantAccessScope>
         | "/api/v1/read"
         | "/api/v1/status/tsdb" => Some(TenantAccessScope::Read),
         "/api/v1/write"
+        | "/api/v1/rows"
         | "/api/v1/import/prometheus"
         | "/write"
         | "/api/v2/write"
@@ -1941,6 +1942,21 @@ mod tests {
         fn close(&self) -> TsinkResult<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn public_request_access_registers_rows_endpoint_as_write() {
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/v1/rows".to_string(),
+            headers: HashMap::new(),
+            body: Vec::new(),
+        };
+
+        assert_eq!(
+            public_request_access(&request),
+            Some(TenantAccessScope::Write)
+        );
     }
 
     #[test]

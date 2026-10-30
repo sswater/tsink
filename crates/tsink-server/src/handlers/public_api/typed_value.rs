@@ -15,9 +15,8 @@
 //! arrays of numbers. Strings are plain UTF-8; serde_json emits non-ASCII
 //! characters unescaped.
 
-// Consumed by the rows/select handlers added in follow-up tasks; until they
-// land, nothing outside this module's unit tests references these items.
-#![allow(dead_code)]
+// Consumed by the rows endpoint in Task 4; the remaining items below are
+// consumed by the select handlers added in Task 5.
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -33,8 +32,10 @@ pub(crate) const MAX_ROWS_PER_REQUEST: usize = 10_000;
 /// Maximum request body size (32 MiB).
 pub(crate) const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// Maximum timestamps accepted by a single point-query request.
+#[allow(dead_code)] // Consumed by the Task 5 select_points handler.
 pub(crate) const MAX_TIMESTAMPS: usize = 10_000;
 /// Maximum `limit` accepted by a range query.
+#[allow(dead_code)] // Consumed by the Task 5 select handler.
 pub(crate) const MAX_LIMIT: usize = 100_000;
 
 const FIELD_TYPE: &str = "type";
@@ -213,6 +214,7 @@ fn from_json_f64<E: de::Error>(raw_value: &serde_json::Value) -> Result<TypedVal
 }
 
 /// Converts an engine value into its HTTP DTO. Histograms are unsupported.
+#[allow(dead_code)] // Consumed by the Task 5 select handlers.
 pub(crate) fn from_tsink_value(value: &tsink::Value) -> Result<TypedValueDto, &'static str> {
     match value {
         tsink::Value::F64(value) => Ok(TypedValueDto::F64(*value)),
