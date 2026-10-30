@@ -235,7 +235,14 @@ pub(super) async fn route_request(
             cluster_mode_unsupported_response()
         }
         ("POST", "/api/v1/select_points") => {
-            handle_rows_select_points(storage, &request, timestamp_precision, cluster_context).await
+            handle_rows_select_points(
+                storage,
+                &request,
+                timestamp_precision,
+                cluster_context,
+                &public_read_context,
+            )
+            .await
         }
         ("POST", "/v1/metrics") => {
             handle_otlp_metrics(

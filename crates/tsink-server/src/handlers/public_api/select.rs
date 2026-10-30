@@ -141,6 +141,7 @@ pub(crate) async fn handle_rows_select(
 
     match outcome {
         Ok(Ok(points)) => {
+            record_query_pressure(&tenant_id, 1, points.len());
             record_query_usage(
                 public_read_context.usage_accounting,
                 &tenant_id,
@@ -166,6 +167,7 @@ pub(crate) async fn handle_rows_select_points(
     request: &HttpRequest,
     precision: TimestampPrecision,
     cluster_context: Option<&ClusterRequestContext>,
+    public_read_context: &PublicReadContext<'_>,
 ) -> HttpResponse {
     // Timestamps arrive in `precision` units and are stored verbatim (spec §4);
     // the parameter is part of the pinned handler signature.
@@ -173,6 +175,7 @@ pub(crate) async fn handle_rows_select_points(
     if cluster_context.is_some() {
         return cluster_mode_unsupported_response();
     }
+    let started = Instant::now();
     let read_admission = match admission::global_public_read_admission() {
         Ok(controller) => controller,
         Err(err) => return text_response(500, &format!("read admission unavailable: {err}")),
@@ -181,9 +184,34 @@ pub(crate) async fn handle_rows_select_points(
         Ok(tenant_id) => tenant_id,
         Err(err) => return select_bad_request_response(&err),
     };
+    let tenant_plan = match prepare_tenant_request(
+        public_read_context.tenant_registry,
+        public_read_context.managed_control_plane,
+        request,
+        &tenant_id,
+        tenant::TenantAccessScope::Read,
+    ) {
+        Ok(plan) => plan,
+        Err(response) => return response,
+    };
+    if let Err(err) = tenant::enforce_read_queries_quota(tenant_plan.policy(), 1) {
+        tenant_plan.record_rejected(tenant::TenantAdmissionSurface::Query, 1, err.clone());
+        return select_bad_request_response(&err);
+    }
+    let _tenant_request = match tenant_plan.admit_with_usage(
+        tenant::TenantAdmissionSurface::Query,
+        1,
+        public_read_context.usage_accounting,
+    ) {
+        Ok(guard) => guard,
+        Err(err) => return err.to_http_response(),
+    };
     let _read_admission = match read_admission.admit_request(1).await {
         Ok(lease) => lease,
-        Err(err) => return read_admission_error_response(err),
+        Err(err) => {
+            tenant_plan.record_throttled(tenant::TenantAdmissionSurface::Query, 1, err.to_string());
+            return read_admission_error_response(err);
+        }
     };
     let query = match parse_select_points_request(&request.body) {
         Ok(query) => query,
@@ -197,7 +225,22 @@ pub(crate) async fn handle_rows_select_points(
     .await;
 
     match outcome {
-        Ok(Ok(points)) => select_points_success_response(&points),
+        Ok(Ok(points)) => {
+            record_query_pressure(&tenant_id, 1, points.len());
+            record_query_usage(
+                public_read_context.usage_accounting,
+                &tenant_id,
+                "select_points",
+                request.path_without_query(),
+                QueryUsageMetrics::new(
+                    1,
+                    points.len() as u64,
+                    elapsed_nanos_since(started),
+                    request.body.len() as u64,
+                ),
+            );
+            select_points_success_response(&points)
+        }
         Ok(Err(err)) => select_storage_error_response(&err),
         Err(err) => select_execution_error_response(&format!("select_points task failed: {err}")),
     }
@@ -280,17 +323,11 @@ fn select_points_success_response(points: &[DataPoint]) -> HttpResponse {
 }
 
 fn select_bad_request_response(error: &str) -> HttpResponse {
-    json_response(
-        400,
-        &json!({"status": "error", "errorType": "bad_data", "error": error}),
-    )
+    query_error_response(400, "bad_data", error)
 }
 
 fn select_execution_error_response(error: &str) -> HttpResponse {
-    json_response(
-        500,
-        &json!({"status": "error", "errorType": "execution", "error": error}),
-    )
+    query_error_response(500, "execution", error)
 }
 
 /// Storage failures raised by the read paths: invalid ranges/identifiers are
@@ -311,12 +348,16 @@ mod tests {
     use super::super::super::router::route_request;
     use super::super::super::{AppContext, PublicReadContext, RequestContext};
     use super::super::typed_value::{MAX_LIMIT, MAX_TIMESTAMPS};
-    use super::{handle_rows_select, handle_rows_select_points};
+    use super::*;
 
     use crate::cluster::config::ClusterConfig;
     use crate::cluster::{ClusterRequestContext, ClusterRuntime};
     use crate::exemplar_store::ExemplarStore;
     use crate::http::{HttpRequest, HttpResponse};
+    use crate::managed_control_plane::{
+        DeploymentLifecycleState, ManagedControlPlane, ManagedControlPlaneActor,
+        ManagedDeploymentProvisionRequest, ManagedTenantApplyRequest, TenantLifecycleState,
+    };
     use crate::metadata_store::MetricMetadataStore;
     use crate::tenant;
     use serde_json::{json, Value as JsonValue};
@@ -422,6 +463,7 @@ mod tests {
             &request("/api/v1/select_points", body),
             TimestampPrecision::Milliseconds,
             None,
+            &no_read_context(),
         )
         .await
     }
@@ -631,6 +673,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_range_is_rejected() {
+        let storage = make_storage();
+        for (start, end) in [(BASE_TS, BASE_TS), (BASE_TS + STEP, BASE_TS)] {
+            let response = run_select(
+                &storage,
+                json!({
+                    "metric": METRIC,
+                    "labels": [["device_id", "A"]],
+                    "start": start,
+                    "end": end,
+                    "limit": 10,
+                }),
+            )
+            .await;
+            assert_eq!(response.status, 400, "{}", response_text(&response));
+            assert!(
+                response_text(&response).contains("invalid time range"),
+                "got {}",
+                response_text(&response)
+            );
+        }
+
+        // Parse-level validation rejects the request first; assert the storage
+        // error mapping (`InvalidTimeRange` -> 400) directly as well.
+        let mapped = select_storage_error_response(&tsink::TsinkError::InvalidTimeRange {
+            start: 5,
+            end: 5,
+        });
+        assert_eq!(mapped.status, 400, "{}", response_text(&mapped));
+        assert!(response_text(&mapped).contains("Invalid timestamp range"));
+    }
+
+    #[tokio::test]
     async fn cluster_mode_returns_501() {
         let storage = make_storage();
         let metadata_store = Arc::new(MetricMetadataStore::in_memory());
@@ -683,6 +758,85 @@ mod tests {
                         && value == "text/plain"),
                 "{path} must stay text/plain"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_request_dispatches_select_endpoints() {
+        let storage = make_storage();
+        tenant::scoped_storage(Arc::clone(&storage), "team-a")
+            .insert_rows(&[Row::with_labels(
+                METRIC,
+                device_labels("A"),
+                DataPoint::new(BASE_TS, 7.5),
+            )])
+            .expect("seed write should succeed");
+        let registry = tenant::TenantRegistry::from_json_str(r#"{"tenants":{"team-a":{}}}"#)
+            .expect("tenant registry should parse");
+        let metadata_store = Arc::new(MetricMetadataStore::in_memory());
+        let exemplar_store = Arc::new(ExemplarStore::in_memory());
+        let engine = Engine::with_precision(Arc::clone(&storage), TimestampPrecision::Milliseconds);
+
+        let cases = [
+            (
+                "/api/v1/select",
+                json!({
+                    "metric": METRIC,
+                    "labels": [["device_id", "A"]],
+                    "start": BASE_TS,
+                    "end": BASE_TS + STEP,
+                    "order": "desc",
+                    "limit": 10,
+                }),
+            ),
+            (
+                "/api/v1/select_points",
+                json!({
+                    "metric": METRIC,
+                    "labels": [["device_id", "A"]],
+                    "timestamps": [BASE_TS],
+                }),
+            ),
+        ];
+
+        for (path, body) in cases {
+            let mut dispatch_request = request(path, body);
+            dispatch_request
+                .headers
+                .insert(tenant::TENANT_HEADER.to_string(), "team-a".to_string());
+            let response = route_request(
+                AppContext {
+                    storage: &storage,
+                    metadata_store: &metadata_store,
+                    exemplar_store: &exemplar_store,
+                    rules_runtime: None,
+                    engine: &engine,
+                    cluster_context: None,
+                    tenant_registry: Some(&registry),
+                    rbac_registry: None,
+                    edge_sync_context: None,
+                    security_manager: None,
+                    usage_accounting: None,
+                    managed_control_plane: None,
+                },
+                RequestContext {
+                    request: dispatch_request,
+                    server_start: Instant::now(),
+                    timestamp_precision: TimestampPrecision::Milliseconds,
+                    admin_api_enabled: false,
+                    admin_path_prefix: None,
+                    internal_api: None,
+                },
+            )
+            .await;
+
+            assert_eq!(response.status, 200, "{path}: {}", response_text(&response));
+            let body = response_json(&response);
+            assert_eq!(body["status"], "success");
+            let points = response_points(&body);
+            assert_eq!(points.len(), 1, "{path} should return the seeded point");
+            assert_eq!(points[0]["timestamp"], BASE_TS);
+            assert_eq!(points[0]["value"]["value"], 7.5);
         }
     }
 
@@ -815,9 +969,87 @@ mod tests {
             ),
             TimestampPrecision::Milliseconds,
             None,
+            &no_read_context(),
         )
         .await;
         assert_eq!(points.status, 400, "{}", response_text(&points));
+    }
+
+    #[tokio::test]
+    async fn suspended_managed_tenant_is_rejected_on_select_points() {
+        let storage = make_storage();
+        let control_plane = ManagedControlPlane::open(None).expect("control plane should open");
+        let actor = ManagedControlPlaneActor {
+            id: "test".to_string(),
+            scope: "test".to_string(),
+        };
+        control_plane
+            .provision_deployment(
+                actor.clone(),
+                ManagedDeploymentProvisionRequest {
+                    deployment_id: "prod".to_string(),
+                    display_name: Some("Prod".to_string()),
+                    region: Some("test-region".to_string()),
+                    plan: Some("test-plan".to_string()),
+                    lifecycle: Some(DeploymentLifecycleState::Ready),
+                    ..ManagedDeploymentProvisionRequest::default()
+                },
+            )
+            .expect("deployment should provision");
+        control_plane
+            .apply_tenant(
+                actor,
+                ManagedTenantApplyRequest {
+                    tenant_id: "team-a".to_string(),
+                    deployment_id: Some("prod".to_string()),
+                    lifecycle: Some(TenantLifecycleState::Suspended),
+                    ..ManagedTenantApplyRequest::default()
+                },
+            )
+            .expect("tenant should apply");
+        let context = PublicReadContext::new(None, None, Some(&control_plane), None);
+
+        for (path, body) in [
+            (
+                "/api/v1/select_points",
+                json!({
+                    "metric": METRIC,
+                    "labels": [["device_id", "A"]],
+                    "timestamps": [BASE_TS],
+                }),
+            ),
+            ("/api/v1/select", select_body(Some("desc"), Some(1), None)),
+        ] {
+            let mut suspended_request = request(path, body);
+            suspended_request
+                .headers
+                .insert(tenant::TENANT_HEADER.to_string(), "team-a".to_string());
+            let response = if path == "/api/v1/select_points" {
+                handle_rows_select_points(
+                    &storage,
+                    &suspended_request,
+                    TimestampPrecision::Milliseconds,
+                    None,
+                    &context,
+                )
+                .await
+            } else {
+                handle_rows_select(
+                    &storage,
+                    &suspended_request,
+                    TimestampPrecision::Milliseconds,
+                    None,
+                    &context,
+                )
+                .await
+            };
+            assert_eq!(response.status, 403, "{path}: {}", response_text(&response));
+            assert!(
+                response_text(&response).contains("suspended"),
+                "{path} got {}",
+                response_text(&response)
+            );
+        }
     }
 
     #[tokio::test]
@@ -905,6 +1137,7 @@ mod tests {
                 &points_request,
                 TimestampPrecision::Milliseconds,
                 None,
+                &context,
             )
             .await;
             assert_eq!(

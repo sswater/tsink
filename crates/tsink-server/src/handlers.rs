@@ -6446,15 +6446,20 @@ fn storage_for_promql_request(
     ))
 }
 
-fn promql_error_response(error_type: &str, error: &str) -> HttpResponse {
+/// Shared JSON error envelope for public query endpoints.
+fn query_error_response(status: u16, error_type: &str, error: &str) -> HttpResponse {
     json_response(
-        422,
+        status,
         &json!({
             "status": "error",
             "errorType": error_type,
             "error": error,
         }),
     )
+}
+
+fn promql_error_response(error_type: &str, error: &str) -> HttpResponse {
+    query_error_response(422, error_type, error)
 }
 
 fn promql_success_response(value: &PromqlValue, precision: TimestampPrecision) -> HttpResponse {
