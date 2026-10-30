@@ -252,11 +252,13 @@ Successful responses use the standard success envelope. Query errors use the Pro
 
 | Limit | Value |
 |---|---|
-| Raw size of a single value (`bytes` length or `string` UTF-8 byte length) | 64 KiB (65 536 bytes) |
+| Raw size of a single value (on write; `bytes` length or `string` UTF-8 byte length) | 64 KiB (65 536 bytes) |
 | Rows per `POST /api/v1/rows` request | 10 000 |
-| Request body size | 32 MiB |
+| Request body size for `POST /api/v1/rows` | 32 MiB |
 | Timestamps per `POST /api/v1/select_points` request | 10 000 |
 | `limit` for `POST /api/v1/select` | required, `1..=100 000` |
+
+The 64 KiB value cap is enforced on write, and the 32 MiB body cap applies only to `POST /api/v1/rows`. The read endpoints have no handler-level body limit and are bounded only by the HTTP transport limit (64 MiB).
 
 Base64 inflates `bytes` payloads by ~33%. The 64 KiB value cap follows from the storage shape — chunks seal at 2 048 points and have no byte dimension — so deployments that legitimately approach it should lower `with_chunk_points` (see [Data Types](data-types.md#http-transport)).
 
@@ -319,7 +321,7 @@ Typed batch write for up to 10 000 rows. `bytes` is the primary use case, but ev
 }
 ```
 
-**Error codes:** `400` invalid JSON, missing or invalid fields, invalid base64, or a value/row/body limit exceeded; `413` per-tenant write quota or non-retryable admission resource limit; `429` admission backpressure (`X-Tsink-Write-Error-Code: write_overloaded`, `Retry-After: 1`); `500` internal failure.
+**Error codes:** `400` invalid JSON, missing or invalid fields, invalid base64, or a value/row/body limit exceeded; `413` per-tenant write quota or non-retryable admission resource limit; `429` admission backpressure (`X-Tsink-Write-Error-Code: write_overloaded`, `Retry-After: 1`); `501` in cluster mode; `500` internal failure.
 
 ---
 
@@ -372,7 +374,7 @@ Range query over a single series with explicit ordering and a mandatory `limit`.
 }
 ```
 
-An empty window returns `200` with `"points": []`.
+A window with no matching points returns `200` with `"points": []`.
 
 **Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, invalid range, missing/out-of-range `limit`, `offset` with `order: "desc"`, per-tenant read-query quota, or a histogram result; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
 
@@ -1156,7 +1158,9 @@ All control-plane mutation requests require a JSON body. Responses follow `{"sta
 | `413` | Request exceeds a configured quota (rows, queries, range points, histogram buckets). |
 | `415` | Unsupported `Content-Type`. |
 | `422` | Feature disabled on this node. |
+| `429` | Admission backpressure; retry after the `Retry-After` interval. |
 | `500` | Internal server error. |
+| `501` | Operation not supported in this deployment mode (the typed row endpoints in cluster mode). |
 | `503` | Required subsystem not configured or unavailable. |
 
 On write and read admission errors the response also sets:
