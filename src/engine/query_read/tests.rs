@@ -432,14 +432,16 @@ fn persistent_numeric_and_blob_storage(
 #[test]
 fn point_scan_single_decompression_per_chunk_group() {
     let temp_dir = TempDir::new().unwrap();
-    // 50 clustered timestamps fit in exactly one chunk; large zero-filled blob
-    // values make the persisted chunk payload a zstd candidate.
+    // 50 clustered timestamps fit in exactly one chunk. Each value carries its
+    // timestamp in every byte: highly compressible (so the persisted chunk takes
+    // the zstd path) but distinct per point, so misaligned index decoding would
+    // produce the wrong value.
     let storage = persistent_numeric_and_blob_storage(temp_dir.path(), 50);
     let rows = (0..50i64)
         .map(|ts| {
             Row::new(
                 "point_scan_inv2",
-                DataPoint::new(ts, Value::Bytes(vec![0u8; 512])),
+                DataPoint::new(ts, Value::Bytes(vec![ts as u8; 512])),
             )
         })
         .collect::<Vec<_>>();
@@ -475,6 +477,17 @@ fn point_scan_single_decompression_per_chunk_group() {
     assert!(points
         .windows(2)
         .all(|window| window[0].timestamp < window[1].timestamp));
+    for ts in [0i64, 1, 17, 33, 49] {
+        let point = points
+            .iter()
+            .find(|point| point.timestamp == ts)
+            .unwrap_or_else(|| panic!("missing point at ts {ts}"));
+        assert_eq!(
+            point.value,
+            Value::Bytes(vec![ts as u8; 512]),
+            "indexed value decode returned the wrong value at ts {ts}"
+        );
+    }
     assert_eq!(
         stats.chunk_groups_touched, 1,
         "INV-2: 50 clustered timestamps in one chunk must decode the chunk once"

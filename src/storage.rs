@@ -667,6 +667,10 @@ pub trait Storage: Send + Sync {
     /// source version, missing timestamps are omitted, and the output is ordered
     /// ascending by timestamp. There is no limit parameter and no ordering
     /// guarantee beyond the natural ascending implementation order.
+    ///
+    /// Known boundary: a requested timestamp equal to `i64::MAX` may not be
+    /// returned because the half-open `[start, end)` interval cannot represent an
+    /// upper bound of `i64::MAX + 1`.
     fn select_at_timestamps(
         &self,
         metric: &str,

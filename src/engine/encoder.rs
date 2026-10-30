@@ -396,17 +396,7 @@ impl Encoder {
             return Ok(Vec::new());
         }
 
-        let mut pos = 0usize;
-        let ts_len = read_u32(payload, &mut pos)? as usize;
-        let ts_payload = read_bytes(payload, &mut pos, ts_len)?;
-        let value_len = read_u32(payload, &mut pos)? as usize;
-        let value_payload = read_bytes(payload, &mut pos, value_len)?;
-
-        if pos != payload.len() {
-            return Err(TsinkError::DataCorruption(
-                "encoded chunk payload has trailing bytes".to_string(),
-            ));
-        }
+        let (ts_payload, value_payload) = split_chunk_payload(payload)?;
 
         let timestamps = decode_timestamps(ts_codec, ts_payload, point_count)?;
         let first = timestamps.partition_point(|ts| *ts < start);
@@ -455,17 +445,7 @@ impl Encoder {
             return Ok(Vec::new());
         }
 
-        let mut pos = 0usize;
-        let ts_len = read_u32(payload, &mut pos)? as usize;
-        let _ts_payload = read_bytes(payload, &mut pos, ts_len)?;
-        let value_len = read_u32(payload, &mut pos)? as usize;
-        let value_payload = read_bytes(payload, &mut pos, value_len)?;
-
-        if pos != payload.len() {
-            return Err(TsinkError::DataCorruption(
-                "encoded chunk payload has trailing bytes".to_string(),
-            ));
-        }
+        let (_ts_payload, value_payload) = split_chunk_payload(payload)?;
 
         let mut out = Vec::with_capacity(indexes.len());
         let mut run_start = 0usize;

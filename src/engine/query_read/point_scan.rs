@@ -11,9 +11,10 @@ use super::*;
 /// Honest work counters for a point scan.
 ///
 /// `chunk_groups_touched` counts the distinct `(source layer, chunk)` groups
-/// whose payload was fetched and decoded. Because a group is decoded exactly
-/// once, this is also the number of zstd decompressions performed by the call
-/// (INV-2), independent of how many timestamps were requested.
+/// whose payload was fetched and decoded. In-memory active/sealed groups are
+/// counted too, so this is an upper bound on the number of zstd decompressions
+/// (which equals the number of touched persisted groups), independent of how
+/// many timestamps were requested.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PointScanStats {
     pub chunk_groups_touched: usize,
@@ -169,14 +170,17 @@ impl ChunkStorage {
                 &wanted,
             )),
             CandidateSource::Sealed(chunk) => {
-                if !chunk.points.is_empty() {
+                // Mirror the reverse scan's preference: a finalized sealed chunk
+                // always carries its encoded payload, so use it first and fall
+                // back to raw in-memory points only for payload-less chunks.
+                if chunk.encoded_payload.is_empty() {
+                    if chunk.points.is_empty() {
+                        return Ok(Vec::new());
+                    }
                     return Ok(points_from_in_memory_snapshot(
                         chunk.points.iter().map(|point| (point.ts, &point.value)),
                         &wanted,
                     ));
-                }
-                if chunk.encoded_payload.is_empty() {
-                    return Ok(Vec::new());
                 }
 
                 let descriptor = EncodedChunkDescriptor {
@@ -308,15 +312,14 @@ fn index_payload_matches(
         else {
             continue;
         };
-        let block = if let Some(block) = block_cache.get(&block_idx) {
-            block
-        } else {
-            let block = search_index.decode_block(descriptor.point_count, ts_payload, block_idx)?;
-            block_cache.insert(block_idx, block);
-            block_cache
-                .get(&block_idx)
-                .expect("block was just inserted")
-        };
+        if let std::collections::hash_map::Entry::Vacant(entry) = block_cache.entry(block_idx) {
+            entry.insert(search_index.decode_block(
+                descriptor.point_count,
+                ts_payload,
+                block_idx,
+            )?);
+        }
+        let block = &block_cache[&block_idx];
 
         let end = block.partition_point(|candidate| *candidate <= timestamp);
         if end == 0 || block[end - 1] != timestamp {
