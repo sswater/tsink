@@ -33,8 +33,12 @@ pub(crate) async fn handle_rows_write(
     request: &HttpRequest,
     precision: TimestampPrecision,
     tenant_registry: Option<&tenant::TenantRegistry>,
+    managed_control_plane: Option<&ManagedControlPlane>,
     usage_accounting: Option<&UsageAccounting>,
 ) -> HttpResponse {
+    // Timestamps arrive in `precision` units and are stored verbatim (spec §4);
+    // the parameter is part of the pinned handler signature.
+    let _ = precision;
     let started = Instant::now();
     let write_admission = match admission::global_public_write_admission() {
         Ok(controller) => controller,
@@ -46,7 +50,7 @@ pub(crate) async fn handle_rows_write(
     };
     let tenant_plan = match prepare_tenant_request(
         tenant_registry,
-        None,
+        managed_control_plane,
         request,
         &tenant_id,
         tenant::TenantAccessScope::Write,
@@ -66,7 +70,7 @@ pub(crate) async fn handle_rows_write(
         );
     }
 
-    let rows = match parse_rows_request(&request.body, precision) {
+    let rows = match parse_rows_request(&request.body) {
         Ok(rows) => rows,
         Err(err) => return text_response(400, &err),
     };
@@ -143,7 +147,7 @@ fn rows_write_success_response(inserted_rows: usize) -> HttpResponse {
     )
 }
 
-fn parse_rows_request(body: &[u8], precision: TimestampPrecision) -> Result<Vec<Row>, String> {
+fn parse_rows_request(body: &[u8]) -> Result<Vec<Row>, String> {
     let payload: JsonValue =
         serde_json::from_slice(body).map_err(|err| format!("invalid JSON body: {err}"))?;
     let raw_rows = payload
@@ -160,20 +164,15 @@ fn parse_rows_request(body: &[u8], precision: TimestampPrecision) -> Result<Vec<
     raw_rows
         .iter()
         .enumerate()
-        .map(|(index, raw_row)| parse_row(index, raw_row, precision))
+        .map(|(index, raw_row)| parse_row(index, raw_row))
         .collect()
 }
 
-fn parse_row(
-    index: usize,
-    raw_row: &JsonValue,
-    precision: TimestampPrecision,
-) -> Result<Row, String> {
+fn parse_row(index: usize, raw_row: &JsonValue) -> Result<Row, String> {
     let row = RawRow::deserialize(raw_row).map_err(|err| format!("row {index}: {err}"))?;
     if row.metric.is_empty() {
         return Err(format!("row {index}: metric name is required"));
     }
-    validate_timestamp(index, row.timestamp, precision)?;
     let labels = row
         .labels
         .into_iter()
@@ -222,21 +221,6 @@ fn parse_row_value(index: usize, raw_value: &JsonValue) -> Result<TypedValueDto,
     Ok(value)
 }
 
-/// Request timestamps are already expressed in `precision` units (spec §4) and
-/// are stored verbatim; only the engine-wide sentinel needs rejecting.
-fn validate_timestamp(
-    index: usize,
-    timestamp: i64,
-    precision: TimestampPrecision,
-) -> Result<(), String> {
-    if timestamp == i64::MAX {
-        return Err(format!(
-            "row {index}: timestamp {timestamp} is out of supported range for {precision:?} precision"
-        ));
-    }
-    Ok(())
-}
-
 /// Storage failures raised by `insert_rows`: validation and value-family
 /// mismatches are client errors, everything else follows the shared write
 /// error classification.
@@ -282,7 +266,7 @@ mod tests {
         precision: TimestampPrecision,
         body: impl Into<Vec<u8>>,
     ) -> HttpResponse {
-        handle_rows_write(storage, &rows_request(body), precision, None, None).await
+        handle_rows_write(storage, &rows_request(body), precision, None, None, None).await
     }
 
     fn response_json(response: &HttpResponse) -> JsonValue {
@@ -571,5 +555,141 @@ mod tests {
             )
             .expect("empty range query should succeed")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn rows_write_scopes_rows_to_requesting_tenant() {
+        let storage = make_storage(TimestampPrecision::Milliseconds);
+        let tenant_registry = tenant::TenantRegistry::from_json_str(r#"{"tenants":{"team-a":{}}}"#)
+            .expect("tenant registry should parse");
+        let mut request = rows_request(
+            json!({
+                "rows": [{
+                    "metric": "device_data",
+                    "labels": [["device_id", "A"]],
+                    "timestamp": 1_730_000_000_000_i64,
+                    "value": {"type": "bytes", "value": "yv4="}
+                }]
+            })
+            .to_string(),
+        );
+        request
+            .headers
+            .insert(tenant::TENANT_HEADER.to_string(), "team-a".to_string());
+
+        let response = handle_rows_write(
+            &storage,
+            &request,
+            TimestampPrecision::Milliseconds,
+            Some(&tenant_registry),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response_text(&response));
+
+        let points = storage
+            .select(
+                "device_data",
+                &[
+                    Label::new("device_id", "A"),
+                    Label::new(tenant::TENANT_LABEL, "team-a"),
+                ],
+                1_730_000_000_000,
+                1_730_000_000_001,
+            )
+            .expect("tenant row must be persisted under the requesting tenant");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value.as_bytes(), Some(&[0xCA, 0xFE][..]));
+
+        assert!(
+            storage
+                .select(
+                    "device_data",
+                    &tenant_scoped("A"),
+                    1_730_000_000_000,
+                    1_730_000_000_001,
+                )
+                .expect("default tenant read should succeed")
+                .is_empty(),
+            "row must not land in the default tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn rows_write_rejects_suspended_managed_tenant() {
+        let storage = make_storage(TimestampPrecision::Milliseconds);
+        let control_plane = ManagedControlPlane::open(None).expect("control plane should open");
+        let actor = ManagedControlPlaneActor {
+            id: "test".to_string(),
+            scope: "test".to_string(),
+        };
+        control_plane
+            .provision_deployment(
+                actor.clone(),
+                ManagedDeploymentProvisionRequest {
+                    deployment_id: "prod".to_string(),
+                    display_name: Some("Prod".to_string()),
+                    region: Some("test-region".to_string()),
+                    plan: Some("test-plan".to_string()),
+                    lifecycle: Some(crate::managed_control_plane::DeploymentLifecycleState::Ready),
+                    ..ManagedDeploymentProvisionRequest::default()
+                },
+            )
+            .expect("deployment should provision");
+        control_plane
+            .apply_tenant(
+                actor,
+                ManagedTenantApplyRequest {
+                    tenant_id: "team-a".to_string(),
+                    deployment_id: Some("prod".to_string()),
+                    lifecycle: Some(crate::managed_control_plane::TenantLifecycleState::Suspended),
+                    ..ManagedTenantApplyRequest::default()
+                },
+            )
+            .expect("tenant should apply");
+
+        let mut request = rows_request(
+            json!({
+                "rows": [{
+                    "metric": "device_data",
+                    "labels": [["device_id", "A"]],
+                    "timestamp": 1_730_000_000_000_i64,
+                    "value": {"type": "bytes", "value": "yv4="}
+                }]
+            })
+            .to_string(),
+        );
+        request
+            .headers
+            .insert(tenant::TENANT_HEADER.to_string(), "team-a".to_string());
+
+        let response = handle_rows_write(
+            &storage,
+            &request,
+            TimestampPrecision::Milliseconds,
+            None,
+            Some(&control_plane),
+            None,
+        )
+        .await;
+        assert_eq!(response.status, 403, "{}", response_text(&response));
+        assert!(
+            response_text(&response).contains("suspended"),
+            "got {}",
+            response_text(&response)
+        );
+        assert!(
+            storage
+                .select(
+                    "device_data",
+                    &tenant_scoped("A"),
+                    1_730_000_000_000,
+                    1_730_000_000_001
+                )
+                .expect("post-rejection read should succeed")
+                .is_empty(),
+            "suspended managed tenant must not persist rows"
+        );
     }
 }

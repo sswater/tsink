@@ -204,12 +204,14 @@ pub(super) async fn route_request(
             )
             .await
         }
+        ("POST", "/api/v1/rows") if cluster_context.is_some() => cluster_mode_rows_response(),
         ("POST", "/api/v1/rows") => {
             handle_rows_write(
                 storage,
                 &request,
                 timestamp_precision,
                 tenant_registry,
+                managed_control_plane,
                 usage_accounting,
             )
             .await
@@ -674,6 +676,13 @@ pub(super) async fn route_request(
 
 fn label_values_path(path: &str) -> Option<&str> {
     path.strip_prefix("/api/v1/label/")?.strip_suffix("/values")
+}
+
+/// Shared guard for the row-level bytes API: routing rows in cluster mode
+/// would silently write/read the local shard, so all row endpoints fail loudly
+/// instead (spec §2 非目标). Reused by the select endpoints.
+fn cluster_mode_rows_response() -> HttpResponse {
+    text_response(501, "row endpoints are not supported in cluster mode")
 }
 
 #[cfg(test)]
