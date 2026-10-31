@@ -239,6 +239,43 @@ let series = vec![
 let results: Vec<SeriesPoints> = storage.select_many(&series, start, end)?;
 ```
 
+### Descending select (newest first)
+
+`select_desc` reads newest-first and stops as soon as `limit` points are
+visible, so the cost is independent of the window width — use it for
+"latest N samples" queries over long ranges:
+
+```rust
+// Newest 100 points in [start, end), strictly descending.
+// `limit` is required; paginate further back by setting `end` to the
+// oldest timestamp of the previous page ([start, end) is end-exclusive).
+let points: Vec<DataPoint> =
+    storage.select_desc("cpu_usage", &[], start, end, 100)?;
+
+for p in &points {
+    println!("t={} v={:?}", p.timestamp, p.value);
+}
+```
+
+Duplicate timestamps collapse to the newest stored copy (the ascending
+`select` may return several). Points removed by retention or tombstones
+are skipped and do not count against `limit`.
+
+### Point queries by timestamp list
+
+`select_at_timestamps` fetches exact points for a list of timestamps —
+use it to join a set of timestamps (e.g. produced by another series)
+against one series without scanning a range:
+
+```rust
+let timestamps = vec![1_700_000_000_000, 1_700_000_060_000];
+let points: Vec<DataPoint> =
+    storage.select_at_timestamps("payload", &labels, &timestamps)?;
+```
+
+Points are returned in ascending timestamp order; timestamps with no
+stored point are omitted, duplicate timestamps are deduplicated.
+
 ### Advanced queries with QueryOptions
 
 `select_with_options` provides aggregation, downsampling, and pagination:

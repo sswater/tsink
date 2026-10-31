@@ -13,6 +13,7 @@ tsink accepts data over seven protocols. Three are HTTP-based and handled by the
 | Prometheus Text Exposition | HTTP POST | `POST /api/v1/import/prometheus` | Bulk plain-text import |
 | InfluxDB Line Protocol | HTTP POST | `POST /write`, `POST /api/v2/write` | v1 and v2 compatible |
 | OTLP HTTP | HTTP POST | `POST /v1/metrics` | Protobuf only |
+| Typed Row JSON | HTTP POST | `POST /api/v1/rows` | JSON rows with typed values (`bytes`/`f64`/`i64`/`u64`/`bool`/`string`); paired query endpoints `POST /api/v1/select`, `POST /api/v1/select_points` |
 | StatsD | UDP | `--statsd-listen ADDR` | Disabled by default |
 | Graphite | TCP | `--graphite-listen ADDR` | Disabled by default |
 
