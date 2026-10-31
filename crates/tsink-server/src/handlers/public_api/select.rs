@@ -15,7 +15,7 @@ use super::super::router::cluster_mode_unsupported_response;
 use super::super::*;
 use super::typed_value::{from_tsink_value, MAX_LIMIT, MAX_TIMESTAMPS};
 use serde::Deserialize;
-use tsink::QueryOptions;
+use tsink::{ValuePredicate, ValuePredicateOp, ValuePredicateTarget};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,6 +38,65 @@ struct RawSelectRequest {
     limit: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+    #[serde(default)]
+    value_filter: Option<RawValueFilter>,
+}
+
+/// Wire form of a single-value comparison predicate: `{"op": "gt", "type":
+/// "i64", "value": 42}`. Strictly typed — the stored point must carry the
+/// exact numeric variant to be compared; anything else is dropped.
+#[derive(Debug, Deserialize)]
+struct RawValueFilter {
+    op: String,
+    #[serde(rename = "type")]
+    value_type: String,
+    value: serde_json::Number,
+}
+
+impl RawValueFilter {
+    fn into_predicate(self) -> Result<ValuePredicate, String> {
+        use ValuePredicateOp as Op;
+        let op = match self.op.as_str() {
+            "lt" => Op::Lt,
+            "lte" => Op::Lte,
+            "gt" => Op::Gt,
+            "gte" => Op::Gte,
+            "eq" => Op::Eq,
+            "ne" => Op::Ne,
+            other => return Err(format!("unknown value_filter op `{other}`")),
+        };
+        let target = match self.value_type.as_str() {
+            "i64" => {
+                let value = self.value.as_i64().ok_or_else(|| {
+                    format!(
+                        "value_filter value `{}` is not a valid i64",
+                        self.value
+                    )
+                })?;
+                ValuePredicateTarget::I64(value)
+            }
+            "u64" => {
+                let value = self.value.as_u64().ok_or_else(|| {
+                    format!(
+                        "value_filter value `{}` is not a valid u64",
+                        self.value
+                    )
+                })?;
+                ValuePredicateTarget::U64(value)
+            }
+            "f64" => {
+                let value = self.value.as_f64().ok_or_else(|| {
+                    format!(
+                        "value_filter value `{}` is not a valid f64",
+                        self.value
+                    )
+                })?;
+                ValuePredicateTarget::F64(value)
+            }
+            other => return Err(format!("unknown value_filter type `{other}`")),
+        };
+        Ok(ValuePredicate { op, target })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,7 +114,7 @@ struct SelectQuery {
     end: i64,
     order: SelectOrder,
     limit: usize,
-    offset: usize,
+    predicate: Option<ValuePredicate>,
 }
 
 struct SelectPointsQuery {
@@ -126,21 +185,26 @@ pub(crate) async fn handle_rows_select(
     }
 
     let storage = tenant::scoped_storage(Arc::clone(storage), &tenant_id);
-    let outcome = tokio::task::spawn_blocking(move || match query.order {
-        SelectOrder::Asc => storage.select_with_options(
-            &query.metric,
-            QueryOptions::new(query.start, query.end)
-                .with_labels(query.labels)
-                .with_pagination(query.offset, Some(query.limit)),
-        ),
-        SelectOrder::Desc => storage.select_desc(
-            &query.metric,
-            &query.labels,
-            query.start,
-            query.end,
-            query.limit,
-            None,
-        ),
+    let outcome = tokio::task::spawn_blocking(move || {
+        let predicate = query.predicate.as_ref();
+        match query.order {
+            SelectOrder::Asc => storage.select_asc(
+                &query.metric,
+                &query.labels,
+                query.start,
+                query.end,
+                query.limit,
+                predicate,
+            ),
+            SelectOrder::Desc => storage.select_desc(
+                &query.metric,
+                &query.labels,
+                query.start,
+                query.end,
+                query.limit,
+                predicate,
+            ),
+        }
     })
     .await;
 
@@ -272,11 +336,16 @@ fn parse_select_request(body: &[u8]) -> Result<SelectQuery, String> {
     if limit > MAX_LIMIT {
         return Err(format!("`limit` must be <= {MAX_LIMIT}, got {limit}"));
     }
-    if raw.order == SelectOrder::Desc && raw.offset.is_some() {
+    if raw.offset.is_some() {
         return Err(
-            "`offset` is not supported with order \"desc\"; page by adjusting `end`".to_string(),
+            "`offset` is not supported with `order` \"asc\" or \"desc\"; page by adjusting `start`/`end`"
+                .to_string(),
         );
     }
+    let predicate = match raw.value_filter {
+        Some(filter) => Some(filter.into_predicate()?),
+        None => None,
+    };
     if raw.start >= raw.end {
         return Err(format!(
             "invalid time range: start {} must be less than end {}",
@@ -294,7 +363,7 @@ fn parse_select_request(body: &[u8]) -> Result<SelectQuery, String> {
         end: raw.end,
         order: raw.order,
         limit,
-        offset: raw.offset.unwrap_or(0),
+        predicate,
     })
 }
 
@@ -534,7 +603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn asc_parity_with_storage_select_and_offset_paging() {
+    async fn asc_parity_with_storage_select_and_window_paging() {
         let storage = make_storage();
         seed_indexed(&storage, 10);
 
@@ -545,13 +614,16 @@ mod tests {
             .expect("baseline select should succeed");
         assert_eq!(expected.len(), 10);
 
+        // `offset` is rejected for both orders; page by narrowing the window.
         let mut paged_timestamps = Vec::new();
         let mut paged_values = Vec::new();
-        for (offset, limit) in [(0_usize, 4_usize), (4, 4), (8, 4)] {
-            // Order omitted => asc.
-            let order = (offset == 4).then_some("asc");
-            let response =
-                run_select(&storage, select_body(order, Some(limit), Some(offset))).await;
+        for page in 0..3i64 {
+            let page_start = BASE_TS + page * 4 * STEP;
+            let page_end = (page_start + 4 * STEP).min(end);
+            let mut body = select_body(Some("asc"), Some(4), None);
+            body["start"] = json!(page_start);
+            body["end"] = json!(page_end);
+            let response = run_select(&storage, body).await;
             assert_eq!(response.status, 200, "{}", response_text(&response));
             let body = response_json(&response);
             assert_eq!(body["status"], "success");
@@ -603,31 +675,170 @@ mod tests {
         assert_eq!(timestamps, baseline_timestamps);
     }
 
+    fn filter_body(order: &str, limit: usize, filter: JsonValue) -> JsonValue {
+        let mut body = select_body(Some(order), Some(limit), None);
+        body["value_filter"] = filter;
+        body
+    }
+
+    #[tokio::test]
+    async fn desc_applies_value_filter() {
+        let storage = make_storage();
+        seed_indexed(&storage, 10);
+
+        let response = run_select(
+            &storage,
+            filter_body(
+                "desc",
+                10,
+                json!({"op": "gt", "type": "f64", "value": 6.0}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response_text(&response));
+        let body = response_json(&response);
+        let points = response_points(&body);
+        // Values 7..9 survive; desc order.
+        assert_eq!(point_values(points), vec![9.0, 8.0, 7.0]);
+    }
+
+    #[tokio::test]
+    async fn asc_applies_value_filter() {
+        let storage = make_storage();
+        seed_indexed(&storage, 10);
+
+        let response = run_select(
+            &storage,
+            filter_body(
+                "asc",
+                10,
+                json!({"op": "gt", "type": "f64", "value": 6.0}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response_text(&response));
+        let body = response_json(&response);
+        let points = response_points(&body);
+        // Values 7..9 survive; asc order.
+        assert_eq!(point_values(points), vec![7.0, 8.0, 9.0]);
+    }
+
+    #[tokio::test]
+    async fn value_filter_with_limit_stops_after_enough_matches() {
+        let storage = make_storage();
+        seed_indexed(&storage, 10);
+
+        let response = run_select(
+            &storage,
+            filter_body(
+                "desc",
+                2,
+                json!({"op": "gte", "type": "f64", "value": 0.0}),
+            ),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response_text(&response));
+        let body = response_json(&response);
+        let points = response_points(&body);
+        // All values match gte 0; limit 2 caps.
+        assert_eq!(point_values(points), vec![9.0, 8.0]);
+    }
+
+    #[tokio::test]
+    async fn value_filter_rejects_wrong_typed_values() {
+        let storage = make_storage();
+        seed_indexed(&storage, 10);
+
+        // Points carry F64; an i64 filter never matches them.
+        let response = run_select(
+            &storage,
+            filter_body("desc", 10, json!({"op": "gt", "type": "i64", "value": 0})),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response_text(&response));
+        let body = response_json(&response);
+        assert!(response_points(&body).is_empty());
+    }
+
+    #[tokio::test]
+    async fn value_filter_rejects_malformed_spec() {
+        let storage = make_storage();
+        seed_indexed(&storage, 10);
+
+        for bad in [
+            json!({"op": "between", "type": "f64", "value": 1.0}),
+            json!({"op": "gt", "type": "u16", "value": 1}),
+            json!({"op": "gt", "type": "f64", "value": "abc"}),
+            json!({"op": "gt", "value": 1.0}),
+        ] {
+            let response = run_select(&storage, filter_body("desc", 10, bad)).await;
+            assert_eq!(response.status, 400, "{}", response_text(&response));
+        }
+    }
+
+    #[tokio::test]
+    async fn select_rejects_offset_for_both_orders() {
+        let storage = make_storage();
+        seed_indexed(&storage, 10);
+
+        for order in ["asc", "desc"] {
+            let response =
+                run_select(&storage, select_body(Some(order), Some(5), Some(2))).await;
+            assert_eq!(response.status, 400, "{order}: {}", response_text(&response));
+            assert!(
+                response_text(&response).contains("offset"),
+                "{order} must mention `offset`: {}",
+                response_text(&response)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn asc_returns_earliest_limit_ascending() {
+        let storage = make_storage();
+        seed_indexed(&storage, 10);
+
+        let response = run_select(&storage, select_body(Some("asc"), Some(3), None)).await;
+        assert_eq!(response.status, 200, "{}", response_text(&response));
+        let body = response_json(&response);
+        let points = response_points(&body);
+        let timestamps = point_timestamps(points);
+        assert_eq!(timestamps, vec![BASE_TS, BASE_TS + STEP, BASE_TS + 2 * STEP]);
+        assert!(
+            timestamps.windows(2).all(|pair| pair[0] < pair[1]),
+            "asc output must be strictly ascending, got {timestamps:?}"
+        );
+    }
+
     #[tokio::test]
     async fn duplicate_ts_divergence_desc_vs_asc() {
         let storage = make_storage();
-        // Two writes of the same (series, timestamp) with different values; the
-        // engine does not dedupe on the ascending path.
+        // Two writes of the same (series, timestamp) with different values; both
+        // scan directions collapse to the newest version per timestamp.
         seed(&storage, &[(BASE_TS + STEP, 1.0)]);
         seed(&storage, &[(BASE_TS + STEP, 2.0)]);
 
         let asc = run_select(&storage, select_body(Some("asc"), Some(10), None)).await;
         assert_eq!(asc.status, 200, "{}", response_text(&asc));
         let asc_body = response_json(&asc);
+        let asc_points = response_points(&asc_body);
         assert_eq!(
-            response_points(&asc_body).len(),
-            2,
-            "asc must preserve duplicate timestamps"
+            asc_points.len(),
+            1,
+            "asc must collapse duplicate timestamps to the newest version"
         );
+        assert_eq!(point_values(asc_points), vec![2.0]);
 
         let desc = run_select(&storage, select_body(Some("desc"), Some(10), None)).await;
         assert_eq!(desc.status, 200, "{}", response_text(&desc));
         let desc_body = response_json(&desc);
+        let desc_points = response_points(&desc_body);
         assert_eq!(
-            response_points(&desc_body).len(),
+            desc_points.len(),
             1,
             "desc must collapse duplicate timestamps (spec §4.2)"
         );
+        assert_eq!(point_values(desc_points), vec![2.0]);
 
         let points = run_select_points(
             &storage,
