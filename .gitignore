@@ -3,3 +3,5 @@ target
 **/*.rs.bk
 *.pdb
 **/mutants.out*/
+/.cocoindex_code/
+/.codegraph/
