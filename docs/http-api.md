@@ -327,7 +327,8 @@ Typed batch write for up to 10 000 rows. `bytes` is the primary use case, but ev
 
 ### `POST /api/v1/select`
 
-Range query over a single series with explicit ordering and a mandatory `limit`.
+Range query over a single series with explicit ordering, an optional
+single-value filter, and a mandatory `limit`.
 
 **Request body:**
 
@@ -338,7 +339,8 @@ Range query over a single series with explicit ordering and a mandatory `limit`.
   "start": 1730000000000,
   "end": 1730086400000,
   "order": "desc",
-  "limit": 100
+  "limit": 100,
+  "value_filter": {"op": "gt", "type": "f64", "value": 42.0}
 }
 ```
 
@@ -350,17 +352,38 @@ Range query over a single series with explicit ordering and a mandatory `limit`.
 | `end` | Yes | Exclusive window end; must be greater than `start`. |
 | `order` | No | `asc` (default) or `desc`. |
 | `limit` | Yes | Maximum number of points to return, `1..=100 000`. |
-| `offset` | No | `asc` only. Number of leading points to skip for paging. |
+| `value_filter` | No | Single comparison predicate on the stored value: `op` is one of `lt`, `lte`, `gt`, `gte`, `eq`, `ne`; `type` is one of `i64`, `u64`, `f64`; `value` is the comparison target as a JSON number. |
 
 **Ordering and paging:**
 
-- `asc` returns oldest-first through the existing ascending pipeline. `offset` and `limit` page through a window; an offset past the end returns an empty `points` array.
-- `desc` returns newest-first through the reverse tail scan. `offset` is rejected with `400`: continue paging by setting `end` to the oldest timestamp of the previous page (because `end` is exclusive, pages remain contiguous). Decode work is bounded by `limit` plus at most one tail block per touched chunk; metadata enumeration still visits the persisted chunk headers before `end` for the series, so a wider window can add header-scan cost even though it does not add point-decode cost.
-- `limit` is mandatory for both orders; a missing, zero, or out-of-range `limit` is rejected with `400`. Results beyond one page are fetched with `offset` (`asc`) or by narrowing the window and moving `end` (`desc`).
+- `asc` returns oldest-first through a streaming forward scan; `desc` returns
+  newest-first through a streaming reverse scan. Both directions stop decoding
+  as soon as `limit` points have been collected, so a scan without
+  `value_filter` costs roughly `limit` decoded values plus at most one block
+  (64 timestamps) per touched chunk, independent of window width; metadata
+  enumeration still visits the persisted chunk headers overlapping the window
+  for the series, so a wider window can add header-scan cost even though it
+  does not add point-decode cost.
+- `value_filter` makes the decode cost depend on predicate selectivity: in the
+  worst case the whole window is decoded to fill `limit`. Both `asc` and `desc`
+  apply the filter after the same retention/tombstone/deduplication chain, and
+  the filter only compares values whose stored type exactly matches `type`
+  (`i64`, `u64`, `f64` are mutually exclusive; points of any other type are
+  dropped, not errors). `NaN` points never match an ordering op; `eq`/`ne`
+  follow the library equality convention where `NaN == NaN` holds.
+- `offset` is rejected with `400` for both orders: page by narrowing the
+  window (because `end` is exclusive, pages remain contiguous).
+- `limit` is mandatory for both orders; a missing, zero, or out-of-range
+  `limit` is rejected with `400`.
 
 **Memory:** the handler buffers the full response in memory. Worst case is `limit × value size`; at the maximum `limit` of 100 000 and a 64 KiB value that is roughly 6.4 GiB before serialization. For large-value series use a correspondingly smaller `limit`; streaming or a response-budget mechanism is deferred.
 
-**Duplicate timestamps:** `desc` collapses points that share the same `(series, timestamp)` into a single point, keeping the newest stored copy. `asc` preserves the existing engine behaviour and may return several points for the same timestamp. The divergence is intentional: duplicate timestamps come from retries or crash replay, where the stored values are identical.
+**Duplicate timestamps:** both `asc` and `desc` collapse points that share the
+same `(series, timestamp)` into a single point, keeping the newest stored copy.
+Duplicate timestamps come from retries or crash replay, where the stored
+values are identical; a value filter is applied to that newest copy and, when
+it does not match, the whole timestamp is dropped (older versions never fall
+back into the output).
 
 **Response:** `200 application/json`
 
@@ -378,7 +401,7 @@ Range query over a single series with explicit ordering and a mandatory `limit`.
 
 A window with no matching points returns `200` with `"points": []`.
 
-**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, invalid range, missing/out-of-range `limit`, `offset` with `order: "desc"`, per-tenant read-query or range-point quota, or a histogram result; `403` suspended/managed tenant or insufficient scope; `413` (`X-Tsink-Read-Error-Code: read_resource_limit_exceeded`) non-retryable read admission resource limit; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
+**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, invalid range, missing/out-of-range `limit`, `offset` with either order, an invalid `value_filter` (`op`/`type`/`value` combination), per-tenant read-query or range-point quota, or a histogram result; `403` suspended/managed tenant or insufficient scope; `413` (`X-Tsink-Read-Error-Code: read_resource_limit_exceeded`) non-retryable read admission resource limit; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
 
 ---
 

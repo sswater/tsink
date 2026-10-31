@@ -133,7 +133,7 @@ tsink-server \
 | Prometheus Text Exposition | `POST /api/v1/import/prometheus` | Bulk import |
 | InfluxDB Line Protocol | `POST /write`, `POST /api/v2/write` | v1 and v2 compatible |
 | OTLP HTTP | `POST /v1/metrics` | Protobuf; gauges, sums, histograms, summaries |
-| Typed Row JSON | `POST /api/v1/rows` | JSON rows with typed values incl. raw `bytes`; query via `POST /api/v1/select` (asc/desc + limit) and `POST /api/v1/select_points` |
+| Typed Row JSON | `POST /api/v1/rows` | JSON rows with typed values incl. raw `bytes`; query via `POST /api/v1/select` (asc/desc + limit + value filter) and `POST /api/v1/select_points` |
 | StatsD | UDP (`--statsd-listen`) | Counter, gauge, timer, set |
 | Graphite | TCP (`--graphite-listen`) | Plaintext protocol |
 

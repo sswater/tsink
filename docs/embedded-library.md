@@ -239,27 +239,67 @@ let series = vec![
 let results: Vec<SeriesPoints> = storage.select_many(&series, start, end)?;
 ```
 
-### Descending select (newest first)
+### Ordered streaming selects (asc/desc)
 
-`select_desc` reads newest-first and stops as soon as `limit` points are
-visible, so the cost is independent of the window width — use it for
-"latest N samples" queries over long ranges:
+`select_desc` reads newest-first and `select_asc` reads oldest-first; both
+stop as soon as `limit` points are visible, so the cost is independent of the
+window width — use them for "latest/earliest N samples" queries over long
+ranges:
 
 ```rust
 // Newest 100 points in [start, end), strictly descending.
 // `limit` is required; paginate further back by setting `end` to the
 // oldest timestamp of the previous page ([start, end) is end-exclusive).
 let points: Vec<DataPoint> =
-    storage.select_desc("cpu_usage", &[], start, end, 100)?;
+    storage.select_desc("cpu_usage", &[], start, end, 100, None)?;
+
+// Earliest 50 points in [start, end), strictly ascending; paginate forward
+// by setting `start` to just past the newest timestamp of the previous page.
+let points: Vec<DataPoint> =
+    storage.select_asc("cpu_usage", &[], start, end, 50, None)?;
 
 for p in &points {
     println!("t={} v={:?}", p.timestamp, p.value);
 }
 ```
 
-Duplicate timestamps collapse to the newest stored copy (the ascending
-`select` may return several). Points removed by retention or tombstones
-are skipped and do not count against `limit`.
+Duplicate timestamps collapse to the newest stored copy in both directions
+(the plain `select` may return several). Points removed by retention or
+tombstones are skipped and do not count against `limit`.
+
+### Filtering by value during a scan
+
+Both ordered selects accept an optional single-value predicate. It is applied
+during the scan, after the retention/tombstone/deduplication chain, so the
+scan still stops as soon as `limit` *matching* points have been collected:
+
+```rust
+use tsink::{ValuePredicate, ValuePredicateOp, ValuePredicateTarget};
+
+// The 100 newest samples above 42.0.
+let predicate = ValuePredicate {
+    op: ValuePredicateOp::Gt,
+    target: ValuePredicateTarget::F64(42.0),
+};
+let points: Vec<DataPoint> =
+    storage.select_desc("cpu_usage", &[], start, end, 100, Some(&predicate))?;
+```
+
+Rules:
+
+- Matching is strictly typed: a stored `i64`/`u64`/`f64` value only compares
+  against a predicate target of the same variant. Points of any other type
+  (`bool`, `bytes`, `string`, histogram) — or of a different numeric variant —
+  are dropped, never an error.
+- A `NaN` point never matches an ordering op (`lt`/`lte`/`gt`/`gte`); `eq` and
+  `ne` follow the library equality convention where `NaN == NaN` holds.
+- A point whose newest version fails the predicate drops its timestamp
+  entirely; older versions of the same timestamp never fall back into the
+  output.
+- Without a predicate the decode cost stays independent of window width; with
+  a selective predicate the scan may decode the whole window to fill `limit`
+  (the worst case is a non-selective predicate), so prefer tight windows for
+  rarely-matching filters.
 
 ### Point queries by timestamp list
 

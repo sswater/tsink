@@ -88,6 +88,7 @@ impl ChunkStorage {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn select_asc_with_plan(
         &self,
         metric: &str,
@@ -111,6 +112,7 @@ impl ChunkStorage {
         self.select_asc_for_series_with_plan(series_id, start, end, limit, predicate, plan)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn select_asc_for_series_with_plan(
         &self,
         series_id: SeriesId,
