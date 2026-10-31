@@ -236,6 +236,22 @@ impl From<&QueryObservabilityCounters> for QueryObservabilitySnapshot {
             select_with_options_points_returned_total: counters
                 .select_with_options_points_returned_total
                 .load(Ordering::Relaxed),
+            select_desc_calls_total: counters.select_desc_calls_total.load(Ordering::Relaxed),
+            select_desc_errors_total: counters.select_desc_errors_total.load(Ordering::Relaxed),
+            select_desc_duration_nanos_total: counters
+                .select_desc_duration_nanos_total
+                .load(Ordering::Relaxed),
+            select_desc_points_returned_total: counters
+                .select_desc_points_returned_total
+                .load(Ordering::Relaxed),
+            select_asc_calls_total: counters.select_asc_calls_total.load(Ordering::Relaxed),
+            select_asc_errors_total: counters.select_asc_errors_total.load(Ordering::Relaxed),
+            select_asc_duration_nanos_total: counters
+                .select_asc_duration_nanos_total
+                .load(Ordering::Relaxed),
+            select_asc_points_returned_total: counters
+                .select_asc_points_returned_total
+                .load(Ordering::Relaxed),
             select_all_calls_total: counters.select_all_calls_total.load(Ordering::Relaxed),
             select_all_errors_total: counters.select_all_errors_total.load(Ordering::Relaxed),
             select_all_duration_nanos_total: counters

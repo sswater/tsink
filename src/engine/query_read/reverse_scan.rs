@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use parking_lot::RwLockReadGuard;
 
@@ -8,6 +9,7 @@ use crate::engine::encoder::{Encoder, TimestampSearchIndex, TIMESTAMP_SEARCH_BLO
 use crate::validation::{validate_labels, validate_metric};
 use crate::{DataPoint, Label, Result, TsinkError, ValuePredicate};
 
+use super::super::{elapsed_nanos_u64, saturating_u64_from_usize};
 use super::super::state::ActivePartitionSnapshot;
 use super::*;
 
@@ -72,20 +74,51 @@ impl ChunkStorage {
         limit: usize,
         predicate: Option<&ValuePredicate>,
     ) -> Result<Vec<DataPoint>> {
-        self.ensure_open()?;
-        validate_metric(metric)?;
-        validate_labels(labels)?;
-        if start >= end {
-            return Err(TsinkError::InvalidTimeRange { start, end });
-        }
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
+        self.observability
+            .query
+            .select_desc_calls_total
+            .fetch_add(1, Ordering::Relaxed);
+        let started = std::time::Instant::now();
 
-        let plan = self.query_tier_plan(start, end);
-        let (points, _stats) =
-            self.select_desc_with_plan(metric, labels, start, end, limit, predicate, plan)?;
-        Ok(points)
+        let result = (|| -> Result<Vec<DataPoint>> {
+            self.ensure_open()?;
+            validate_metric(metric)?;
+            validate_labels(labels)?;
+            self.request_background_persisted_refresh_if_needed();
+            if start >= end {
+                return Err(TsinkError::InvalidTimeRange { start, end });
+            }
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+
+            let plan = self.query_tier_plan(start, end);
+            let (points, _stats) =
+                self.select_desc_with_plan(metric, labels, start, end, limit, predicate, plan)?;
+            Ok(points)
+        })();
+
+        self.observability
+            .query
+            .select_desc_duration_nanos_total
+            .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+
+        match result {
+            Ok(points) => {
+                self.observability
+                    .query
+                    .select_desc_points_returned_total
+                    .fetch_add(saturating_u64_from_usize(points.len()), Ordering::Relaxed);
+                Ok(points)
+            }
+            Err(err) => {
+                self.observability
+                    .query
+                    .select_desc_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(err)
+            }
+        }
     }
 
     pub(super) fn select_desc_with_plan(
