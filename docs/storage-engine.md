@@ -127,8 +127,10 @@ A separate file `wal.published` records the highest `(segment, frame)` pair that
 
 | Mode | Behavior |
 |---|---|
-| `Strict` (default) | Any checksum mismatch or truncation fails the open call immediately. |
+| `Strict` (library default) | Any checksum mismatch or truncation fails the open call immediately. |
 | `Salvage` | Skips corrupted frames whose boundaries are intact; quarantines the corrupt segment and continues from the next. |
+
+`tsink-server` passes `Salvage` by default so a torn frame cannot block startup; pass `--wal-replay-mode strict` to restore fail-fast startup.
 
 On open, if the last active segment is found corrupt, it is quarantined (left in place) and a fresh segment is started.
 

@@ -24,7 +24,9 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::JoinHandle;
 use tsink::promql::Engine;
-use tsink::{Storage, StorageBuilder, StorageRuntimeMode, TimestampPrecision, WalSyncMode};
+use tsink::{
+    Storage, StorageBuilder, StorageRuntimeMode, TimestampPrecision, WalReplayMode, WalSyncMode,
+};
 
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_GRAPHITE_CONNECTIONS: usize = 1024;
@@ -67,6 +69,7 @@ pub struct ServerConfig {
     pub chunk_points: Option<usize>,
     pub max_writers: Option<usize>,
     pub wal_sync_mode: Option<WalSyncMode>,
+    pub wal_replay_mode: Option<WalReplayMode>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub auth_token: Option<String>,
@@ -107,6 +110,7 @@ impl Default for ServerConfig {
             chunk_points: None,
             max_writers: None,
             wal_sync_mode: None,
+            wal_replay_mode: None,
             tls_cert: None,
             tls_key: None,
             auth_token: None,
@@ -1496,6 +1500,10 @@ fn build_storage(config: &ServerConfig) -> tsink::Result<Arc<dyn Storage>> {
     if let Some(mode) = config.wal_sync_mode {
         builder = builder.with_wal_sync_mode(mode);
     }
+    // The server defaults to salvage so a torn WAL frame cannot block startup; operators
+    // who require corruption to be surfaced opt back into strict explicitly.
+    builder =
+        builder.with_wal_replay_mode(config.wal_replay_mode.unwrap_or(WalReplayMode::Salvage));
     if config.cluster.enabled {
         builder = builder.with_metadata_shard_count(config.cluster.shards);
     }
@@ -2273,6 +2281,75 @@ mod tests {
             .storage
             .close()
             .expect("storage runtime should close cleanly");
+    }
+
+    /// Seeds a data path whose WAL contains a real frame with a flipped payload byte —
+    /// the same frame-level corruption a crash mid-append produces.
+    fn server_config_with_corrupt_wal_frame(temp_dir: &TempDir) -> ServerConfig {
+        let data_path = temp_dir.path().join("data");
+        let wal_dir = data_path.join("wal");
+        std::fs::create_dir_all(&wal_dir).expect("wal dir should be created");
+
+        // A structurally valid frame (intact boundaries) with a bad CRC — the same
+        // frame-level corruption a crash mid-append produces. Layout per `append_frame`:
+        // magic[0..4], type[4], reserved[5..8], seq[8..16], len[16..20], crc[20..24],
+        // payload[24..].
+        let mut frame = Vec::with_capacity(24 + 8);
+        frame.extend_from_slice(b"TSFR");
+        frame.push(2); // FRAME_TYPE_SAMPLES
+        frame.extend_from_slice(&[0u8; 3]); // reserved
+        frame.extend_from_slice(&1u64.to_le_bytes()); // sequence
+        frame.extend_from_slice(&8u32.to_le_bytes()); // payload length
+        frame.extend_from_slice(&0xdeadbeefu32.to_le_bytes()); // deliberately wrong CRC
+        frame.extend_from_slice(&[0xAA; 8]); // payload
+        std::fs::write(wal_dir.join("wal-0000000000000000.log"), &frame)
+            .expect("corrupt wal frame should be written");
+
+        ServerConfig {
+            data_path: Some(data_path),
+            ..ServerConfig::default()
+        }
+    }
+
+    #[test]
+    fn build_storage_defaults_to_salvage_replay_over_corrupt_wal() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let config = server_config_with_corrupt_wal_frame(&temp_dir);
+
+        let storage = build_storage(&config)
+            .expect("default replay mode should tolerate a corrupt WAL frame");
+        storage.close().expect("storage should close cleanly");
+    }
+
+    #[test]
+    fn build_storage_explicit_salvage_replay_recovers_from_corrupt_wal() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let config = ServerConfig {
+            wal_replay_mode: Some(WalReplayMode::Salvage),
+            ..server_config_with_corrupt_wal_frame(&temp_dir)
+        };
+
+        let storage =
+            build_storage(&config).expect("salvage replay should recover from a corrupt WAL");
+        storage.close().expect("storage should close cleanly");
+    }
+
+    #[test]
+    fn build_storage_explicit_strict_replay_fails_open_on_corrupt_wal() {
+        let temp_dir = TempDir::new().expect("tempdir should be created");
+        let config = ServerConfig {
+            wal_replay_mode: Some(WalReplayMode::Strict),
+            ..server_config_with_corrupt_wal_frame(&temp_dir)
+        };
+
+        let err = match build_storage(&config) {
+            Ok(_) => panic!("strict replay should refuse to open a corrupt WAL"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("WAL replay corruption"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

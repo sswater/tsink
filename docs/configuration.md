@@ -85,7 +85,7 @@ These are the options exposed through the `StorageBuilder` Rust API and the equi
 | `with_wal_size_limit_bytes(n)` | `usize` | `usize::MAX` (unlimited) | Maximum total on-disk size for WAL files. Oldest segments are pruned when the limit is reached. |
 | `with_wal_buffer_size(n)` | `usize` | `4096` | I/O buffer size for WAL writes. Larger buffers reduce syscall overhead on high-throughput workloads. |
 | `with_wal_sync_mode(mode)` | `WalSyncMode` | `PerAppend` | `PerAppend` — `fsync` after every write (crash-safe, higher latency). `Periodic(duration)` — flush without fsync on a fixed interval (higher throughput, potential data loss on crash). |
-| `with_wal_replay_mode(mode)` | `WalReplayMode` | `Strict` | `Strict` — abort recovery on any corrupted WAL frame. `Salvage` — skip corrupted frames and recover as much data as possible. |
+| `with_wal_replay_mode(mode)` | `WalReplayMode` | `Strict` | `Strict` — abort recovery on any corrupted WAL frame. `Salvage` — skip corrupted frames and recover as much data as possible. The `tsink-server` binary overrides this to `Salvage` by default; use `--wal-replay-mode strict` there to restore fail-fast behaviour. |
 
 ### Background workers
 
@@ -134,6 +134,7 @@ tsink-server --help
 | `--mirror-hot-segments-to-object-store` | `false` | Copy hot segments to object store as they are sealed. |
 | `--wal-enabled <BOOL>` | `true` | Enable (`true`) or disable (`false`) the WAL. |
 | `--wal-sync-mode <MODE>` | `per-append` | `per-append` (crash-safe) or `periodic` (higher throughput). |
+| `--wal-replay-mode <MODE>` | `salvage` | Recovery policy for corrupted WAL frames at startup: `salvage` (default — skip corrupted frames, quarantine the damaged segment, keep serving) or `strict` (fail the open call so corruption is surfaced explicitly). |
 | `--chunk-points <N>` | `2048` | Target data points per chunk (1–65535). |
 
 ### 2.3 Memory & cardinality

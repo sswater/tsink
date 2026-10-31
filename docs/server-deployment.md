@@ -71,6 +71,7 @@ Use `--help` to print the full listing with types and defaults.
 | `--object-store-path PATH` | *none* | Shared directory (or object-store prefix) for warm/cold tier segments. |
 | `--wal-enabled BOOL` | `true` | Enable or disable the write-ahead log. |
 | `--wal-sync-mode MODE` | `per-append` | WAL durability policy: `per-append` (crash-safe) or `periodic` (higher throughput). |
+| `--wal-replay-mode MODE` | `salvage` | Startup recovery policy for corrupted WAL frames: `salvage` (skip and keep serving) or `strict` (fail startup). |
 | `--timestamp-precision PRECISION` | `ms` | Interpret ingested timestamps as `s`, `ms`, `us`, or `ns`. |
 | `--retention DURATION` | 14 days | Global data retention window (e.g. `30d`, `720h`). |
 | `--hot-tier-retention DURATION` | *none* | Age threshold before segments move from hot to warm. |

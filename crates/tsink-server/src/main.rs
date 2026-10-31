@@ -25,7 +25,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use clap::{error::ErrorKind, Parser};
-use tsink::{StorageRuntimeMode, TimestampPrecision, WalSyncMode};
+use tsink::{StorageRuntimeMode, TimestampPrecision, WalReplayMode, WalSyncMode};
 
 use crate::cluster::config::{
     ClusterConfig, ClusterInternalMtlsConfig, ClusterNodeRole, ClusterReadConsistency,
@@ -233,6 +233,13 @@ struct ServerCliArgs {
         help = "WAL acknowledgement policy (per-append default, periodic opt-in)"
     )]
     wal_sync_mode: Option<WalSyncMode>,
+    #[arg(
+        long,
+        value_name = "MODE",
+        value_parser = parse_wal_replay_mode,
+        help = "WAL recovery policy for corrupted frames (salvage default, strict opt-in)"
+    )]
+    wal_replay_mode: Option<WalReplayMode>,
     #[arg(long, value_name = "PATH", help = "TLS certificate file (PEM)")]
     tls_cert: Option<PathBuf>,
     #[arg(long, value_name = "PATH", help = "TLS private key file (PEM)")]
@@ -447,6 +454,7 @@ impl ServerCliArgs {
             chunk_points: self.chunk_points,
             max_writers: self.max_writers,
             wal_sync_mode: self.wal_sync_mode,
+            wal_replay_mode: self.wal_replay_mode,
             tls_cert: self.tls_cert,
             tls_key: self.tls_key,
             auth_token: self.auth_token,
@@ -652,6 +660,16 @@ fn parse_wal_sync_mode(value: &str) -> Result<WalSyncMode, String> {
     }
 }
 
+fn parse_wal_replay_mode(value: &str) -> Result<WalReplayMode, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "salvage" => Ok(WalReplayMode::Salvage),
+        "strict" => Ok(WalReplayMode::Strict),
+        _ => Err(format!(
+            "invalid WAL replay mode '{value}', expected 'salvage' or 'strict'"
+        )),
+    }
+}
+
 fn parse_cluster_node_role(value: &str) -> Result<ClusterNodeRole, String> {
     ClusterNodeRole::from_str(value).map_err(|err| format!("--cluster-node-role {err}"))
 }
@@ -692,6 +710,42 @@ mod tests {
     #[test]
     fn parse_byte_size_rejects_negative_values() {
         assert!(parse_byte_size("-1K").is_err());
+    }
+
+    #[test]
+    fn parse_wal_replay_mode_maps_canonical_values() {
+        assert_eq!(
+            parse_wal_replay_mode("salvage").ok(),
+            Some(WalReplayMode::Salvage)
+        );
+        assert_eq!(
+            parse_wal_replay_mode("SALVAGE").ok(),
+            Some(WalReplayMode::Salvage)
+        );
+        assert_eq!(
+            parse_wal_replay_mode("strict").ok(),
+            Some(WalReplayMode::Strict)
+        );
+        assert!(parse_wal_replay_mode("bogus").is_err());
+    }
+
+    #[test]
+    fn wal_replay_mode_flag_maps_into_server_config() {
+        let strict = parse_server_args_clap(
+            ["--listen", "127.0.0.1:9201", "--wal-replay-mode", "strict"]
+                .iter()
+                .map(|value| value.to_string()),
+        )
+        .expect("args should parse");
+        assert_eq!(strict.wal_replay_mode, Some(WalReplayMode::Strict));
+
+        let defaulted = parse_server_args_clap(
+            ["--listen", "127.0.0.1:9201"]
+                .iter()
+                .map(|value| value.to_string()),
+        )
+        .expect("args should parse");
+        assert_eq!(defaulted.wal_replay_mode, None);
     }
 
     #[test]
