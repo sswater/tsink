@@ -172,7 +172,20 @@ impl ChunkStorage {
         self.tombstone_read_context().with_series_tombstone_ranges(
             series_id,
             |tombstone_ranges| -> Result<()> {
+                let scan_started = std::time::Instant::now();
+                let timeout_nanos = self.filtered_scan_timeout_nanos();
                 while out.len() < limit {
+                    // Filtered-scan guard: a poorly-selective predicate can
+                    // force a whole-window decode; stop when the configured
+                    // budget runs out (one extra decoded block at most).
+                    if predicate.is_some()
+                        && timeout_nanos != 0
+                        && scan_started.elapsed().as_nanos() as u64 >= timeout_nanos
+                    {
+                        return Err(TsinkError::ScanTimeout {
+                            scanned_points: stats.points_decoded as u64,
+                        });
+                    }
                     let Some(entry) = heap.pop() else {
                         break;
                     };

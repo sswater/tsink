@@ -49,6 +49,7 @@ pub(super) fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>>
         next_segment_id,
         wal,
     )?;
+    storage.set_filtered_scan_timeout(builder.filtered_scan_timeout());
     StartupHydrationPhase::hydrate(
         storage.as_ref(),
         &builder,

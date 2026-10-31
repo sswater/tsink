@@ -204,6 +204,11 @@ struct RuntimeConfigState {
     cardinality_limit: usize,
     wal_size_limit_bytes: u64,
     admission_poll_interval: Duration,
+    /// Budget in nanoseconds for value-filtered streaming scans (`0` =
+    /// unlimited). Written once at construction from the builder; predicate
+    /// scans fail with `ScanTimeout` when their loop notices the elapsed
+    /// budget is exhausted.
+    filtered_scan_timeout_nanos: AtomicU64,
 }
 
 /// Memory-accounting counters and backpressure coordination.
@@ -653,6 +658,25 @@ impl Drop for ChunkStorage {
 
 pub fn build_storage(builder: StorageBuilder) -> Result<Arc<dyn Storage>> {
     bootstrap::build_storage(builder)
+}
+
+impl ChunkStorage {
+    /// Runtime injection point for the builder-provided filtered-scan budget.
+    /// `None` keeps filtered scans unlimited.
+    pub(crate) fn set_filtered_scan_timeout(&self, timeout: Option<Duration>) {
+        let nanos = timeout
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        self.runtime
+            .filtered_scan_timeout_nanos
+            .store(nanos, Ordering::Relaxed);
+    }
+
+    pub(super) fn filtered_scan_timeout_nanos(&self) -> u64 {
+        self.runtime
+            .filtered_scan_timeout_nanos
+            .load(Ordering::Relaxed)
+    }
 }
 
 pub fn restore_storage_from_snapshot(snapshot_path: &Path, data_path: &Path) -> Result<()> {

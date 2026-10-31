@@ -1084,6 +1084,7 @@ pub struct StorageBuilder {
     chunk_points: usize,
     max_writers: usize,
     write_timeout: Duration,
+    filtered_scan_timeout: Option<Duration>,
     partition_duration: Duration,
     max_active_partition_heads_per_series: usize,
     memory_limit_bytes: usize,
@@ -1118,6 +1119,7 @@ impl Default for StorageBuilder {
             chunk_points: DEFAULT_CHUNK_POINTS,
             max_writers: crate::cgroup::default_workers_limit(),
             write_timeout: Duration::from_secs(30),
+            filtered_scan_timeout: None,
             partition_duration: Duration::from_secs(3600),
             max_active_partition_heads_per_series: DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
             memory_limit_bytes: usize::MAX,
@@ -1245,6 +1247,19 @@ impl StorageBuilder {
     #[must_use]
     pub fn with_write_timeout(mut self, timeout: Duration) -> Self {
         self.write_timeout = timeout;
+        self
+    }
+
+    /// Caps how long a value-filtered streaming scan may run.
+    ///
+    /// Only scans carrying a [`ValuePredicate`] are affected — predicate-free
+    /// scans are limit-driven with per-point output and never hit this guard.
+    /// When the budget runs out the scan fails with
+    /// [`TsinkError::ScanTimeout`] instead of decoding further. Defaults to
+    /// `None` (unlimited).
+    #[must_use]
+    pub fn with_filtered_scan_timeout(mut self, timeout: Duration) -> Self {
+        self.filtered_scan_timeout = Some(timeout);
         self
     }
 
@@ -1414,6 +1429,10 @@ impl StorageBuilder {
 
     pub(crate) fn max_writers(&self) -> usize {
         self.max_writers
+    }
+
+    pub(crate) fn filtered_scan_timeout(&self) -> Option<Duration> {
+        self.filtered_scan_timeout
     }
 
     pub(crate) fn write_timeout(&self) -> Duration {

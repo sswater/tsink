@@ -70,6 +70,12 @@ These are the options exposed through the `StorageBuilder` Rust API and the equi
 | `with_max_writers(n)` | `usize` | CPU-count (cgroup-aware) | Size of the writer thread pool. Higher values increase throughput under concurrent write load at the cost of memory. |
 | `with_write_timeout(duration)` | `Duration` | `30s` | Maximum time a write call will wait for a writer slot before returning a backpressure error. |
 
+### Query
+
+| Builder method | Type | Default | Description |
+|---|---|---|---|
+| `with_filtered_scan_timeout(duration)` | `Duration` | *(unlimited)* | Budget for value-filtered streaming scans (`select_asc`/`select_desc` with a predicate). When exhausted the scan fails with `ScanTimeout` after at most one more 64-point block. Scans without a predicate are never subject to it. |
+
 ### Memory & cardinality
 
 | Builder method | Type | Default | Description |
@@ -144,6 +150,7 @@ tsink-server --help
 | `--memory-limit <BYTES>` | *(unlimited)* | Global in-memory chunk budget, in bytes. Supports suffixes such as `1G`, `512M`. |
 | `--cardinality-limit <N>` | *(unlimited)* | Maximum number of unique series. New series are rejected once the limit is reached. |
 | `--max-writers <N>` | *(CPU count)* | Concurrent writer threads. |
+| `--filtered-scan-timeout <DURATION>` | *(unlimited)* | Budget for value-filtered streaming scans (for example `30s`). An exhausted filtered scan fails with HTTP `503` (`scan_timeout`). |
 
 ### 2.4 Security & auth
 

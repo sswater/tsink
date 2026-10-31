@@ -301,6 +301,27 @@ Rules:
   (the worst case is a non-selective predicate), so prefer tight windows for
   rarely-matching filters.
 
+### Capping filtered scans with a time budget
+
+A filtered scan is the one read path whose cost is unbounded — a rarely
+matching predicate forces a whole-window decode. `with_filtered_scan_timeout`
+bounds it: when the budget runs out the scan fails with
+`TsinkError::ScanTimeout { scanned_points }` instead of continuing to decode
+(the scan stops after at most one more 64-point block). Scans without a
+predicate are never subject to the budget, and the default is unlimited:
+
+```rust
+use std::time::Duration;
+
+let storage = StorageBuilder::new()
+    .with_filtered_scan_timeout(Duration::from_secs(30))
+    .build()?;
+```
+
+The standalone server exposes the same knob as `--filtered-scan-timeout 30s`
+and surfaces the failure as HTTP `503` with `errorType: "scan_timeout"`. Retry
+with a narrower window or a more selective predicate.
+
 ### Point queries by timestamp list
 
 `select_at_timestamps` fetches exact points for a list of timestamps —

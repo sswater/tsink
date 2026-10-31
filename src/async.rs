@@ -573,6 +573,12 @@ impl AsyncStorageBuilder {
     }
 
     #[must_use]
+    pub fn with_filtered_scan_timeout(mut self, timeout: Duration) -> Self {
+        self.inner = self.inner.with_filtered_scan_timeout(timeout);
+        self
+    }
+
+    #[must_use]
     pub fn with_cardinality_limit(mut self, series: usize) -> Self {
         self.inner = self.inner.with_cardinality_limit(series);
         self

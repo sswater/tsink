@@ -410,6 +410,20 @@ fn select_storage_error_response(err: &tsink::TsinkError) -> HttpResponse {
         | tsink::TsinkError::InvalidMetricName(_)
         | tsink::TsinkError::InvalidLabel(_) => select_bad_request_response(&err.to_string()),
         tsink::TsinkError::UnsupportedOperation { .. } => text_response(501, &err.to_string()),
+        tsink::TsinkError::ScanTimeout { scanned_points } => {
+            let mut response = json_response(
+                503,
+                &json!({
+                    "status": "error",
+                    "errorType": "scan_timeout",
+                    "error": format!(
+                        "value-filtered scan exceeded the configured scan budget after decoding {scanned_points} points"
+                    ),
+                }),
+            );
+            response = response.with_header("Retry-After", "1");
+            response
+        }
         _ => select_execution_error_response(&err.to_string()),
     }
 }
@@ -737,6 +751,27 @@ mod tests {
         assert_eq!(response.status, 200, "{}", response_text(&response));
         let body = response_json(&response);
         assert!(response_points(&body).is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_timeout_error_maps_to_503_with_retry_after() {
+        // ScanTimeout maps to 503 + errorType "scan_timeout" + Retry-After.
+        let response =
+            select_storage_error_response(&tsink::TsinkError::ScanTimeout { scanned_points: 42 });
+        assert_eq!(response.status, 503, "{}", response_text(&response));
+        let header = response
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+            .map(|(_, value)| value.clone());
+        assert_eq!(header.as_deref(), Some("1"));
+        let body: JsonValue =
+            serde_json::from_slice(&response.body).expect("scan timeout body should be JSON");
+        assert_eq!(body["errorType"], "scan_timeout");
+        assert_eq!(body["status"], "error");
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("42 points")));
     }
 
     #[tokio::test]

@@ -856,6 +856,87 @@ fn asc_predicate_rejects_latest_version_drops_timestamp() {
     storage.close().unwrap();
 }
 
+fn builder_with_scan_timeout(timeout: Duration) -> Arc<dyn Storage> {
+    StorageBuilder::new()
+        .with_chunk_points(50)
+        .with_filtered_scan_timeout(timeout)
+        .build()
+        .unwrap()
+}
+
+fn seed_never_matching(storage: &Arc<dyn Storage>, metric: &str, count: i64) {
+    let rows = (0..count)
+        .map(|idx| Row::new(metric, DataPoint::new(idx, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+}
+
+#[test]
+fn desc_scan_times_out_with_never_matching_predicate() {
+    let storage = builder_with_scan_timeout(Duration::from_nanos(1));
+    seed_never_matching(&storage, "desc_timeout", 2_000);
+
+    // A 1ns budget is exhausted before the first point: the scan must fail
+    // with ScanTimeout instead of decoding the whole window.
+    let predicate = ValuePredicate {
+        op: ValuePredicateOp::Gt,
+        target: ValuePredicateTarget::F64(f64::MAX),
+    };
+    let err = storage
+        .select_desc("desc_timeout", &[], 0, 2_000, 100, Some(&predicate))
+        .unwrap_err();
+
+    match err {
+        TsinkError::ScanTimeout { scanned_points, .. } => {
+            assert!(
+                scanned_points < 2_000,
+                "timeout must stop before decoding everything, got {scanned_points}"
+            );
+        }
+        other => panic!("expected ScanTimeout, got {other:?}"),
+    }
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_scan_times_out_with_never_matching_predicate() {
+    let storage = builder_with_scan_timeout(Duration::from_nanos(1));
+    seed_never_matching(&storage, "asc_timeout", 2_000);
+
+    let predicate = ValuePredicate {
+        op: ValuePredicateOp::Gt,
+        target: ValuePredicateTarget::F64(f64::MAX),
+    };
+    let err = storage
+        .select_asc("asc_timeout", &[], 0, 2_000, 100, Some(&predicate))
+        .unwrap_err();
+
+    assert!(matches!(err, TsinkError::ScanTimeout { .. }));
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn scan_timeout_does_not_apply_without_predicate() {
+    // Gating: the timeout only guards filtered scans. Without a predicate the
+    // scan is limit-driven with per-point output and must run to completion.
+    let storage = builder_with_scan_timeout(Duration::from_nanos(1));
+    seed_never_matching(&storage, "no_predicate_gate", 2_000);
+
+    let points = storage
+        .select_desc("no_predicate_gate", &[], 0, 2_000, 100, None)
+        .unwrap();
+    assert_eq!(points.len(), 100);
+
+    let points = storage
+        .select_asc("no_predicate_gate", &[], 0, 2_000, 100, None)
+        .unwrap();
+    assert_eq!(points.len(), 100);
+
+    storage.close().unwrap();
+}
+
 #[test]
 fn asc_and_desc_stop_early_on_limit() {
     // limit=3 over 1000 points (cap 50): decoded points must stay far below

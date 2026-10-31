@@ -36,6 +36,8 @@ impl From<TsinkError> for TsinkUniFFIError {
 
             TsinkError::InvalidTimeRange { .. } => TsinkUniFFIError::InvalidTimeRange { msg },
 
+            TsinkError::ScanTimeout { .. } => TsinkUniFFIError::Other { msg },
+
             TsinkError::StorageClosed | TsinkError::StorageShuttingDown => {
                 TsinkUniFFIError::StorageClosed { msg }
             }

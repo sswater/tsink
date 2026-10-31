@@ -228,6 +228,13 @@ struct ServerCliArgs {
     max_writers: Option<usize>,
     #[arg(
         long,
+        value_name = "DURATION",
+        value_parser = parse_duration,
+        help = "Budget for value-filtered streaming scans (for example 30s); unlimited when unset"
+    )]
+    filtered_scan_timeout: Option<Duration>,
+    #[arg(
+        long,
         value_name = "MODE",
         value_parser = parse_wal_sync_mode,
         help = "WAL acknowledgement policy (per-append default, periodic opt-in)"
@@ -453,6 +460,7 @@ impl ServerCliArgs {
             cardinality_limit: self.cardinality_limit,
             chunk_points: self.chunk_points,
             max_writers: self.max_writers,
+            filtered_scan_timeout: self.filtered_scan_timeout,
             wal_sync_mode: self.wal_sync_mode,
             wal_replay_mode: self.wal_replay_mode,
             tls_cert: self.tls_cert,

@@ -66,6 +66,12 @@ pub enum TsinkError {
         reason: String,
     },
 
+    #[error("Filtered scan timeout after decoding {scanned_points} points")]
+    ScanTimeout {
+        /// Number of point values materialized before the budget ran out.
+        scanned_points: u64,
+    },
+
     #[error("Data corruption detected: {0}")]
     DataCorruption(String),
 

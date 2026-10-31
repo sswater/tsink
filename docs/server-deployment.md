@@ -88,6 +88,7 @@ Use `--help` to print the full listing with types and defaults.
 | `--cardinality-limit N` | *unlimited* | Maximum number of unique series. New series are rejected at the limit. |
 | `--chunk-points N` | *engine default* | Target number of data points per in-memory chunk before sealing. |
 | `--max-writers N` | *CPU count* | Parallel writer threads for ingestion. |
+| `--filtered-scan-timeout DURATION` | *unlimited* | Budget for value-filtered streaming scans (e.g. `30s`). An exhausted filtered scan fails with HTTP `503` (`scan_timeout`). |
 
 ### TLS
 

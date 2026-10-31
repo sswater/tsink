@@ -126,6 +126,30 @@ parity 测试按新契约更新，并在文档中明示该行为差异。
   在谓词存在时随扫描到的去重时间戳数增长，属预期内存特征，builder 可在实现
   时评估容量策略。
 
+### 过滤扫描超时护栏（追加设计，2026-10-31 二轮）
+
+谓词选择性差时扫描无上界，前端可能早已放弃而后端仍在解码。以**超时护栏**
+兜底（decoded-points budget 记为未来接租户配额时的扩展，与本机制可共存）。
+
+已定决策：
+
+- **生效条件**：仅当 `predicate` 存在时启用。无谓词扫描成本由 limit 驱动
+  且每点有产出（凑满即停），不存在白烧，不设超时。
+- **配置形态**：`StorageBuilder::with_filtered_scan_timeout(Duration)` 落入
+  引擎 options；**`Storage` trait 签名不动**（引擎从自身 options 读取）。
+  默认 `None` = 不限制，不改变现有行为。
+- **Server CLI**：`--filtered-scan-timeout <humantime>`（如 `30s`），映射到
+  builder；默认未设置 = 不限制。
+- **检查时机**：扫描主循环每迭代检查一次（`heap.pop` 前）。cursor 的 batch
+  解压发生在循环体内，因此超时后最多多解码一个 64 点块即停。起算点为
+  candidate 枚举之后、循环开始之前（metadata 枚举不计入）。
+- **触发行为（用户拍板：方案 A）**：返回错误
+  `TsinkError::ScanTimeout { scanned_points }`，**不带部分结果**——调用方
+  不会把半页数据误当完整结果。HTTP 映射 `503`，`errorType: "scan_timeout"`，
+  携带已扫描点数，客户端可缩小窗口或放宽谓词重试。
+- decoded-points budget（按 `points_decoded` 上限）为未来扩展位，与超时
+  检查可在同一循环共存，本期不实现。
+
 ### 流式模型（asc 镜像 desc，但 tie-break 不是简单反转）
 
 - candidate 枚举复用 `collect_candidates_with_mode`；asc 需要 head-peek（窗口内

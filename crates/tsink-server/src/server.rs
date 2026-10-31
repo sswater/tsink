@@ -68,6 +68,7 @@ pub struct ServerConfig {
     pub cardinality_limit: Option<usize>,
     pub chunk_points: Option<usize>,
     pub max_writers: Option<usize>,
+    pub filtered_scan_timeout: Option<Duration>,
     pub wal_sync_mode: Option<WalSyncMode>,
     pub wal_replay_mode: Option<WalReplayMode>,
     pub tls_cert: Option<PathBuf>,
@@ -109,6 +110,7 @@ impl Default for ServerConfig {
             cardinality_limit: None,
             chunk_points: None,
             max_writers: None,
+            filtered_scan_timeout: None,
             wal_sync_mode: None,
             wal_replay_mode: None,
             tls_cert: None,
@@ -1493,6 +1495,9 @@ fn build_storage(config: &ServerConfig) -> tsink::Result<Arc<dyn Storage>> {
     }
     if let Some(points) = config.chunk_points {
         builder = builder.with_chunk_points(points);
+    }
+    if let Some(timeout) = config.filtered_scan_timeout {
+        builder = builder.with_filtered_scan_timeout(timeout);
     }
     if let Some(writers) = config.max_writers {
         builder = builder.with_max_writers(writers);

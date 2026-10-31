@@ -371,6 +371,13 @@ single-value filter, and a mandatory `limit`.
   (`i64`, `u64`, `f64` are mutually exclusive; points of any other type are
   dropped, not errors). `NaN` points never match an ordering op; `eq`/`ne`
   follow the library equality convention where `NaN == NaN` holds.
+- **Filtered-scan budget:** when the server is started with
+  `--filtered-scan-timeout <duration>` (for example `30s`), a filtered scan
+  that outlives the budget fails with `503` (`errorType: "scan_timeout"`,
+  `Retry-After: 1`) naming the number of points decoded before the cutoff —
+  retry with a narrower window or a more selective `value_filter`. Scans
+  without `value_filter` are never subject to this budget, and the default is
+  unlimited.
 - `offset` is rejected with `400` for both orders: page by narrowing the
   window (because `end` is exclusive, pages remain contiguous).
 - `limit` is mandatory for both orders; a missing, zero, or out-of-range
@@ -401,7 +408,7 @@ back into the output).
 
 A window with no matching points returns `200` with `"points": []`.
 
-**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, invalid range, missing/out-of-range `limit`, `offset` with either order, an invalid `value_filter` (`op`/`type`/`value` combination), per-tenant read-query or range-point quota, or a histogram result; `403` suspended/managed tenant or insufficient scope; `413` (`X-Tsink-Read-Error-Code: read_resource_limit_exceeded`) non-retryable read admission resource limit; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `501` in cluster mode; `500` (`execution`) backend failure.
+**Error codes:** `400` (`bad_data`) invalid JSON, missing or invalid fields, invalid range, missing/out-of-range `limit`, `offset` with either order, an invalid `value_filter` (`op`/`type`/`value` combination), per-tenant read-query or range-point quota, or a histogram result; `403` suspended/managed tenant or insufficient scope; `413` (`X-Tsink-Read-Error-Code: read_resource_limit_exceeded`) non-retryable read admission resource limit; `429` (`X-Tsink-Read-Error-Code: read_overloaded`) read admission backpressure; `503` (`scan_timeout`) a value-filtered scan exceeded the server's `--filtered-scan-timeout` budget (see above); `501` in cluster mode; `500` (`execution`) backend failure.
 
 ---
 

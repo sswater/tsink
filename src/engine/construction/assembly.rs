@@ -137,6 +137,9 @@ impl StorageStateAssembly {
             cardinality_limit: options.cardinality_limit,
             wal_size_limit_bytes: options.wal_size_limit_bytes,
             admission_poll_interval: options.admission_poll_interval,
+            // Overwritten from the builder after construction when a filtered
+            // scan timeout is configured.
+            filtered_scan_timeout_nanos: AtomicU64::new(0),
         }
     }
 
