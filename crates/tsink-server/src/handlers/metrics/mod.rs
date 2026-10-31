@@ -343,6 +343,30 @@ pub(super) fn render_metrics(
          # HELP tsink_query_select_with_options_points_returned_total Points returned by select_with_options\n\
          # TYPE tsink_query_select_with_options_points_returned_total counter\n\
          tsink_query_select_with_options_points_returned_total {query_select_with_options_points_returned_total}\n\
+         # HELP tsink_query_select_desc_calls_total Storage select_desc calls\n\
+         # TYPE tsink_query_select_desc_calls_total counter\n\
+         tsink_query_select_desc_calls_total {query_select_desc_calls_total}\n\
+         # HELP tsink_query_select_desc_errors_total Storage select_desc errors\n\
+         # TYPE tsink_query_select_desc_errors_total counter\n\
+         tsink_query_select_desc_errors_total {query_select_desc_errors_total}\n\
+         # HELP tsink_query_select_desc_duration_nanoseconds_total Storage select_desc runtime\n\
+         # TYPE tsink_query_select_desc_duration_nanoseconds_total counter\n\
+         tsink_query_select_desc_duration_nanoseconds_total {query_select_desc_duration_nanos_total}\n\
+         # HELP tsink_query_select_desc_points_returned_total Points returned by select_desc\n\
+         # TYPE tsink_query_select_desc_points_returned_total counter\n\
+         tsink_query_select_desc_points_returned_total {query_select_desc_points_returned_total}\n\
+         # HELP tsink_query_select_asc_calls_total Storage select_asc calls\n\
+         # TYPE tsink_query_select_asc_calls_total counter\n\
+         tsink_query_select_asc_calls_total {query_select_asc_calls_total}\n\
+         # HELP tsink_query_select_asc_errors_total Storage select_asc errors\n\
+         # TYPE tsink_query_select_asc_errors_total counter\n\
+         tsink_query_select_asc_errors_total {query_select_asc_errors_total}\n\
+         # HELP tsink_query_select_asc_duration_nanoseconds_total Storage select_asc runtime\n\
+         # TYPE tsink_query_select_asc_duration_nanoseconds_total counter\n\
+         tsink_query_select_asc_duration_nanoseconds_total {query_select_asc_duration_nanos_total}\n\
+         # HELP tsink_query_select_asc_points_returned_total Points returned by select_asc\n\
+         # TYPE tsink_query_select_asc_points_returned_total counter\n\
+         tsink_query_select_asc_points_returned_total {query_select_asc_points_returned_total}\n\
          # HELP tsink_query_select_all_calls_total Storage select_all calls\n\
          # TYPE tsink_query_select_all_calls_total counter\n\
          tsink_query_select_all_calls_total {query_select_all_calls_total}\n\
@@ -559,6 +583,14 @@ pub(super) fn render_metrics(
             obs.query.select_with_options_duration_nanos_total,
         query_select_with_options_points_returned_total =
             obs.query.select_with_options_points_returned_total,
+        query_select_desc_calls_total = obs.query.select_desc_calls_total,
+        query_select_desc_errors_total = obs.query.select_desc_errors_total,
+        query_select_desc_duration_nanos_total = obs.query.select_desc_duration_nanos_total,
+        query_select_desc_points_returned_total = obs.query.select_desc_points_returned_total,
+        query_select_asc_calls_total = obs.query.select_asc_calls_total,
+        query_select_asc_errors_total = obs.query.select_asc_errors_total,
+        query_select_asc_duration_nanos_total = obs.query.select_asc_duration_nanos_total,
+        query_select_asc_points_returned_total = obs.query.select_asc_points_returned_total,
         query_select_all_calls_total = obs.query.select_all_calls_total,
         query_select_all_errors_total = obs.query.select_all_errors_total,
         query_select_all_duration_nanos_total = obs.query.select_all_duration_nanos_total,

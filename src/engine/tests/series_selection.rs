@@ -4985,9 +4985,7 @@ fn select_desc_api_records_observability_counters() {
         .unwrap();
 
     let before = storage.observability_snapshot();
-    let points = storage
-        .select_desc("cpu", &[], 0, 100, 10, None)
-        .unwrap();
+    let points = storage.select_desc("cpu", &[], 0, 100, 10, None).unwrap();
     let after = storage.observability_snapshot();
 
     assert_eq!(points.len(), 1);
@@ -4998,6 +4996,30 @@ fn select_desc_api_records_observability_counters() {
     assert_eq!(
         after.query.select_desc_points_returned_total,
         before.query.select_desc_points_returned_total + 1,
+    );
+
+    let _ = storage.close();
+}
+
+#[test]
+fn select_asc_api_records_observability_counters() {
+    let storage = ChunkStorage::new(2, None);
+    storage
+        .insert_rows(&[Row::new("cpu", DataPoint::new(10, 1.0))])
+        .unwrap();
+
+    let before = storage.observability_snapshot();
+    let points = storage.select_asc("cpu", &[], 0, 100, 10, None).unwrap();
+    let after = storage.observability_snapshot();
+
+    assert_eq!(points.len(), 1);
+    assert_eq!(
+        after.query.select_asc_calls_total,
+        before.query.select_asc_calls_total + 1,
+    );
+    assert_eq!(
+        after.query.select_asc_points_returned_total,
+        before.query.select_asc_points_returned_total + 1,
     );
 
     let _ = storage.close();

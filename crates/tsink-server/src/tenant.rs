@@ -1679,14 +1679,10 @@ impl Storage for TenantScopedStorage {
         predicate: Option<&ValuePredicate>,
     ) -> TsinkResult<Vec<DataPoint>> {
         let scoped_labels = self.scoped_labels(labels)?;
-        match self.inner.select_desc(
-            metric,
-            &scoped_labels,
-            start,
-            end,
-            limit,
-            predicate,
-        ) {
+        match self
+            .inner
+            .select_desc(metric, &scoped_labels, start, end, limit, predicate)
+        {
             Ok(points) => {
                 if !points.is_empty() || !self.is_default_tenant() {
                     Ok(points)
@@ -1695,10 +1691,9 @@ impl Storage for TenantScopedStorage {
                         .select_desc(metric, labels, start, end, limit, predicate)
                 }
             }
-            Err(TsinkError::NoDataPoints { .. }) if self.is_default_tenant() => {
-                self.inner
-                    .select_desc(metric, labels, start, end, limit, predicate)
-            }
+            Err(TsinkError::NoDataPoints { .. }) if self.is_default_tenant() => self
+                .inner
+                .select_desc(metric, labels, start, end, limit, predicate),
             Err(err) => Err(err),
         }
     }
@@ -1725,10 +1720,9 @@ impl Storage for TenantScopedStorage {
                         .select_asc(metric, labels, start, end, limit, predicate)
                 }
             }
-            Err(TsinkError::NoDataPoints { .. }) if self.is_default_tenant() => {
-                self.inner
-                    .select_asc(metric, labels, start, end, limit, predicate)
-            }
+            Err(TsinkError::NoDataPoints { .. }) if self.is_default_tenant() => self
+                .inner
+                .select_asc(metric, labels, start, end, limit, predicate),
             Err(err) => Err(err),
         }
     }

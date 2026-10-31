@@ -235,15 +235,9 @@ impl Value {
     /// `NaN == NaN` is true.
     pub fn matches_predicate(&self, predicate: &ValuePredicate) -> bool {
         match (self, &predicate.target) {
-            (Value::I64(v), ValuePredicateTarget::I64(t)) => {
-                compare_i64(predicate.op, *v, *t)
-            }
-            (Value::U64(v), ValuePredicateTarget::U64(t)) => {
-                compare_u64(predicate.op, *v, *t)
-            }
-            (Value::F64(v), ValuePredicateTarget::F64(t)) => {
-                compare_f64(predicate.op, *v, *t)
-            }
+            (Value::I64(v), ValuePredicateTarget::I64(t)) => compare_i64(predicate.op, *v, *t),
+            (Value::U64(v), ValuePredicateTarget::U64(t)) => compare_u64(predicate.op, *v, *t),
+            (Value::F64(v), ValuePredicateTarget::F64(t)) => compare_f64(predicate.op, *v, *t),
             _ => false,
         }
     }

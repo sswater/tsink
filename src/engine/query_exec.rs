@@ -58,7 +58,7 @@ impl ChunkStorage {
         self.query_planning_context().query_tier_plan(start, end)
     }
 
-    fn record_query_tier_plan(&self, plan: TieredQueryPlan) {
+    pub(in crate::engine::storage_engine) fn record_query_tier_plan(&self, plan: TieredQueryPlan) {
         if plan.is_hot_only() {
             self.observability
                 .query
@@ -102,9 +102,7 @@ impl ChunkStorage {
             .fetch_add(stats.cold_fetch_duration_nanos, Ordering::Relaxed);
     }
 
-    pub(in crate::engine::storage_engine) fn request_background_persisted_refresh_if_needed(
-        &self,
-    ) {
+    pub(in crate::engine::storage_engine) fn request_background_persisted_refresh_if_needed(&self) {
         if self.persisted.persisted_index_dirty.load(Ordering::SeqCst)
             || self.should_refresh_remote_catalog()
         {

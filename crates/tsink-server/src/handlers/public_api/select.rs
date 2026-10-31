@@ -68,28 +68,19 @@ impl RawValueFilter {
         let target = match self.value_type.as_str() {
             "i64" => {
                 let value = self.value.as_i64().ok_or_else(|| {
-                    format!(
-                        "value_filter value `{}` is not a valid i64",
-                        self.value
-                    )
+                    format!("value_filter value `{}` is not a valid i64", self.value)
                 })?;
                 ValuePredicateTarget::I64(value)
             }
             "u64" => {
                 let value = self.value.as_u64().ok_or_else(|| {
-                    format!(
-                        "value_filter value `{}` is not a valid u64",
-                        self.value
-                    )
+                    format!("value_filter value `{}` is not a valid u64", self.value)
                 })?;
                 ValuePredicateTarget::U64(value)
             }
             "f64" => {
                 let value = self.value.as_f64().ok_or_else(|| {
-                    format!(
-                        "value_filter value `{}` is not a valid f64",
-                        self.value
-                    )
+                    format!("value_filter value `{}` is not a valid f64", self.value)
                 })?;
                 ValuePredicateTarget::F64(value)
             }
@@ -688,11 +679,7 @@ mod tests {
 
         let response = run_select(
             &storage,
-            filter_body(
-                "desc",
-                10,
-                json!({"op": "gt", "type": "f64", "value": 6.0}),
-            ),
+            filter_body("desc", 10, json!({"op": "gt", "type": "f64", "value": 6.0})),
         )
         .await;
         assert_eq!(response.status, 200, "{}", response_text(&response));
@@ -709,11 +696,7 @@ mod tests {
 
         let response = run_select(
             &storage,
-            filter_body(
-                "asc",
-                10,
-                json!({"op": "gt", "type": "f64", "value": 6.0}),
-            ),
+            filter_body("asc", 10, json!({"op": "gt", "type": "f64", "value": 6.0})),
         )
         .await;
         assert_eq!(response.status, 200, "{}", response_text(&response));
@@ -730,11 +713,7 @@ mod tests {
 
         let response = run_select(
             &storage,
-            filter_body(
-                "desc",
-                2,
-                json!({"op": "gte", "type": "f64", "value": 0.0}),
-            ),
+            filter_body("desc", 2, json!({"op": "gte", "type": "f64", "value": 0.0})),
         )
         .await;
         assert_eq!(response.status, 200, "{}", response_text(&response));
@@ -753,6 +732,23 @@ mod tests {
         let response = run_select(
             &storage,
             filter_body("desc", 10, json!({"op": "gt", "type": "i64", "value": 0})),
+        )
+        .await;
+        assert_eq!(response.status, 200, "{}", response_text(&response));
+        let body = response_json(&response);
+        assert!(response_points(&body).is_empty());
+    }
+
+    #[tokio::test]
+    async fn value_filter_accepts_u64_targets() {
+        let storage = make_storage();
+        seed_indexed(&storage, 10);
+
+        // F64 points never match a u64 predicate (strict typing), but the
+        // u64 wire path itself must parse and evaluate.
+        let response = run_select(
+            &storage,
+            filter_body("desc", 10, json!({"op": "gt", "type": "u64", "value": 0})),
         )
         .await;
         assert_eq!(response.status, 200, "{}", response_text(&response));
@@ -782,9 +778,13 @@ mod tests {
         seed_indexed(&storage, 10);
 
         for order in ["asc", "desc"] {
-            let response =
-                run_select(&storage, select_body(Some(order), Some(5), Some(2))).await;
-            assert_eq!(response.status, 400, "{order}: {}", response_text(&response));
+            let response = run_select(&storage, select_body(Some(order), Some(5), Some(2))).await;
+            assert_eq!(
+                response.status,
+                400,
+                "{order}: {}",
+                response_text(&response)
+            );
             assert!(
                 response_text(&response).contains("offset"),
                 "{order} must mention `offset`: {}",
@@ -803,7 +803,10 @@ mod tests {
         let body = response_json(&response);
         let points = response_points(&body);
         let timestamps = point_timestamps(points);
-        assert_eq!(timestamps, vec![BASE_TS, BASE_TS + STEP, BASE_TS + 2 * STEP]);
+        assert_eq!(
+            timestamps,
+            vec![BASE_TS, BASE_TS + STEP, BASE_TS + 2 * STEP]
+        );
         assert!(
             timestamps.windows(2).all(|pair| pair[0] < pair[1]),
             "asc output must be strictly ascending, got {timestamps:?}"
@@ -1289,8 +1292,14 @@ mod tests {
 
         // The scoped wrapper forwards both new read paths with tenant scoping.
         let a_desc = tenant_a
-            .select_desc(METRIC, &device_labels("A"), BASE_TS, BASE_TS + STEP, 10,
-            None,)
+            .select_desc(
+                METRIC,
+                &device_labels("A"),
+                BASE_TS,
+                BASE_TS + STEP,
+                10,
+                None,
+            )
             .expect("tenant-a desc read should succeed");
         assert_eq!(a_desc.len(), 1);
         let a_points = tenant_a
@@ -1301,11 +1310,48 @@ mod tests {
         let tenant_b = tenant::scoped_storage(Arc::clone(&storage), "tenant-b");
         assert!(
             tenant_b
-                .select_desc(METRIC, &device_labels("A"), BASE_TS, BASE_TS + STEP, 10,
-            None,)
+                .select_desc(
+                    METRIC,
+                    &device_labels("A"),
+                    BASE_TS,
+                    BASE_TS + STEP,
+                    10,
+                    None,
+                )
                 .expect("tenant-b desc read should succeed")
                 .is_empty(),
             "tenant B must not see tenant A data through select_desc"
+        );
+        assert!(
+            tenant_b
+                .select_asc(
+                    METRIC,
+                    &device_labels("A"),
+                    BASE_TS,
+                    BASE_TS + STEP,
+                    10,
+                    None
+                )
+                .expect("tenant-b asc read should succeed")
+                .is_empty(),
+            "tenant B must not see tenant A data through select_asc"
+        );
+        assert!(
+            tenant_b
+                .select_asc(
+                    METRIC,
+                    &device_labels("A"),
+                    BASE_TS,
+                    BASE_TS + STEP,
+                    10,
+                    Some(&tsink::ValuePredicate {
+                        op: tsink::ValuePredicateOp::Gt,
+                        target: tsink::ValuePredicateTarget::F64(0.0),
+                    }),
+                )
+                .expect("tenant-b filtered asc read should succeed")
+                .is_empty(),
+            "tenant B must not see tenant A data through a filtered select_asc"
         );
         assert!(
             tenant_b
