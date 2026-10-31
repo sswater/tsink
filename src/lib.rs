@@ -41,7 +41,8 @@ pub use storage::{
 };
 pub use value::{
     Aggregator, BytesAggregation, Codec, CodecAggregator, HistogramBucketSpan, HistogramCount,
-    HistogramResetHint, NativeHistogram, Value,
+    HistogramResetHint, NativeHistogram, Value, ValuePredicate, ValuePredicateOp,
+    ValuePredicateTarget,
 };
 pub use wal::{WalReplayMode, WalSyncMode};
 

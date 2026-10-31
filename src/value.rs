@@ -141,6 +141,69 @@ pub(crate) fn i64_to_f64_exact(value: i64) -> Option<f64> {
     }
 }
 
+/// Single-value comparison operator for [`ValuePredicate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValuePredicateOp {
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+    Eq,
+    Ne,
+}
+
+/// Strictly-typed right-hand side of a [`ValuePredicate`]. Only the numeric
+/// payload variants are representable; points of any other type (or of a
+/// different numeric variant) never match.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ValuePredicateTarget {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+}
+
+/// A single comparison predicate applied to data point values during
+/// `select_asc` / `select_desc` scans (e.g. "value > 42").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ValuePredicate {
+    pub op: ValuePredicateOp,
+    pub target: ValuePredicateTarget,
+}
+
+fn compare_i64(op: ValuePredicateOp, lhs: i64, rhs: i64) -> bool {
+    match op {
+        ValuePredicateOp::Lt => lhs < rhs,
+        ValuePredicateOp::Lte => lhs <= rhs,
+        ValuePredicateOp::Gt => lhs > rhs,
+        ValuePredicateOp::Gte => lhs >= rhs,
+        ValuePredicateOp::Eq => lhs == rhs,
+        ValuePredicateOp::Ne => lhs != rhs,
+    }
+}
+
+fn compare_u64(op: ValuePredicateOp, lhs: u64, rhs: u64) -> bool {
+    match op {
+        ValuePredicateOp::Lt => lhs < rhs,
+        ValuePredicateOp::Lte => lhs <= rhs,
+        ValuePredicateOp::Gt => lhs > rhs,
+        ValuePredicateOp::Gte => lhs >= rhs,
+        ValuePredicateOp::Eq => lhs == rhs,
+        ValuePredicateOp::Ne => lhs != rhs,
+    }
+}
+
+fn compare_f64(op: ValuePredicateOp, lhs: f64, rhs: f64) -> bool {
+    match op {
+        ValuePredicateOp::Lt => lhs < rhs,
+        ValuePredicateOp::Lte => lhs <= rhs,
+        ValuePredicateOp::Gt => lhs > rhs,
+        ValuePredicateOp::Gte => lhs >= rhs,
+        // Library-wide equality convention: NaN == NaN (see `f64_eq`).
+        ValuePredicateOp::Eq => f64_eq(lhs, rhs),
+        ValuePredicateOp::Ne => !f64_eq(lhs, rhs),
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -159,6 +222,32 @@ impl PartialEq for Value {
 impl Eq for Value {}
 
 impl Value {
+    /// Evaluates a single-value comparison predicate against this point value.
+    ///
+    /// Matching is strictly typed: a `Value` only compares against a predicate
+    /// target of the exact same variant (`I64` vs `I64`, `U64` vs `U64`, `F64`
+    /// vs `F64`). Every other combination — including `Bool`, `Bytes`,
+    /// `String`, `Histogram`, and numeric variants crossing between each
+    /// other — is dropped (returns `false`), never an error.
+    ///
+    /// NaN semantics: ordering ops (`Lt`/`Lte`/`Gt`/`Gte`) never match a NaN
+    /// point; `Eq`/`Ne` follow the library-wide `f64_eq` convention where
+    /// `NaN == NaN` is true.
+    pub fn matches_predicate(&self, predicate: &ValuePredicate) -> bool {
+        match (self, &predicate.target) {
+            (Value::I64(v), ValuePredicateTarget::I64(t)) => {
+                compare_i64(predicate.op, *v, *t)
+            }
+            (Value::U64(v), ValuePredicateTarget::U64(t)) => {
+                compare_u64(predicate.op, *v, *t)
+            }
+            (Value::F64(v), ValuePredicateTarget::F64(t)) => {
+                compare_f64(predicate.op, *v, *t)
+            }
+            _ => false,
+        }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
             Value::F64(_) => "f64",
@@ -662,5 +751,82 @@ mod tests {
             .aggregate_series(&[DataPoint::new(1, Value::I64(1))])
             .unwrap_err();
         assert!(matches!(err, TsinkError::ValueTypeMismatch { .. }));
+    }
+
+    #[test]
+    fn predicate_strict_type_matching() {
+        let p = ValuePredicate {
+            op: ValuePredicateOp::Gt,
+            target: ValuePredicateTarget::I64(42),
+        };
+        assert!(Value::I64(43).matches_predicate(&p));
+        assert!(!Value::I64(42).matches_predicate(&p)); // Gt is strictly greater
+        assert!(!Value::U64(43).matches_predicate(&p)); // U64 does not cross an I64 predicate
+        assert!(!Value::F64(43.0).matches_predicate(&p)); // F64 does not cross an I64 predicate
+        assert!(!Value::Bool(true).matches_predicate(&p)); // non-numeric types drop
+        assert!(!Value::Bytes(vec![1]).matches_predicate(&p));
+        assert!(!Value::String("43".to_string()).matches_predicate(&p));
+        assert!(!Value::Histogram(Box::new(NativeHistogram {
+            count: None,
+            sum: 0.0,
+            schema: 0,
+            zero_threshold: 0.0,
+            zero_count: None,
+            negative_spans: Vec::new(),
+            negative_deltas: Vec::new(),
+            negative_counts: Vec::new(),
+            positive_spans: Vec::new(),
+            positive_deltas: Vec::new(),
+            positive_counts: Vec::new(),
+            reset_hint: HistogramResetHint::Unknown,
+            custom_values: Vec::new(),
+        }))
+        .matches_predicate(&p));
+    }
+
+    #[test]
+    fn predicate_nan_semantics() {
+        let gt = ValuePredicate {
+            op: ValuePredicateOp::Gt,
+            target: ValuePredicateTarget::F64(1.0),
+        };
+        assert!(!Value::F64(f64::NAN).matches_predicate(&gt)); // NaN never matches ordering ops
+
+        let eq_nan = ValuePredicate {
+            op: ValuePredicateOp::Eq,
+            target: ValuePredicateTarget::F64(f64::NAN),
+        };
+        assert!(Value::F64(f64::NAN).matches_predicate(&eq_nan)); // library convention: NaN == NaN
+
+        let ne_nan = ValuePredicate {
+            op: ValuePredicateOp::Ne,
+            target: ValuePredicateTarget::F64(f64::NAN),
+        };
+        assert!(!Value::F64(f64::NAN).matches_predicate(&ne_nan));
+    }
+
+    #[test]
+    fn predicate_all_ops_on_f64_and_u64() {
+        let f = |op| ValuePredicate {
+            op,
+            target: ValuePredicateTarget::F64(2.0),
+        };
+        assert!(Value::F64(1.0).matches_predicate(&f(ValuePredicateOp::Lt)));
+        assert!(Value::F64(2.0).matches_predicate(&f(ValuePredicateOp::Lte)));
+        assert!(Value::F64(2.0).matches_predicate(&f(ValuePredicateOp::Gte)));
+        assert!(Value::F64(2.0).matches_predicate(&f(ValuePredicateOp::Eq)));
+        assert!(Value::F64(3.0).matches_predicate(&f(ValuePredicateOp::Ne)));
+        assert!(!Value::F64(2.0).matches_predicate(&f(ValuePredicateOp::Ne)));
+
+        // U64 values beyond f64 exact-integer range still compare exactly.
+        let big = (1u64 << 53) + 1;
+        let u = |op| ValuePredicate {
+            op,
+            target: ValuePredicateTarget::U64(big),
+        };
+        assert!(Value::U64(big).matches_predicate(&u(ValuePredicateOp::Eq)));
+        assert!(Value::U64(big + 1).matches_predicate(&u(ValuePredicateOp::Gt)));
+        assert!(Value::U64(big - 1).matches_predicate(&u(ValuePredicateOp::Lt)));
+        assert!(!Value::I64(0).matches_predicate(&u(ValuePredicateOp::Eq)));
     }
 }
