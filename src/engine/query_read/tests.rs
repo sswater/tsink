@@ -536,6 +536,167 @@ fn desc_predicate_drops_wrong_typed_values() {
     storage.close().unwrap();
 }
 
+#[test]
+fn asc_scan_returns_strict_ascending_with_limit() {
+    // Cross-block data: 200 points across 4 chunks (cap 50). A limit of 5
+    // must return the earliest 5 in-window points in strictly ascending order.
+    let storage = live_storage(50);
+    let rows = (0..200i64)
+        .map(|idx| Row::new("asc_scan", DataPoint::new(idx, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let points = storage
+        .select_asc_api("asc_scan", &[], 0, 200, 5, None)
+        .unwrap();
+
+    assert_eq!(
+        points,
+        vec![
+            DataPoint::new(0, 0.0),
+            DataPoint::new(1, 1.0),
+            DataPoint::new(2, 2.0),
+            DataPoint::new(3, 3.0),
+            DataPoint::new(4, 4.0),
+        ]
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_merge_prefers_newest_version_at_equal_timestamp() {
+    // Same timestamp written twice: the newest version must win the merge
+    // (active over sealed over persisted, higher sequence over lower).
+    let storage = live_storage(50);
+    storage
+        .insert_rows(&[Row::new("asc_merge", DataPoint::new(5, 1.0))])
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new("asc_merge", DataPoint::new(5, 2.0))])
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new("asc_merge", DataPoint::new(6, 3.0))])
+        .unwrap();
+
+    let points = storage.select_asc_api("asc_merge", &[], 0, 10, 10, None).unwrap();
+    assert_eq!(
+        points,
+        vec![DataPoint::new(5, 2.0), DataPoint::new(6, 3.0)]
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_predicate_filters_points_and_stops_early() {
+    // Mirror of the desc predicate test: 200 points across 4 chunks, the
+    // predicate matches a sparse head; early stop must survive the chain.
+    let storage = live_storage(50);
+    let rows = (0..200i64)
+        .map(|idx| Row::new("asc_pred", DataPoint::new(idx, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let predicate = ValuePredicate {
+        op: ValuePredicateOp::Gt,
+        target: ValuePredicateTarget::F64(50.0),
+    };
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("asc_pred", &[])
+        .unwrap()
+        .series_id;
+    let plan = storage.query_tier_plan(0, 200);
+    let (points, stats) = storage
+        .select_asc_for_series_with_plan(series_id, 0, 200, 5, Some(&predicate), plan)
+        .unwrap();
+
+    assert_eq!(
+        points,
+        vec![
+            DataPoint::new(51, 51.0),
+            DataPoint::new(52, 52.0),
+            DataPoint::new(53, 53.0),
+            DataPoint::new(54, 54.0),
+            DataPoint::new(55, 55.0),
+        ]
+    );
+    assert!(
+        stats.points_decoded < 200,
+        "predicate scan should stop early, decoded {}",
+        stats.points_decoded
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_predicate_none_matches_select_desc_reversed() {
+    let storage = live_storage(50);
+    let rows = (0..80i64)
+        .map(|idx| Row::new("asc_parity", DataPoint::new(idx, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let asc = storage
+        .select_asc_api("asc_parity", &[], 0, 80, 100, None)
+        .unwrap();
+    let mut desc = storage
+        .select_desc_api("asc_parity", &[], 0, 80, 100, None)
+        .unwrap();
+    desc.reverse();
+
+    assert_eq!(asc, desc);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_and_desc_stop_early_on_limit() {
+    // limit=3 over 1000 points (cap 50): decoded points must stay far below
+    // the full window for both directions.
+    let storage = live_storage(50);
+    let rows = (0..1000i64)
+        .map(|idx| Row::new("asc_early", DataPoint::new(idx, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("asc_early", &[])
+        .unwrap()
+        .series_id;
+
+    let asc_plan = storage.query_tier_plan(0, 1000);
+    let (_, asc_stats) = storage
+        .select_asc_for_series_with_plan(series_id, 0, 1000, 3, None, asc_plan)
+        .unwrap();
+    let desc_plan = storage.query_tier_plan(0, 1000);
+    let (_, desc_stats) = storage
+        .select_desc_for_series_with_plan(series_id, 0, 1000, 3, None, desc_plan)
+        .unwrap();
+
+    assert!(
+        asc_stats.points_decoded <= 3 + 64 * (asc_stats.chunks_touched + 1),
+        "asc decoded {} across {} chunks",
+        asc_stats.points_decoded,
+        asc_stats.chunks_touched
+    );
+    assert!(
+        desc_stats.points_decoded <= 3 + 64 * (desc_stats.chunks_touched + 1),
+        "desc decoded {} across {} chunks",
+        desc_stats.points_decoded,
+        desc_stats.chunks_touched
+    );
+
+    storage.close().unwrap();
+}
+
 fn persistent_numeric_and_blob_storage(
     path: &std::path::Path,
     chunk_point_cap: usize,

@@ -1703,6 +1703,36 @@ impl Storage for TenantScopedStorage {
         }
     }
 
+    fn select_asc(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        limit: usize,
+        predicate: Option<&ValuePredicate>,
+    ) -> TsinkResult<Vec<DataPoint>> {
+        let scoped_labels = self.scoped_labels(labels)?;
+        match self
+            .inner
+            .select_asc(metric, &scoped_labels, start, end, limit, predicate)
+        {
+            Ok(points) => {
+                if !points.is_empty() || !self.is_default_tenant() {
+                    Ok(points)
+                } else {
+                    self.inner
+                        .select_asc(metric, labels, start, end, limit, predicate)
+                }
+            }
+            Err(TsinkError::NoDataPoints { .. }) if self.is_default_tenant() => {
+                self.inner
+                    .select_asc(metric, labels, start, end, limit, predicate)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     fn select_at_timestamps(
         &self,
         metric: &str,

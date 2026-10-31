@@ -649,6 +649,29 @@ pub trait Storage: Send + Sync {
 
     fn select_with_options(&self, metric: &str, opts: QueryOptions) -> Result<Vec<DataPoint>>;
 
+    /// Selects at most `limit` points in strictly ascending timestamp order.
+    ///
+    /// The window is `[start, end)`. When `predicate` is `Some`, only points
+    /// whose value matches the predicate are returned; the scan stops as soon
+    /// as `limit` matching points have been collected. Backends that can answer
+    /// this without scanning the whole window should override the default so
+    /// that cost is independent of window width.
+    fn select_asc(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        limit: usize,
+        predicate: Option<&ValuePredicate>,
+    ) -> Result<Vec<DataPoint>> {
+        let _ = (metric, labels, start, end, limit, predicate);
+        Err(TsinkError::UnsupportedOperation {
+            operation: "select_asc",
+            reason: "not implemented for this storage backend".to_string(),
+        })
+    }
+
     /// Selects at most `limit` points in strictly descending timestamp order.
     ///
     /// The window is `[start, end)`. When `predicate` is `Some`, only points

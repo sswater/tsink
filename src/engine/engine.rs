@@ -383,6 +383,18 @@ impl Storage for ChunkStorage {
         self.select_desc_api(metric, labels, start, end, limit, predicate)
     }
 
+    fn select_asc(
+        &self,
+        metric: &str,
+        labels: &[Label],
+        start: i64,
+        end: i64,
+        limit: usize,
+        predicate: Option<&ValuePredicate>,
+    ) -> Result<Vec<DataPoint>> {
+        self.select_asc_api(metric, labels, start, end, limit, predicate)
+    }
+
     fn select_at_timestamps(
         &self,
         metric: &str,

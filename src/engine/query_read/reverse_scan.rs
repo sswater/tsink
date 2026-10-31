@@ -34,7 +34,7 @@ pub(super) struct ChunkCandidate {
     pub max_ts: i64,
     pub recency: SourceRecency,
     pub(super) sequence: u64,
-    peeked: bool,
+    pub(super) peeked: bool,
     pub(super) source: CandidateSource,
 }
 
@@ -61,7 +61,14 @@ pub(super) struct ReverseScanStats {
 pub(super) struct CandidateSnapshot<'a> {
     pub(super) candidates: Vec<ChunkCandidate>,
     pub(super) persisted_index: RwLockReadGuard<'a, PersistedIndexState>,
-    peeked_chunks: usize,
+    pub(super) peeked_chunks: usize,
+}
+
+/// Scan direction for candidate collection and merge ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScanDirection {
+    Asc,
+    Desc,
 }
 
 impl ChunkStorage {
@@ -270,7 +277,7 @@ impl ChunkStorage {
         end: i64,
         plan: TieredQueryPlan,
     ) -> Result<CandidateSnapshot<'_>> {
-        self.collect_candidates_with_mode(series_id, start, end, plan, true)
+        self.collect_candidates_with_mode(series_id, start, end, plan, true, ScanDirection::Desc)
     }
 
     /// Collects candidates for point lookups, using chunk header min/max as-is
@@ -284,16 +291,24 @@ impl ChunkStorage {
         end: i64,
         plan: TieredQueryPlan,
     ) -> Result<CandidateSnapshot<'_>> {
-        self.collect_candidates_with_mode(series_id, start, end, plan, false)
+        self.collect_candidates_with_mode(
+            series_id,
+            start,
+            end,
+            plan,
+            false,
+            ScanDirection::Desc,
+        )
     }
 
-    fn collect_candidates_with_mode(
+    pub(super) fn collect_candidates_with_mode(
         &self,
         series_id: SeriesId,
         start: i64,
         end: i64,
         plan: TieredQueryPlan,
-        peek_tail: bool,
+        peek: bool,
+        direction: ScanDirection,
     ) -> Result<CandidateSnapshot<'_>> {
         let context = self.query_snapshot_context();
         let visibility_guard = context.visibility_read_fence();
@@ -308,15 +323,33 @@ impl ChunkStorage {
                     if chunk.header.max_ts < start {
                         continue;
                     }
-                    let (min_ts, max_ts, peeked) = if !peek_tail || chunk.header.max_ts < end {
-                        (chunk.header.min_ts, chunk.header.max_ts, false)
-                    } else {
-                        let Some(max_ts) = self.latest_sealed_in_window_ts(chunk, start, end)?
-                        else {
-                            continue;
-                        };
-                        peeked_chunks = peeked_chunks.saturating_add(1);
-                        (chunk.header.min_ts, max_ts, true)
+                    let (min_ts, max_ts, peeked) = match direction {
+                        ScanDirection::Desc => {
+                            if !peek || chunk.header.max_ts < end {
+                                (chunk.header.min_ts, chunk.header.max_ts, false)
+                            } else {
+                                let Some(max_ts) =
+                                    self.latest_sealed_in_window_ts(chunk, start, end)?
+                                else {
+                                    continue;
+                                };
+                                peeked_chunks = peeked_chunks.saturating_add(1);
+                                (chunk.header.min_ts, max_ts, true)
+                            }
+                        }
+                        ScanDirection::Asc => {
+                            if !peek || chunk.header.min_ts >= start {
+                                (chunk.header.min_ts, chunk.header.max_ts, false)
+                            } else {
+                                let Some(min_ts) =
+                                    self.earliest_sealed_in_window_ts(chunk, start, end)?
+                                else {
+                                    continue;
+                                };
+                                peeked_chunks = peeked_chunks.saturating_add(1);
+                                (min_ts, chunk.header.max_ts, true)
+                            }
+                        }
                     };
                     candidates.push(ChunkCandidate {
                         min_ts,
@@ -384,23 +417,44 @@ impl ChunkStorage {
                     continue;
                 }
 
-                let (max_ts, peeked) = if !peek_tail || chunk_ref.max_ts < end {
-                    (chunk_ref.max_ts, false)
-                } else {
-                    let Some(max_ts) = self.latest_persisted_in_window_ts(
-                        &persisted_index,
-                        chunk_ref,
-                        start,
-                        end,
-                    )?
-                    else {
-                        continue;
-                    };
-                    peeked_chunks = peeked_chunks.saturating_add(1);
-                    (max_ts, true)
+                let (min_ts, max_ts, peeked) = match direction {
+                    ScanDirection::Desc => {
+                        if !peek || chunk_ref.max_ts < end {
+                            (chunk_ref.min_ts, chunk_ref.max_ts, false)
+                        } else {
+                            let Some(max_ts) = self.latest_persisted_in_window_ts(
+                                &persisted_index,
+                                chunk_ref,
+                                start,
+                                end,
+                            )?
+                            else {
+                                continue;
+                            };
+                            peeked_chunks = peeked_chunks.saturating_add(1);
+                            (chunk_ref.min_ts, max_ts, true)
+                        }
+                    }
+                    ScanDirection::Asc => {
+                        if !peek || chunk_ref.min_ts >= start {
+                            (chunk_ref.min_ts, chunk_ref.max_ts, false)
+                        } else {
+                            let Some(min_ts) = self.earliest_persisted_in_window_ts(
+                                &persisted_index,
+                                chunk_ref,
+                                start,
+                                end,
+                            )?
+                            else {
+                                continue;
+                            };
+                            peeked_chunks = peeked_chunks.saturating_add(1);
+                            (min_ts, chunk_ref.max_ts, true)
+                        }
+                    }
                 };
                 candidates.push(ChunkCandidate {
-                    min_ts: chunk_ref.min_ts,
+                    min_ts,
                     max_ts,
                     recency: SourceRecency::Persisted,
                     sequence: chunk_ref.sequence,
@@ -411,13 +465,25 @@ impl ChunkStorage {
         }
         drop(visibility_guard);
 
-        candidates.sort_by(|left, right| {
-            right
-                .max_ts
-                .cmp(&left.max_ts)
-                .then_with(|| right.recency.cmp(&left.recency))
-                .then_with(|| right.sequence.cmp(&left.sequence))
-        });
+        match direction {
+            ScanDirection::Desc => {
+                candidates.sort_by(|left, right| {
+                    right
+                        .max_ts
+                        .cmp(&left.max_ts)
+                        .then_with(|| right.recency.cmp(&left.recency))
+                        .then_with(|| right.sequence.cmp(&left.sequence))
+                });
+            }
+            ScanDirection::Asc => {
+                candidates.sort_by(|left, right| {
+                    left.min_ts
+                        .cmp(&right.min_ts)
+                        .then_with(|| right.recency.cmp(&left.recency))
+                        .then_with(|| right.sequence.cmp(&left.sequence))
+                });
+            }
+        }
 
         Ok(CandidateSnapshot {
             candidates,
@@ -459,6 +525,60 @@ impl ChunkStorage {
             start,
             end,
         )
+    }
+
+    fn earliest_sealed_in_window_ts(
+        &self,
+        chunk: &Chunk,
+        start: i64,
+        end: i64,
+    ) -> Result<Option<i64>> {
+        if chunk.encoded_payload.is_empty() {
+            return Ok(chunk
+                .points
+                .iter()
+                .filter(|point| point.ts >= start && point.ts < end)
+                .map(|point| point.ts)
+                .min());
+        }
+
+        let descriptor = EncodedChunkDescriptor {
+            lane: chunk.header.lane,
+            ts_codec: chunk.header.ts_codec,
+            value_codec: chunk.header.value_codec,
+            point_count: chunk.header.point_count as usize,
+        };
+        let search_index = Encoder::build_timestamp_search_index_from_payload(
+            chunk.header.ts_codec,
+            descriptor.point_count,
+            &chunk.encoded_payload,
+        )?;
+        earliest_in_window_timestamp(
+            descriptor,
+            &chunk.encoded_payload,
+            &search_index,
+            start,
+            end,
+        )
+    }
+
+    fn earliest_persisted_in_window_ts(
+        &self,
+        persisted_index: &PersistedIndexState,
+        chunk_ref: &PersistedChunkRef,
+        start: i64,
+        end: i64,
+    ) -> Result<Option<i64>> {
+        let search_index =
+            self.persisted_chunk_timestamp_search_index(persisted_index, chunk_ref)?;
+        let payload = persisted_chunk_payload(&persisted_index.segment_maps, chunk_ref)?;
+        let descriptor = EncodedChunkDescriptor {
+            lane: chunk_ref.lane,
+            ts_codec: chunk_ref.ts_codec,
+            value_codec: chunk_ref.value_codec,
+            point_count: chunk_ref.point_count as usize,
+        };
+        earliest_in_window_timestamp(descriptor, payload.as_ref(), search_index, start, end)
     }
 
     fn latest_persisted_in_window_ts(
@@ -885,8 +1005,36 @@ fn latest_in_window_timestamp(
         .filter(|timestamp| *timestamp >= start))
 }
 
+/// Finds the earliest timestamp in `[start, end)` for a chunk whose header
+/// minimum falls below `start`, using the anchor index to decode only the
+/// candidate head block.
+fn earliest_in_window_timestamp(
+    descriptor: EncodedChunkDescriptor,
+    payload: &[u8],
+    search_index: &TimestampSearchIndex,
+    start: i64,
+    end: i64,
+) -> Result<Option<i64>> {
+    if descriptor.point_count == 0 {
+        return Ok(None);
+    }
+
+    let ts_payload = Encoder::timestamp_payload_from_chunk_payload(payload)?;
+    let Some(block_idx) = search_index.candidate_block_for_ceiling(descriptor.point_count, start)
+    else {
+        return Ok(None);
+    };
+    let block_timestamps =
+        search_index.decode_block(descriptor.point_count, ts_payload, block_idx)?;
+    Ok(block_timestamps
+        .iter()
+        .find(|timestamp| **timestamp >= start)
+        .copied()
+        .filter(|timestamp| *timestamp < end))
+}
+
 /// Returns the highest point index whose timestamp is below `end`.
-fn last_in_window_index(
+pub(super) fn last_in_window_index(
     descriptor: EncodedChunkDescriptor,
     payload: &[u8],
     search_index: &TimestampSearchIndex,
@@ -912,7 +1060,7 @@ fn last_in_window_index(
 }
 
 /// Returns the lowest point index whose timestamp is at or above `start`.
-fn first_in_window_index(
+pub(super) fn first_in_window_index(
     descriptor: EncodedChunkDescriptor,
     payload: &[u8],
     search_index: &TimestampSearchIndex,
@@ -935,7 +1083,7 @@ fn first_in_window_index(
         .saturating_add(position))
 }
 
-fn timestamps_in_index_range(
+pub(super) fn timestamps_in_index_range(
     descriptor: EncodedChunkDescriptor,
     payload: &[u8],
     search_index: &TimestampSearchIndex,

@@ -13,6 +13,8 @@ use super::*;
 mod analysis;
 #[path = "query_read/append_sort.rs"]
 mod append_sort;
+#[path = "query_read/forward_scan.rs"]
+mod forward_scan;
 #[path = "query_read/merge.rs"]
 mod merge;
 #[path = "query_read/pagination.rs"]
