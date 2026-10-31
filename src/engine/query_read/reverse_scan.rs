@@ -6,7 +6,7 @@ use parking_lot::RwLockReadGuard;
 
 use crate::engine::encoder::{Encoder, TimestampSearchIndex, TIMESTAMP_SEARCH_BLOCK_POINTS};
 use crate::validation::{validate_labels, validate_metric};
-use crate::{DataPoint, Label, Result, TsinkError};
+use crate::{DataPoint, Label, Result, TsinkError, ValuePredicate};
 
 use super::super::state::ActivePartitionSnapshot;
 use super::*;
@@ -70,6 +70,7 @@ impl ChunkStorage {
         start: i64,
         end: i64,
         limit: usize,
+        predicate: Option<&ValuePredicate>,
     ) -> Result<Vec<DataPoint>> {
         self.ensure_open()?;
         validate_metric(metric)?;
@@ -83,7 +84,7 @@ impl ChunkStorage {
 
         let plan = self.query_tier_plan(start, end);
         let (points, _stats) =
-            self.select_desc_with_plan(metric, labels, start, end, limit, plan)?;
+            self.select_desc_with_plan(metric, labels, start, end, limit, predicate, plan)?;
         Ok(points)
     }
 
@@ -94,6 +95,7 @@ impl ChunkStorage {
         start: i64,
         end: i64,
         limit: usize,
+        predicate: Option<&ValuePredicate>,
         plan: TieredQueryPlan,
     ) -> Result<(Vec<DataPoint>, ReverseScanStats)> {
         let Some(series_id) = self
@@ -106,7 +108,7 @@ impl ChunkStorage {
             return Ok((Vec::new(), ReverseScanStats::default()));
         };
 
-        self.select_desc_for_series_with_plan(series_id, start, end, limit, plan)
+        self.select_desc_for_series_with_plan(series_id, start, end, limit, predicate, plan)
     }
 
     pub(super) fn select_desc_for_series_with_plan(
@@ -115,6 +117,7 @@ impl ChunkStorage {
         start: i64,
         end: i64,
         limit: usize,
+        predicate: Option<&ValuePredicate>,
         plan: TieredQueryPlan,
     ) -> Result<(Vec<DataPoint>, ReverseScanStats)> {
         if start >= end {
@@ -198,6 +201,14 @@ impl ChunkStorage {
                     }
                     if !seen_timestamps.insert(point.timestamp) {
                         continue;
+                    }
+                    if let Some(predicate) = predicate {
+                        if !point.value.matches_predicate(predicate) {
+                            // The cursor was already re-queued above, so this
+                            // chunk keeps refilling the heap with its next
+                            // point until `limit` matches are collected.
+                            continue;
+                        }
                     }
                     out.push(point);
                 }

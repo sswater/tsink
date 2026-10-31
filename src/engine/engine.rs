@@ -24,7 +24,8 @@ use crate::validation::{validate_labels, validate_metric};
 use crate::{
     DataPoint, DeleteSeriesResult, Label, MetricSeries, QueryOptions, RemoteSegmentCachePolicy,
     RemoteStorageObservabilitySnapshot, Result, Row, SeriesPoints, Storage, StorageBuilder,
-    StorageObservabilitySnapshot, StorageRuntimeMode, TsinkError, Value, WriteResult,
+    StorageObservabilitySnapshot, StorageRuntimeMode, TsinkError, Value, ValuePredicate,
+    WriteResult,
 };
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -377,8 +378,9 @@ impl Storage for ChunkStorage {
         start: i64,
         end: i64,
         limit: usize,
+        predicate: Option<&ValuePredicate>,
     ) -> Result<Vec<DataPoint>> {
-        self.select_desc_api(metric, labels, start, end, limit)
+        self.select_desc_api(metric, labels, start, end, limit, predicate)
     }
 
     fn select_at_timestamps(

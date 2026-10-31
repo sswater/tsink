@@ -16,7 +16,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tsink::{
     DataPoint, DeleteSeriesResult, Label, MetadataShardScope, MetricSeries, QueryOptions,
     Result as TsinkResult, Row, SeriesMatcher, SeriesPoints, SeriesSelection, Storage,
-    StorageObservabilitySnapshot, TsinkError,
+    StorageObservabilitySnapshot, TsinkError, ValuePredicate,
 };
 
 pub const TENANT_HEADER: &str = "x-tsink-tenant";
@@ -1676,21 +1676,28 @@ impl Storage for TenantScopedStorage {
         start: i64,
         end: i64,
         limit: usize,
+        predicate: Option<&ValuePredicate>,
     ) -> TsinkResult<Vec<DataPoint>> {
         let scoped_labels = self.scoped_labels(labels)?;
-        match self
-            .inner
-            .select_desc(metric, &scoped_labels, start, end, limit)
-        {
+        match self.inner.select_desc(
+            metric,
+            &scoped_labels,
+            start,
+            end,
+            limit,
+            predicate,
+        ) {
             Ok(points) => {
                 if !points.is_empty() || !self.is_default_tenant() {
                     Ok(points)
                 } else {
-                    self.inner.select_desc(metric, labels, start, end, limit)
+                    self.inner
+                        .select_desc(metric, labels, start, end, limit, predicate)
                 }
             }
             Err(TsinkError::NoDataPoints { .. }) if self.is_default_tenant() => {
-                self.inner.select_desc(metric, labels, start, end, limit)
+                self.inner
+                    .select_desc(metric, labels, start, end, limit, predicate)
             }
             Err(err) => Err(err),
         }

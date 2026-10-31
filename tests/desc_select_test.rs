@@ -48,7 +48,7 @@ fn desc_returns_last_limit_points_descending() {
         .collect::<Vec<_>>();
     storage.insert_rows(&rows).unwrap();
 
-    let points = storage.select_desc("desc_metric", &[], 0, 200, 5).unwrap();
+    let points = storage.select_desc("desc_metric", &[], 0, 200, 5, None).unwrap();
 
     assert_eq!(timestamps(&points), vec![111, 110, 109, 108, 107]);
     assert_strictly_descending(&points);
@@ -66,8 +66,7 @@ fn desc_across_chunk_boundary() {
     storage.insert_rows(&rows).unwrap();
 
     let points = storage
-        .select_desc("desc_boundary", &[], 0, 500, 6)
-        .unwrap();
+        .select_desc("desc_boundary", &[], 0, 500, 6, None)        .unwrap();
 
     assert_eq!(timestamps(&points), vec![119, 118, 117, 116, 115, 114]);
     assert_strictly_descending(&points);
@@ -94,8 +93,7 @@ fn desc_global_order_mixed_sources() {
         .unwrap();
 
     let points = storage
-        .select_desc("desc_mixed", &[], 0, 4000, 100)
-        .unwrap();
+        .select_desc("desc_mixed", &[], 0, 4000, 100, None)        .unwrap();
 
     assert_eq!(timestamps(&points), vec![2503, 2502, 2501, 2500, 800, 500]);
     assert_strictly_descending(&points);
@@ -124,8 +122,7 @@ fn duplicate_ts_collapsed_to_newest_source() {
         .unwrap();
 
     let points = storage
-        .select_desc("desc_duplicate", &[], 0, 200, 10)
-        .unwrap();
+        .select_desc("desc_duplicate", &[], 0, 200, 10, None)        .unwrap();
 
     assert_eq!(points.len(), 1, "duplicate timestamps must collapse");
     assert_eq!(points[0].timestamp, 100);
@@ -144,23 +141,19 @@ fn desc_respects_end_exclusive_and_empty_window() {
     storage.insert_rows(&rows).unwrap();
 
     let points = storage
-        .select_desc("desc_window", &[], 0, 108, 100)
-        .unwrap();
+        .select_desc("desc_window", &[], 0, 108, 100, None)        .unwrap();
     assert_eq!(timestamps(&points), (100..108i64).rev().collect::<Vec<_>>());
 
     let before_data = storage
-        .select_desc("desc_window", &[], 0, 100, 100)
-        .unwrap();
+        .select_desc("desc_window", &[], 0, 100, 100, None)        .unwrap();
     assert!(before_data.is_empty());
 
     let disjoint = storage
-        .select_desc("desc_window", &[], 200, 300, 100)
-        .unwrap();
+        .select_desc("desc_window", &[], 200, 300, 100, None)        .unwrap();
     assert!(disjoint.is_empty());
 
     let err = storage
-        .select_desc("desc_window", &[], 111, 111, 10)
-        .unwrap_err();
+        .select_desc("desc_window", &[], 111, 111, 10, None)        .unwrap_err();
     assert!(matches!(
         err,
         TsinkError::InvalidTimeRange {
@@ -188,14 +181,12 @@ fn desc_orders_by_latest_in_window_ts_across_straddling_chunk() {
         .unwrap();
 
     let points = storage
-        .select_desc("desc_straddle", &[], 0, 600, 10)
-        .unwrap();
+        .select_desc("desc_straddle", &[], 0, 600, 10, None)        .unwrap();
     assert_eq!(timestamps(&points), vec![500, 300, 200, 100]);
     assert_strictly_descending(&points);
 
     let newest = storage
-        .select_desc("desc_straddle", &[], 0, 600, 1)
-        .unwrap();
+        .select_desc("desc_straddle", &[], 0, 600, 1, None)        .unwrap();
     assert_eq!(timestamps(&newest), vec![500]);
     storage.close().unwrap();
 }
@@ -226,13 +217,11 @@ fn desc_applies_retention_filter_and_limits_visible_points() {
     std::thread::sleep(Duration::from_millis(1_200));
 
     let points = storage
-        .select_desc("desc_retention", &[], old - 10, now + 1_000, 10)
-        .unwrap();
+        .select_desc("desc_retention", &[], old - 10, now + 1_000, 10, None)        .unwrap();
     assert_eq!(timestamps(&points), vec![now, now - 100, now - 200]);
 
     let limited = storage
-        .select_desc("desc_retention", &[], old - 10, now + 1_000, 2)
-        .unwrap();
+        .select_desc("desc_retention", &[], old - 10, now + 1_000, 2, None)        .unwrap();
     assert_eq!(timestamps(&limited), vec![now, now - 100]);
     storage.close().unwrap();
 }
@@ -257,8 +246,7 @@ fn desc_skips_tombstoned_range() {
     assert_eq!(deleted.matched_series, 1);
 
     let points = storage
-        .select_desc("desc_tombstone", &[], 0, 200, 100)
-        .unwrap();
+        .select_desc("desc_tombstone", &[], 0, 200, 100, None)        .unwrap();
     assert_eq!(
         timestamps(&points),
         vec![110, 109, 108, 104, 103, 102, 101, 100]
@@ -297,8 +285,7 @@ fn desc_matches_exact_labels_only() {
         .unwrap();
 
     let points = storage
-        .select_desc("desc_labels", &[Label::new("host", "a")], 0, 500, 100)
-        .unwrap();
+        .select_desc("desc_labels", &[Label::new("host", "a")], 0, 500, 100, None)        .unwrap();
     assert_eq!(timestamps(&points), vec![102, 101, 100]);
     storage.close().unwrap();
 }
@@ -326,14 +313,12 @@ fn desc_overlapping_sealed_and_late_active_same_partition() {
         .unwrap();
 
     let points = storage
-        .select_desc("desc_overlap", &[], 0, 2_000, 5)
-        .unwrap();
+        .select_desc("desc_overlap", &[], 0, 2_000, 5, None)        .unwrap();
     assert_eq!(timestamps(&points), vec![1002, 1001, 1000, 950, 900]);
     assert_strictly_descending(&points);
 
     let newest = storage
-        .select_desc("desc_overlap", &[], 0, 2_000, 2)
-        .unwrap();
+        .select_desc("desc_overlap", &[], 0, 2_000, 2, None)        .unwrap();
     assert_eq!(timestamps(&newest), vec![1002, 1001]);
     storage.close().unwrap();
 }
@@ -360,8 +345,7 @@ fn desc_tombstoned_tail_refills_from_same_chunk() {
         .unwrap();
 
     let points = storage
-        .select_desc("desc_refill", &[], 0, 1_000, 5)
-        .unwrap();
+        .select_desc("desc_refill", &[], 0, 1_000, 5, None)        .unwrap();
     assert_eq!(timestamps(&points), vec![195, 194, 193, 192, 191]);
     storage.close().unwrap();
 }
@@ -389,7 +373,7 @@ fn desc_crash_replay_partial_overlap() {
         )
         .unwrap();
 
-    let points = storage.select_desc("desc_replay", &[], 0, 200, 11).unwrap();
+    let points = storage.select_desc("desc_replay", &[], 0, 200, 11, None).unwrap();
     assert_eq!(
         timestamps(&points),
         (100..=110i64).rev().collect::<Vec<_>>()
@@ -410,10 +394,10 @@ fn desc_persisted_straddling_end_peek() {
     }
 
     let storage = build_storage(&temp_dir, 32, Duration::from_secs(3600));
-    let points = storage.select_desc("desc_peek", &[], 0, 105, 5).unwrap();
+    let points = storage.select_desc("desc_peek", &[], 0, 105, 5, None).unwrap();
     assert_eq!(timestamps(&points), vec![104, 103, 102, 101, 100]);
 
-    let newest = storage.select_desc("desc_peek", &[], 0, 105, 3).unwrap();
+    let newest = storage.select_desc("desc_peek", &[], 0, 105, 3, None).unwrap();
     assert_eq!(timestamps(&newest), vec![104, 103, 102]);
     storage.close().unwrap();
 }

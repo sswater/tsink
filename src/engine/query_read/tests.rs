@@ -10,6 +10,7 @@ use super::merge::{pop_next_point_from_sources, QueryMergeCursor, QueryMergeSour
 use super::pagination::{RawSeriesPagination, SortedSeriesDedupeMode, SortedSeriesPageCollector};
 use super::*;
 use crate::engine::chunk::ChunkHeader;
+use crate::{ValuePredicate, ValuePredicateOp, ValuePredicateTarget};
 
 fn default_future_skew_window(precision: TimestampPrecision) -> i64 {
     super::super::duration_to_timestamp_units(
@@ -381,7 +382,7 @@ fn inv1_decoded_points_bounded() {
     let run = |start: i64| {
         let plan = storage.query_tier_plan(start, end);
         storage
-            .select_desc_for_series_with_plan(series_id, start, end, limit, plan)
+            .select_desc_for_series_with_plan(series_id, start, end, limit, None, plan)
             .unwrap()
     };
 
@@ -410,6 +411,127 @@ fn inv1_decoded_points_bounded() {
         narrow_stats.chunks_touched,
         narrow_bound
     );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn desc_predicate_filters_points_and_stops_early() {
+    // Cross-block data: 200 points across 4 chunks (cap 50). The predicate
+    // matches a sparse tail; early stop must survive the predicate chain.
+    let storage = live_storage(50);
+    let rows = (0..200i64)
+        .map(|idx| Row::new("desc_pred", DataPoint::new(idx, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let predicate = ValuePredicate {
+        op: ValuePredicateOp::Lt,
+        target: ValuePredicateTarget::F64(150.0),
+    };
+    let series_id = storage
+        .catalog
+        .registry
+        .read()
+        .resolve_existing("desc_pred", &[])
+        .unwrap()
+        .series_id;
+    let plan = storage.query_tier_plan(0, 200);
+    let (points, stats) = storage
+        .select_desc_for_series_with_plan(series_id, 0, 200, 5, Some(&predicate), plan)
+        .unwrap();
+
+    assert_eq!(
+        points,
+        vec![
+            DataPoint::new(149, 149.0),
+            DataPoint::new(148, 148.0),
+            DataPoint::new(147, 147.0),
+            DataPoint::new(146, 146.0),
+            DataPoint::new(145, 145.0),
+        ]
+    );
+    assert!(
+        stats.points_decoded < 200,
+        "predicate scan should stop early, decoded {}",
+        stats.points_decoded
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn desc_predicate_none_matches_plain_desc() {
+    let storage = live_storage(50);
+    let rows = (0..80i64)
+        .map(|idx| Row::new("desc_pred_none", DataPoint::new(idx, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let with_none = storage
+        .select_desc_api("desc_pred_none", &[], 0, 80, 100, None)
+        .unwrap();
+    let mut plain_asc = storage
+        .select("desc_pred_none", &[], 0, 80)
+        .unwrap();
+    plain_asc.reverse();
+
+    assert_eq!(with_none, plain_asc);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn desc_predicate_rejects_latest_version_drops_timestamp() {
+    let storage = live_storage(50);
+    storage
+        .insert_rows(&[Row::new("desc_pred_versions", DataPoint::new(5, 1.0))])
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new("desc_pred_versions", DataPoint::new(5, 2.0))])
+        .unwrap();
+
+    // Latest version (2.0) matches: the timestamp survives with the new value.
+    let matches_latest = ValuePredicate {
+        op: ValuePredicateOp::Gt,
+        target: ValuePredicateTarget::F64(1.5),
+    };
+    let points = storage
+        .select_desc_api("desc_pred_versions", &[], 0, 10, 10, Some(&matches_latest))
+        .unwrap();
+    assert_eq!(points, vec![DataPoint::new(5, 2.0)]);
+
+    // Latest version (2.0) rejected: the timestamp drops entirely — the older
+    // matching version (1.0) must NOT fall back into the output.
+    let rejects_latest = ValuePredicate {
+        op: ValuePredicateOp::Gt,
+        target: ValuePredicateTarget::F64(3.0),
+    };
+    let points = storage
+        .select_desc_api("desc_pred_versions", &[], 0, 10, 10, Some(&rejects_latest))
+        .unwrap();
+    assert!(points.is_empty());
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn desc_predicate_drops_wrong_typed_values() {
+    let storage = live_storage(50);
+    let rows = (0..10i64)
+        .map(|idx| Row::new("desc_pred_types", DataPoint::new(idx, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    // Points carry F64; an I64 predicate never matches them.
+    let predicate = ValuePredicate {
+        op: ValuePredicateOp::Gt,
+        target: ValuePredicateTarget::I64(0),
+    };
+    let points = storage
+        .select_desc_api("desc_pred_types", &[], 0, 10, 100, Some(&predicate))
+        .unwrap();
+    assert!(points.is_empty());
 
     storage.close().unwrap();
 }

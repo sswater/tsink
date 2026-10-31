@@ -139,6 +139,7 @@ pub(crate) async fn handle_rows_select(
             query.start,
             query.end,
             query.limit,
+            None,
         ),
     })
     .await;
@@ -595,6 +596,7 @@ mod tests {
                 BASE_TS,
                 BASE_TS + 60 * STEP,
                 limit,
+                None,
             )
             .expect("baseline select_desc should succeed");
         let baseline_timestamps: Vec<i64> = baseline.iter().map(|point| point.timestamp).collect();
@@ -1076,7 +1078,8 @@ mod tests {
 
         // The scoped wrapper forwards both new read paths with tenant scoping.
         let a_desc = tenant_a
-            .select_desc(METRIC, &device_labels("A"), BASE_TS, BASE_TS + STEP, 10)
+            .select_desc(METRIC, &device_labels("A"), BASE_TS, BASE_TS + STEP, 10,
+            None,)
             .expect("tenant-a desc read should succeed");
         assert_eq!(a_desc.len(), 1);
         let a_points = tenant_a
@@ -1087,7 +1090,8 @@ mod tests {
         let tenant_b = tenant::scoped_storage(Arc::clone(&storage), "tenant-b");
         assert!(
             tenant_b
-                .select_desc(METRIC, &device_labels("A"), BASE_TS, BASE_TS + STEP, 10)
+                .select_desc(METRIC, &device_labels("A"), BASE_TS, BASE_TS + STEP, 10,
+            None,)
                 .expect("tenant-b desc read should succeed")
                 .is_empty(),
             "tenant B must not see tenant A data through select_desc"

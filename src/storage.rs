@@ -4,7 +4,7 @@ use crate::validation::validate_metric;
 use crate::wal::{WalReplayMode, WalSyncMode};
 use crate::{
     Aggregator as TypedAggregator, BytesAggregation, Codec, CodecAggregator, DataPoint, Label,
-    Result, Row, TsinkError,
+    Result, Row, TsinkError, ValuePredicate,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -643,9 +643,11 @@ pub trait Storage: Send + Sync {
 
     /// Selects at most `limit` points in strictly descending timestamp order.
     ///
-    /// The window is `[start, end)`. Backends that can answer this without scanning
-    /// the whole window should override the default so that cost is independent of
-    /// window width.
+    /// The window is `[start, end)`. When `predicate` is `Some`, only points
+    /// whose value matches the predicate are returned; the scan stops as soon
+    /// as `limit` matching points have been collected. Backends that can answer
+    /// this without scanning the whole window should override the default so
+    /// that cost is independent of window width.
     fn select_desc(
         &self,
         metric: &str,
@@ -653,8 +655,9 @@ pub trait Storage: Send + Sync {
         start: i64,
         end: i64,
         limit: usize,
+        predicate: Option<&ValuePredicate>,
     ) -> Result<Vec<DataPoint>> {
-        let _ = (metric, labels, start, end, limit);
+        let _ = (metric, labels, start, end, limit, predicate);
         Err(TsinkError::UnsupportedOperation {
             operation: "select_desc",
             reason: "not implemented for this storage backend".to_string(),
