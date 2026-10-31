@@ -471,9 +471,7 @@ fn desc_predicate_none_matches_plain_desc() {
     let with_none = storage
         .select_desc_api("desc_pred_none", &[], 0, 80, 100, None)
         .unwrap();
-    let mut plain_asc = storage
-        .select("desc_pred_none", &[], 0, 80)
-        .unwrap();
+    let mut plain_asc = storage.select("desc_pred_none", &[], 0, 80).unwrap();
     plain_asc.reverse();
 
     assert_eq!(with_none, plain_asc);
@@ -565,6 +563,59 @@ fn asc_scan_returns_strict_ascending_with_limit() {
 }
 
 #[test]
+fn asc_scan_mid_window_start_at_block_boundary_gap() {
+    // Regression: a mid-window `start` landing in a timestamp gap right at a
+    // 64-point block boundary must NOT drop the whole chunk from the head
+    // peek. 200 points at step 10, chunk cap 100, window [635, 1000): the
+    // last pre-start point (ts=630) sits at the final index of its search
+    // block, and the first in-window point (ts=640) opens the next block.
+    let storage = live_storage(100);
+    let rows = (0..200i64)
+        .map(|idx| Row::new("asc_boundary", DataPoint::new(idx * 10, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let points = storage
+        .select_asc_api("asc_boundary", &[], 635, 1000, 100, None)
+        .unwrap();
+
+    assert!(
+        !points.is_empty(),
+        "window [635, 1000) must not come back empty"
+    );
+    let timestamps: Vec<i64> = points.iter().map(|point| point.timestamp).collect();
+    assert_eq!(timestamps.first().copied(), Some(640));
+    assert_eq!(timestamps.last().copied(), Some(990));
+    assert_eq!(timestamps.len(), 36);
+    assert!(
+        timestamps.windows(2).all(|pair| pair[0] < pair[1]),
+        "asc output must be strictly ascending, got {timestamps:?}"
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_scan_mid_window_start_inside_gap_mid_block() {
+    // A gap start that stays inside one search block must also behave.
+    let storage = live_storage(100);
+    let rows = (0..200i64)
+        .map(|idx| Row::new("asc_gap_mid", DataPoint::new(idx * 10, idx as f64)))
+        .collect::<Vec<_>>();
+    storage.insert_rows(&rows).unwrap();
+
+    let points = storage
+        .select_asc_api("asc_gap_mid", &[], 645, 1000, 100, None)
+        .unwrap();
+
+    let timestamps: Vec<i64> = points.iter().map(|point| point.timestamp).collect();
+    assert_eq!(timestamps.first().copied(), Some(650));
+    assert_eq!(timestamps.len(), 35);
+
+    storage.close().unwrap();
+}
+
+#[test]
 fn asc_merge_prefers_newest_version_at_equal_timestamp() {
     // Same timestamp written twice: the newest version must win the merge
     // (active over sealed over persisted, higher sequence over lower).
@@ -579,11 +630,48 @@ fn asc_merge_prefers_newest_version_at_equal_timestamp() {
         .insert_rows(&[Row::new("asc_merge", DataPoint::new(6, 3.0))])
         .unwrap();
 
-    let points = storage.select_asc_api("asc_merge", &[], 0, 10, 10, None).unwrap();
+    let points = storage
+        .select_asc_api("asc_merge", &[], 0, 10, 10, None)
+        .unwrap();
+    assert_eq!(points, vec![DataPoint::new(5, 2.0), DataPoint::new(6, 3.0)]);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_merge_keeps_newest_version_across_block_boundary() {
+    // Regression: duplicate versions of ts=63 stored at search-index 63 and 64
+    // (i.e. straddling a 64-point block boundary). Ascending batch order emits
+    // the older index first; first-seen dedupe must not keep the stale value.
+    let storage = live_storage(100);
+    let mut rows = (0..64i64)
+        .map(|ts| Row::new("asc_block_dup", DataPoint::new(ts, ts as f64)))
+        .collect::<Vec<_>>();
+    rows.push(Row::new("asc_block_dup", DataPoint::new(63, 99.0)));
+    rows.extend((64..200i64).map(|ts| Row::new("asc_block_dup", DataPoint::new(ts, ts as f64))));
+    storage.insert_rows(&rows).unwrap();
+
+    let points = storage
+        .select_asc_api("asc_block_dup", &[], 0, 200, 200, None)
+        .unwrap();
+    let at_63 = points
+        .iter()
+        .find(|point| point.timestamp == 63)
+        .expect("ts=63 must be present");
     assert_eq!(
-        points,
-        vec![DataPoint::new(5, 2.0), DataPoint::new(6, 3.0)]
+        at_63.value_as_f64(),
+        Some(99.0),
+        "asc must keep the newest version across a block boundary"
     );
+
+    let desc = storage
+        .select_desc_api("asc_block_dup", &[], 0, 200, 200, None)
+        .unwrap();
+    let desc_at_63 = desc
+        .iter()
+        .find(|point| point.timestamp == 63)
+        .expect("ts=63 must be present");
+    assert_eq!(desc_at_63.value_as_f64(), Some(99.0));
 
     storage.close().unwrap();
 }
@@ -650,6 +738,120 @@ fn asc_predicate_none_matches_select_desc_reversed() {
     desc.reverse();
 
     assert_eq!(asc, desc);
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_merge_prefers_active_over_sealed_at_equal_timestamp() {
+    // Chunk cap 4 seals [500, 1000, 1001, 1002]; the later ts=1000 write lands
+    // in the same partition's active head. Ascending merge must keep the
+    // active (newest) version at the equal timestamp.
+    let storage = live_storage(4);
+    storage
+        .insert_rows(
+            &[500i64, 1000, 1001, 1002]
+                .into_iter()
+                .map(|ts| Row::new("asc_sealed_dup", DataPoint::new(ts, ts as f64)))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new("asc_sealed_dup", DataPoint::new(1000, 99.0))])
+        .unwrap();
+
+    let points = storage
+        .select_asc_api("asc_sealed_dup", &[], 0, 2_000, 10, None)
+        .unwrap();
+    let at_1000 = points
+        .iter()
+        .find(|point| point.timestamp == 1000)
+        .expect("ts=1000 must be present");
+    assert_eq!(at_1000.value_as_f64(), Some(99.0));
+    let timestamps: Vec<i64> = points.iter().map(|point| point.timestamp).collect();
+    assert!(
+        timestamps.windows(2).all(|pair| pair[0] < pair[1]),
+        "asc output must be strictly ascending, got {timestamps:?}"
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_merge_prefers_active_over_persisted_at_equal_timestamp() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        4,
+        None,
+        Some(temp_dir.path().join("numeric")),
+        Some(temp_dir.path().join("blob")),
+        1,
+        test_options(None),
+    )
+    .unwrap();
+    storage
+        .insert_rows(
+            &[500i64, 1000, 1001, 1002]
+                .into_iter()
+                .map(|ts| Row::new("asc_persisted_dup", DataPoint::new(ts, ts as f64)))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    storage.flush_all_active().unwrap();
+    assert!(storage.persist_segment_with_outcome().unwrap().persisted);
+
+    // The ts=1000 rewrite lands in the active head while the original version
+    // lives in the persisted segment.
+    storage
+        .insert_rows(&[Row::new("asc_persisted_dup", DataPoint::new(1000, 99.0))])
+        .unwrap();
+
+    let points = storage
+        .select_asc_api("asc_persisted_dup", &[], 0, 2_000, 10, None)
+        .unwrap();
+    let at_1000 = points
+        .iter()
+        .find(|point| point.timestamp == 1000)
+        .expect("ts=1000 must be present");
+    assert_eq!(
+        at_1000.value_as_f64(),
+        Some(99.0),
+        "active rewrite must beat the persisted copy in asc merge"
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn asc_predicate_rejects_latest_version_drops_timestamp() {
+    // Asc mirror of desc_predicate_rejects_latest_version_drops_timestamp:
+    // when the newest version fails the predicate the whole timestamp drops —
+    // the older matching version must NOT fall back into the output.
+    let storage = live_storage(50);
+    storage
+        .insert_rows(&[Row::new("asc_pred_versions", DataPoint::new(5, 1.0))])
+        .unwrap();
+    storage
+        .insert_rows(&[Row::new("asc_pred_versions", DataPoint::new(5, 2.0))])
+        .unwrap();
+
+    let matches_latest = ValuePredicate {
+        op: ValuePredicateOp::Gt,
+        target: ValuePredicateTarget::F64(1.5),
+    };
+    let points = storage
+        .select_asc_api("asc_pred_versions", &[], 0, 10, 10, Some(&matches_latest))
+        .unwrap();
+    assert_eq!(points, vec![DataPoint::new(5, 2.0)]);
+
+    let rejects_latest = ValuePredicate {
+        op: ValuePredicateOp::Gt,
+        target: ValuePredicateTarget::F64(3.0),
+    };
+    let points = storage
+        .select_asc_api("asc_pred_versions", &[], 0, 10, 10, Some(&rejects_latest))
+        .unwrap();
+    assert!(points.is_empty());
 
     storage.close().unwrap();
 }

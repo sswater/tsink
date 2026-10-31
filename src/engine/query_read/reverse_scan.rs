@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BinaryHeap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use parking_lot::RwLockReadGuard;
 
@@ -9,8 +9,8 @@ use crate::engine::encoder::{Encoder, TimestampSearchIndex, TIMESTAMP_SEARCH_BLO
 use crate::validation::{validate_labels, validate_metric};
 use crate::{DataPoint, Label, Result, TsinkError, ValuePredicate};
 
-use super::super::{elapsed_nanos_u64, saturating_u64_from_usize};
 use super::super::state::ActivePartitionSnapshot;
+use super::super::{elapsed_nanos_u64, saturating_u64_from_usize};
 use super::*;
 
 /// Relative freshness of a chunk source. Active in-memory heads are always newer
@@ -100,6 +100,7 @@ impl ChunkStorage {
             }
 
             let plan = self.query_tier_plan(start, end);
+            self.record_query_tier_plan(plan);
             let (points, _stats) =
                 self.select_desc_with_plan(metric, labels, start, end, limit, predicate, plan)?;
             Ok(points)
@@ -293,14 +294,7 @@ impl ChunkStorage {
         end: i64,
         plan: TieredQueryPlan,
     ) -> Result<CandidateSnapshot<'_>> {
-        self.collect_candidates_with_mode(
-            series_id,
-            start,
-            end,
-            plan,
-            false,
-            ScanDirection::Desc,
-        )
+        self.collect_candidates_with_mode(series_id, start, end, plan, false, ScanDirection::Desc)
     }
 
     pub(super) fn collect_candidates_with_mode(
@@ -1010,6 +1004,11 @@ fn latest_in_window_timestamp(
 /// Finds the earliest timestamp in `[start, end)` for a chunk whose header
 /// minimum falls below `start`, using the anchor index to decode only the
 /// candidate head block.
+///
+/// This delegates to `first_in_window_index`, which correctly rolls over to
+/// the next block when `start` lands in a timestamp gap at a block boundary
+/// (the naive "search only the block containing `start`" approach silently
+/// drops the chunk whenever the last pre-start point closes its block).
 fn earliest_in_window_timestamp(
     descriptor: EncodedChunkDescriptor,
     payload: &[u8],
@@ -1021,16 +1020,11 @@ fn earliest_in_window_timestamp(
         return Ok(None);
     }
 
-    let ts_payload = Encoder::timestamp_payload_from_chunk_payload(payload)?;
-    let Some(block_idx) = search_index.candidate_block_for_ceiling(descriptor.point_count, start)
-    else {
-        return Ok(None);
-    };
-    let block_timestamps =
-        search_index.decode_block(descriptor.point_count, ts_payload, block_idx)?;
-    Ok(block_timestamps
-        .iter()
-        .find(|timestamp| **timestamp >= start)
+    let first_index = first_in_window_index(descriptor, payload, search_index, start)?;
+    let timestamps =
+        timestamps_in_index_range(descriptor, payload, search_index, first_index, first_index)?;
+    Ok(timestamps
+        .first()
         .copied()
         .filter(|timestamp| *timestamp < end))
 }

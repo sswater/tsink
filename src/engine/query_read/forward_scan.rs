@@ -19,8 +19,8 @@ use crate::{DataPoint, Label, Result, TsinkError, ValuePredicate};
 
 use super::super::{elapsed_nanos_u64, saturating_u64_from_usize};
 use super::reverse_scan::{
-    CandidateSnapshot, CandidateSource, ChunkCandidate, ScanDirection, SourceRecency,
-    first_in_window_index, last_in_window_index, timestamps_in_index_range,
+    first_in_window_index, last_in_window_index, timestamps_in_index_range, CandidateSnapshot,
+    CandidateSource, ChunkCandidate, ScanDirection, SourceRecency,
 };
 use super::*;
 
@@ -60,6 +60,7 @@ impl ChunkStorage {
             }
 
             let plan = self.query_tier_plan(start, end);
+            self.record_query_tier_plan(plan);
             let (points, _stats) =
                 self.select_asc_with_plan(metric, labels, start, end, limit, predicate, plan)?;
             Ok(points)
@@ -129,8 +130,14 @@ impl ChunkStorage {
             return Ok((Vec::new(), ForwardScanStats::default()));
         }
 
-        let snapshot =
-            self.collect_candidates_with_mode(series_id, start, end, plan, true, ScanDirection::Asc)?;
+        let snapshot = self.collect_candidates_with_mode(
+            series_id,
+            start,
+            end,
+            plan,
+            true,
+            ScanDirection::Asc,
+        )?;
         if snapshot.candidates.is_empty() {
             return Ok((Vec::new(), ForwardScanStats::default()));
         }
@@ -388,13 +395,27 @@ impl<'a> AscCursorData<'a> {
             });
         }
 
-        let first_index = first_in_window_index(descriptor, payload.as_ref(), &search_index, start)?;
+        let first_index =
+            first_in_window_index(descriptor, payload.as_ref(), &search_index, start)?;
         let Some(last_index) =
             last_in_window_index(descriptor, payload.as_ref(), &search_index, end)
         else {
             return Self::full_fallback(descriptor, payload.as_ref(), start, end, None, stats);
         };
         if first_index > last_index {
+            return Self::full_fallback(descriptor, payload.as_ref(), start, end, None, stats);
+        }
+        if Self::has_duplicate_timestamp_at_block_boundary(
+            descriptor,
+            payload.as_ref(),
+            &search_index,
+            first_index,
+            last_index,
+        )? {
+            // A duplicate timestamp straddles a block boundary: ascending
+            // batches would emit the older index first and first-seen dedupe
+            // would keep the stale value. The full fallback's single sorted
+            // vector orders newest-first within equal timestamps.
             return Self::full_fallback(descriptor, payload.as_ref(), start, end, None, stats);
         }
 
@@ -411,6 +432,42 @@ impl<'a> AscCursorData<'a> {
             last_emitted_ts: None,
         };
         Ok(Self::Encoded(encoded))
+    }
+
+    /// Detects a duplicate timestamp that straddles a search-block boundary
+    /// inside the window `[first_index, last_index]`: the last index of one
+    /// block and the first index of the next carry the same timestamp.
+    /// Timestamps-only decode, at most one probe per block boundary.
+    fn has_duplicate_timestamp_at_block_boundary(
+        descriptor: EncodedChunkDescriptor,
+        payload: &[u8],
+        search_index: &TimestampSearchIndex,
+        first_index: usize,
+        last_index: usize,
+    ) -> Result<bool> {
+        let first_block = first_index.div_ceil(TIMESTAMP_SEARCH_BLOCK_POINTS);
+        let last_block = last_index / TIMESTAMP_SEARCH_BLOCK_POINTS;
+        for block in first_block..=last_block {
+            let boundary = block * TIMESTAMP_SEARCH_BLOCK_POINTS;
+            if boundary == 0 || boundary > last_index {
+                continue;
+            }
+            let left = timestamps_in_index_range(
+                descriptor,
+                payload,
+                search_index,
+                boundary - 1,
+                boundary - 1,
+            )?;
+            let right =
+                timestamps_in_index_range(descriptor, payload, search_index, boundary, boundary)?;
+            if let (Some(before), Some(after)) = (left.first(), right.first()) {
+                if before == after {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn full_fallback(
