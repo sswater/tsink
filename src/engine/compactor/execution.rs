@@ -121,7 +121,7 @@ fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> 
     let mut deferred_source_removals = Vec::new();
     for source in &source_segments {
         if let Err(err) = remove_dir_if_exists(source) {
-            if is_directory_not_empty_error(&err) {
+            if crate::engine::fs_utils::is_transient_removal_busy_error(&err) {
                 // Another worker (retention sweep) is removing the same
                 // retired source concurrently, or mapped files are still
                 // being released. Keep the replacement marker so a later

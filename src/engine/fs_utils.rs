@@ -129,23 +129,45 @@ fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
 #[cfg(not(windows))]
 fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
     // Two workers may retire the same segment tree concurrently (compaction
-    // source removal vs retention sweep). When the other remover is mid-way,
-    // this attempt can end with DirectoryNotEmpty; wait for it to finish —
-    // if the tree disappears the removal goal is achieved.
+    // source removal vs retention sweep). When the other remover is mid-way
+    // this attempt ends with DirectoryNotEmpty; on NFS an open/mapped file
+    // makes unlink defer to a `.nfs*` silly rename, and re-unlinking that
+    // placeholder fails with EBUSY until the last holder closes it. Both are
+    // transient: wait for the tree to disappear — that is the removal goal.
     let mut attempts = 0usize;
     loop {
         match std::fs::remove_dir_all(path) {
             Ok(()) => return Ok(()),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            Err(err) if is_transient_removal_busy_error(&err) => {
                 attempts += 1;
-                if attempts >= 50 {
+                if attempts >= 150 {
                     return Err(err);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
             Err(err) => return Err(err),
         }
+    }
+}
+
+/// Whether a directory/file removal failure is expected to resolve on its own:
+/// a concurrent remover mid-way (DirectoryNotEmpty) or an NFS silly-renamed
+/// file whose last open handle/mmap has not been dropped yet (EBUSY). The
+/// holder is typically a short-lived reader, so callers wait briefly and
+/// recheck instead of fencing the engine.
+pub(crate) fn is_transient_removal_busy_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || err.raw_os_error() == Some(16) // EBUSY on Linux and macOS
+}
+
+/// TsinkError-level variant for call sites that surface removal failures as
+/// engine errors (bare `Io` or path-scoped `IoWithPath`).
+pub(crate) fn is_transient_removal_busy_tsink_error(err: &TsinkError) -> bool {
+    match err {
+        TsinkError::Io(io_err) => is_transient_removal_busy_error(io_err),
+        TsinkError::IoWithPath { source, .. } => is_transient_removal_busy_error(source),
+        _ => false,
     }
 }
 
@@ -594,5 +616,40 @@ mod tests {
             copy_dir_contents(&source_link, &restore_dest).expect_err("symlink root must fail");
         assert!(matches!(restore_err, TsinkError::InvalidConfiguration(_)));
         assert!(!restore_dest.exists());
+    }
+}
+
+#[cfg(test)]
+mod transient_removal_tests {
+    use super::*;
+
+    #[test]
+    fn transient_removal_busy_classification_matches_nfs_and_racer_states() {
+        // NFS silly rename: the `.nfs*` placeholder of an open file refuses
+        // re-unlink with EBUSY until the last holder closes it.
+        assert!(is_transient_removal_busy_error(
+            &std::io::Error::from_raw_os_error(16)
+        ));
+        // A concurrent remover mid-way leaves the tree non-empty.
+        assert!(is_transient_removal_busy_error(&std::io::Error::from(
+            std::io::ErrorKind::DirectoryNotEmpty
+        )));
+
+        // Genuinely different failures must keep failing loudly.
+        assert!(!is_transient_removal_busy_error(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_transient_removal_busy_error(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+
+        // Engine-level wrappers keep the classification.
+        let busy = std::io::Error::from_raw_os_error(16);
+        assert!(is_transient_removal_busy_tsink_error(&TsinkError::Io(busy)));
+        assert!(is_transient_removal_busy_tsink_error(&TsinkError::IoWithPath {
+            path: std::path::PathBuf::from("/data/seg"),
+            source: std::io::Error::from_raw_os_error(16),
+        }));
+        assert!(!is_transient_removal_busy_tsink_error(&TsinkError::MetricRequired));
     }
 }

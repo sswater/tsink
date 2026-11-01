@@ -7,6 +7,7 @@ use super::super::*;
 use crate::engine::segment::{
     verify_segment_fingerprint, IndexedSegment, SegmentValidationContext,
 };
+use tracing::warn;
 
 type RetentionRewriteStage = (
     Vec<SegmentInventoryEntry>,
@@ -512,6 +513,18 @@ impl<'a> RetentionMaintenanceContext<'a> {
             if let Err(err) =
                 crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&retired_root.root)
             {
+                if crate::engine::fs_utils::is_transient_removal_busy_tsink_error(&err) {
+                    // The transition already published this root out of the
+                    // visible catalog; a concurrent remover or an NFS
+                    // silly-renamed file is still holding the tree. Defer to a
+                    // later pass instead of fencing the engine.
+                    warn!(
+                        path = %retired_root.root.display(),
+                        error = %err,
+                        "Retired segment root removal deferred; a later maintenance pass retries"
+                    );
+                    continue;
+                }
                 if !retired_root.counts_as_expired {
                     self.observability
                         .flush
