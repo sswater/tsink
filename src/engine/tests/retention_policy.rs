@@ -1862,6 +1862,11 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
     );
 
+    // A segment-shaped directory without a manifest is skipped by the
+    // inventory scan: a dir mid-removal (or crash-truncated) must not fence
+    // the whole engine behind a permanent scan failure. The refresh proceeds
+    // with the valid tiers, so the warm-lane segment becomes visible right
+    // away while the invalid directory is left untouched on disk.
     let invalid_segment_root = object_store_dir
         .path()
         .join("cold")
@@ -1869,8 +1874,6 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         .join("segments")
         .join("L0")
         .join("seg-00000000000000ff");
-    // A segment-shaped directory without a manifest forces the inventory scan to fail
-    // deterministically, which keeps the visible catalog stale until the retry succeeds.
     std::fs::create_dir_all(&invalid_segment_root).unwrap();
 
     let warm_lane = object_store_dir.path().join("warm").join(NUMERIC_LANE_ROOT);
@@ -1883,66 +1886,7 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
         &[(30, 30.0), (31, 31.0)],
     );
 
-    let expected_stale_points = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
-    assert!(
-        wait_for_condition(Duration::from_secs(1), Duration::from_millis(5), || {
-            storage
-                .sync_persisted_segments_from_disk_if_dirty_for_tests()
-                .unwrap();
-            let selected = storage
-                .select("compute_only_refresh_stale_metric", &labels, 0, 200)
-                .unwrap();
-            let snapshot = storage.observability_snapshot();
-            selected == expected_stale_points
-                && !snapshot.remote.accessible
-                && snapshot.remote.catalog_refresh_errors_total >= 1
-                && snapshot.remote.consecutive_refresh_failures == 1
-                && snapshot.remote.backoff_active
-        }),
-        "timed out waiting for remote refresh backoff while the stale catalog stayed visible"
-    );
-    assert_eq!(
-        storage
-            .select("compute_only_refresh_stale_metric", &labels, 0, 200)
-            .unwrap(),
-        expected_stale_points
-    );
-
-    let outage_snapshot = storage.observability_snapshot();
-    assert!(!outage_snapshot.remote.accessible);
-    assert!(outage_snapshot.remote.catalog_refresh_errors_total >= 1);
-    assert_eq!(outage_snapshot.remote.consecutive_refresh_failures, 1);
-    assert!(outage_snapshot.remote.backoff_active);
-    assert!(outage_snapshot
-        .remote
-        .last_refresh_attempt_unix_ms
-        .is_some());
-    assert!(outage_snapshot.remote.next_refresh_retry_unix_ms.is_some());
-    assert!(outage_snapshot
-        .remote
-        .last_refresh_error
-        .as_deref()
-        .is_some_and(|message| message.contains("remote catalog refresh")));
-    assert!(outage_snapshot.health.degraded);
-
-    let refresh_errors_before_retry = outage_snapshot.remote.catalog_refresh_errors_total;
-    assert_eq!(
-        storage
-            .select("compute_only_refresh_stale_metric", &labels, 0, 200)
-            .unwrap(),
-        vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)]
-    );
-    let repeated_snapshot = storage.observability_snapshot();
-    assert_eq!(
-        repeated_snapshot.remote.catalog_refresh_errors_total,
-        refresh_errors_before_retry
-    );
-    assert_eq!(repeated_snapshot.remote.consecutive_refresh_failures, 1);
-    assert!(repeated_snapshot.remote.backoff_active);
-
-    std::fs::remove_dir_all(&invalid_segment_root).unwrap();
-
-    let expected_recovered_points = vec![
+    let expected_points = vec![
         DataPoint::new(1, 1.0),
         DataPoint::new(2, 2.0),
         DataPoint::new(30, 30.0),
@@ -1957,32 +1901,31 @@ fn compute_only_storage_serves_stale_catalog_during_remote_refresh_backoff_and_r
                 .select("compute_only_refresh_stale_metric", &labels, 0, 200)
                 .unwrap();
             let snapshot = storage.observability_snapshot();
-            selected == expected_recovered_points
+            selected == expected_points
                 && snapshot.remote.accessible
-                && !snapshot.remote.backoff_active
+                && snapshot.remote.catalog_refresh_errors_total == 0
                 && snapshot.remote.consecutive_refresh_failures == 0
-                && snapshot.remote.last_refresh_error.is_none()
-                && !snapshot.health.degraded
+                && !snapshot.remote.backoff_active
         }),
-        "timed out waiting for remote catalog refresh recovery"
+        "timed out waiting for the refresh to adopt valid tiers despite the manifest-less directory"
     );
     assert_eq!(
         storage
             .select("compute_only_refresh_stale_metric", &labels, 0, 200)
             .unwrap(),
-        expected_recovered_points
+        expected_points
     );
-    let recovered_snapshot = storage.observability_snapshot();
-    assert!(recovered_snapshot.remote.accessible);
-    assert!(!recovered_snapshot.remote.backoff_active);
-    assert_eq!(recovered_snapshot.remote.consecutive_refresh_failures, 0);
-    assert!(recovered_snapshot.remote.last_refresh_error.is_none());
-    assert!(!recovered_snapshot.health.degraded);
-    assert_eq!(
-        storage
-            .select("compute_only_refresh_stale_metric", &labels, 0, 200)
-            .unwrap(),
-        expected_recovered_points
+
+    let snapshot = storage.observability_snapshot();
+    assert!(snapshot.remote.accessible);
+    assert_eq!(snapshot.remote.catalog_refresh_errors_total, 0);
+    assert_eq!(snapshot.remote.consecutive_refresh_failures, 0);
+    assert!(!snapshot.remote.backoff_active);
+    assert!(snapshot.remote.last_refresh_error.is_none());
+    assert!(!snapshot.health.degraded);
+    assert!(
+        invalid_segment_root.exists(),
+        "skipped invalid directory must be left untouched for later cleanup"
     );
 
     storage.close().unwrap();

@@ -1,4 +1,5 @@
 use super::*;
+use tracing::warn;
 
 impl Compactor {
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
@@ -95,6 +96,14 @@ pub(super) fn count_level_segments_for_compaction(base: &Path, level: u8) -> Res
                 count = count.saturating_add(1);
             }
             Err(err) if is_not_found_error(&err) => continue,
+            Err(TsinkError::DataCorruption(details)) if details.starts_with("missing ") => {
+                warn!(
+                    path = %root.display(),
+                    details = %details,
+                    "Segment directory is mid-removal during compaction planning; skipping"
+                );
+                continue;
+            }
             Err(TsinkError::DataCorruption(details)) => {
                 return Err(segment_validation_error(
                     &root,

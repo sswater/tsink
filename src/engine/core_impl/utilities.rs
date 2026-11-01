@@ -174,6 +174,14 @@ impl ChunkStorage {
         self.coordination.background_maintenance_lock.lock()
     }
 
+    /// Non-blocking variant for foreground callers: returns `None` while a
+    /// background maintenance pass holds the gate.
+    pub(in crate::engine::storage_engine) fn background_maintenance_gate_try_lock(
+        &self,
+    ) -> Option<MutexGuard<'_, ()>> {
+        self.coordination.background_maintenance_lock.try_lock()
+    }
+
     pub(in crate::engine::storage_engine) fn compaction_gate(&self) -> MutexGuard<'_, ()> {
         self.coordination.compaction_lock.lock()
     }

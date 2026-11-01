@@ -491,6 +491,30 @@ impl ChunkStorage {
             return Ok(());
         }
 
+        // Foreground flushes (cluster durability hooks, user calls) drive the
+        // same staging/publish/WAL-reset stages as the background flush
+        // thread. Racing the two produced transient ENOENT/ENOTEMPTY failures
+        // that tripped the fail-fast fence. Skip when a pass is already in
+        // flight: the background thread covers this request within its next
+        // tick.
+        let _maintenance_gate = match policy {
+            FlushPipelinePolicy::Foreground => match self.background_maintenance_gate_try_lock() {
+                Some(guard) => Some(guard),
+                None => {
+                    self.observability
+                        .flush
+                        .pipeline_success_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.observability
+                        .flush
+                        .pipeline_duration_nanos_total
+                        .fetch_add(elapsed_nanos_u64(started), Ordering::Relaxed);
+                    return Ok(());
+                }
+            },
+            _ => None,
+        };
+
         let flush_result = match policy {
             FlushPipelinePolicy::Foreground => self.flush_all_active(),
             FlushPipelinePolicy::BackgroundEligibleOnly => self.flush_background_eligible_active(),

@@ -118,22 +118,41 @@ fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> 
         }
     }
 
+    let mut deferred_source_removals = Vec::new();
     for source in &source_segments {
-        remove_dir_if_exists(source).map_err(|err| TsinkError::IoWithPath {
-            path: source.clone(),
-            source: err,
-        })?;
-    }
-
-    match fs::remove_file(marker_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
+        if let Err(err) = remove_dir_if_exists(source) {
+            if is_directory_not_empty_error(&err) {
+                // Another worker (retention sweep) is removing the same
+                // retired source concurrently, or mapped files are still
+                // being released. Keep the replacement marker so a later
+                // maintenance pass retries the removal; the recorded diff
+                // already fences these sources out of the catalog.
+                deferred_source_removals.push(source.clone());
+                continue;
+            }
             return Err(TsinkError::IoWithPath {
-                path: marker_path.to_path_buf(),
+                path: source.clone(),
                 source: err,
             });
         }
+    }
+
+    if deferred_source_removals.is_empty() {
+        match fs::remove_file(marker_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: marker_path.to_path_buf(),
+                    source: err,
+                });
+            }
+        }
+    } else {
+        tracing::warn!(
+            deferred = ?deferred_source_removals,
+            "Compaction source removal deferred; replacement marker kept for a later pass"
+        );
     }
 
     Ok(())

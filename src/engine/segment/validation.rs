@@ -42,6 +42,15 @@ pub(crate) fn segment_validation_error_message(err: &TsinkError) -> Option<Strin
     }
 }
 
+/// A segment directory that exists but is missing one of its required files is
+/// a segment **mid-removal**: retirement unlinks the files before the rmdir,
+/// and on NFS the unlinks of still-mapped files linger as `.nfs*` entries
+/// until the mappings are dropped. Such a directory cannot serve data and
+/// must be skipped by runtime scans instead of failing them.
+pub(crate) fn is_missing_required_segment_file_error(err: &TsinkError) -> bool {
+    matches!(err, TsinkError::DataCorruption(msg) if msg.starts_with("missing "))
+}
+
 pub(crate) fn segment_validation_error(
     segment_root: &Path,
     context: SegmentValidationContext,

@@ -128,7 +128,25 @@ fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
 
 #[cfg(not(windows))]
 fn remove_dir_all_with_retry(path: &Path) -> std::io::Result<()> {
-    std::fs::remove_dir_all(path)
+    // Two workers may retire the same segment tree concurrently (compaction
+    // source removal vs retention sweep). When the other remover is mid-way,
+    // this attempt can end with DirectoryNotEmpty; wait for it to finish —
+    // if the tree disappears the removal goal is achieved.
+    let mut attempts = 0usize;
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                attempts += 1;
+                if attempts >= 50 {
+                    return Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -157,6 +175,12 @@ pub(crate) fn remove_dir_if_exists(path: &Path) -> std::io::Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
+}
+
+/// Whether the error is a rmdir/remove_dir failure on a directory that still
+/// contains entries — the signature of a concurrent remover mid-way.
+pub(crate) fn is_directory_not_empty_error(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::DirectoryNotEmpty
 }
 
 pub(crate) fn remove_file_if_exists(path: &Path) -> std::io::Result<bool> {

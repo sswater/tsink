@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::durability::WalHighWatermark;
 use crate::engine::encoder::Encoder;
-use crate::engine::fs_utils::{remove_dir_if_exists, write_file_atomically_and_sync_parent};
+use crate::engine::fs_utils::{is_directory_not_empty_error, remove_dir_if_exists, write_file_atomically_and_sync_parent};
 use crate::engine::segment::{
     is_not_found_error, list_segment_dirs, load_segments_for_level_runtime_strict,
     load_segments_runtime_strict, read_segment_manifest, segment_validation_error, LoadedSegment,

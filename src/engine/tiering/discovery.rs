@@ -83,6 +83,14 @@ fn scan_segment_roots(
                 );
                 continue;
             }
+            Err(TsinkError::DataCorruption(msg)) if msg.starts_with("missing ") => {
+                warn!(
+                    path = %root.display(),
+                    details = %msg,
+                    "Segment directory is mid-removal during tiered inventory scan; skipping"
+                );
+                continue;
+            }
             Err(TsinkError::DataCorruption(msg)) => {
                 return Err(segment_validation_error(&root, context, &msg));
             }
