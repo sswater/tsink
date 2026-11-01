@@ -10,6 +10,7 @@ use crate::engine::fs_utils::{path_exists_no_follow, write_file_atomically_and_s
 use crate::engine::segment::IndexedSegment;
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::Label;
+use tracing::warn;
 
 const REGISTRY_CATALOG_FILE_NAME: &str = "series_index.catalog.json";
 const REGISTRY_CATALOG_VERSION: u32 = 2;
@@ -136,13 +137,36 @@ fn build_catalog(
     })
 }
 
+/// A catalog source that vanished (root directory removed, or its required
+/// files already unlinked) between the inventory snapshot and this read is a
+/// segment mid-removal: compaction or retention retired it concurrently. The
+/// catalog describes surviving segments, so skip the source instead of
+/// failing — surfacing the error would fence the engine on a transient state.
+fn is_vanished_catalog_source_error(err: &TsinkError) -> bool {
+    match err {
+        TsinkError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
+        TsinkError::DataCorruption(message) => message.starts_with("missing "),
+        _ => false,
+    }
+}
+
 fn build_catalog_entries(
     sources: &[PersistedRegistryCatalogSource],
 ) -> Result<Vec<PersistedRegistryCatalogEntry>> {
-    let mut segments = sources
-        .iter()
-        .map(build_catalog_entry)
-        .collect::<Result<Vec<_>>>()?;
+    let mut segments = Vec::with_capacity(sources.len());
+    for source in sources {
+        match build_catalog_entry(source) {
+            Ok(entry) => segments.push(entry),
+            Err(err) if is_vanished_catalog_source_error(&err) => {
+                warn!(
+                    path = %source.root.display(),
+                    error = %err,
+                    "Registry catalog source vanished mid-removal; skipping"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
     segments.sort_by_key(|entry| (entry.lane, entry.level, entry.segment_id));
     Ok(segments)
 }
@@ -181,7 +205,20 @@ fn build_series_fingerprint_from_sources(
     let mut series_id_by_key = BTreeMap::<(String, Vec<Label>), SeriesId>::new();
 
     for source in sources {
-        for series in crate::engine::segment::load_segment_series_metadata(&source.root)? {
+        let series_metadata =
+            match crate::engine::segment::load_segment_series_metadata(&source.root) {
+                Ok(metadata) => metadata,
+                Err(err) if is_vanished_catalog_source_error(&err) => {
+                    warn!(
+                        path = %source.root.display(),
+                        error = %err,
+                        "Registry catalog source vanished mid-removal; skipping"
+                    );
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+        for series in series_metadata {
             match series_by_id.get(&series.series_id) {
                 Some(existing)
                     if existing.metric == series.metric && existing.labels == series.labels => {}
@@ -268,4 +305,29 @@ fn fingerprint_series<'a>(
 fn update_len_prefixed_bytes(hasher: &mut Xxh64, bytes: &[u8]) {
     hasher.update(&(bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn catalog_build_skips_sources_that_vanish_mid_removal() {
+        let temp_dir = TempDir::new().unwrap();
+        let ghost = PersistedRegistryCatalogSource {
+            lane: SegmentLaneFamily::Numeric,
+            root: temp_dir.path().join("seg-00000000000000ff"),
+        };
+
+        // The root directory does not exist. Before the vanished-source
+        // tolerance this surfaced as a bare ENOENT from the manifest
+        // fingerprint read and fenced the flush worker while it persisted
+        // the registry catalog (production backtrace, 2026-11-01).
+        let entries = build_catalog_entries(&[ghost.clone()]).unwrap();
+        assert!(entries.is_empty());
+
+        let fingerprint = build_series_fingerprint_from_sources(&[ghost]).unwrap();
+        assert_eq!(fingerprint.series_count, 0);
+    }
 }

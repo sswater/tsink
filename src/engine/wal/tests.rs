@@ -1662,6 +1662,7 @@ fn failed_append_does_not_advance_next_seq() {
         path: parking_lot::Mutex::new(PathBuf::from(&wal_path)),
         published_highwater_path: temp_dir.path().join("wal.published"),
         published_highwater_tmp_path: temp_dir.path().join("wal.published.tmp"),
+        published_marker_lock: parking_lot::Mutex::new(()),
         writer: parking_lot::Mutex::new(std::io::BufWriter::new(writer_file)),
         active_segment: AtomicU64::new(0),
         active_segment_size_bytes: AtomicU64::new(0),
@@ -1816,4 +1817,44 @@ fn rollback_partial_append_clears_buffered_bytes_and_preserves_next_frame() {
 
     assert_eq!(first.series_id, 1);
     assert_eq!(second.series_id, 2);
+}
+
+#[test]
+fn concurrent_publishes_serialize_and_keep_the_marker_monotonic() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let wal = Arc::new(FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap());
+    let next_frame = Arc::new(AtomicU64::new(1));
+
+    // Before the published-marker lock existed, concurrent publishes shared
+    // one fixed tmp path: one thread's rename moved the tmp out from under
+    // another (bare ENOENT, volatile ack) and an older highwater could land
+    // after a newer one, regressing the persisted boundary.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let wal = wal.clone();
+        let next_frame = next_frame.clone();
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..64 {
+                let frame = next_frame.fetch_add(1, Ordering::SeqCst);
+                wal.publish_committed_highwater(WalHighWatermark { segment: 0, frame }, false)
+                    .unwrap();
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let expected_frame = 8 * 64;
+    drop(wal);
+    let reopened = FramedWal::open(temp_dir.path(), WalSyncMode::PerAppend).unwrap();
+    let published = reopened.current_published_highwater();
+    assert_eq!(published.segment, 0);
+    assert_eq!(
+        published.frame, expected_frame,
+        "the persisted marker must land on the last issued highwater"
+    );
 }

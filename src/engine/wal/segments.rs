@@ -132,6 +132,7 @@ impl FramedWal {
             path: Mutex::new(active.path.clone()),
             published_highwater_path,
             published_highwater_tmp_path,
+            published_marker_lock: Mutex::new(()),
             writer: Mutex::new(writer),
             active_segment: AtomicU64::new(active.id),
             active_segment_size_bytes: AtomicU64::new(accounting.active_segment_size_bytes),

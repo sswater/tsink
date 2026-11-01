@@ -413,6 +413,15 @@ impl FramedWal {
         highwater: WalHighWatermark,
         sync: bool,
     ) -> Result<()> {
+        let _marker_guard = self.published_marker_lock.lock();
+        self.persist_published_highwater_locked(highwater, sync)
+    }
+
+    fn persist_published_highwater_locked(
+        &self,
+        highwater: WalHighWatermark,
+        sync: bool,
+    ) -> Result<()> {
         write_published_highwater_marker(
             &self.dir,
             &self.published_highwater_path,
@@ -427,11 +436,15 @@ impl FramedWal {
         highwater: WalHighWatermark,
         sync: bool,
     ) -> Result<()> {
+        // The check/persist/mark sequence must be atomic: ingest threads and
+        // the WAL reset path converge on the same marker files, and an older
+        // highwater persisting after a newer one would regress the boundary.
+        let _marker_guard = self.published_marker_lock.lock();
         if highwater <= self.current_published_highwater() {
             return Ok(());
         }
 
-        self.persist_published_highwater(highwater, sync)?;
+        self.persist_published_highwater_locked(highwater, sync)?;
         self.mark_published_through(highwater);
         Ok(())
     }

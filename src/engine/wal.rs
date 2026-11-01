@@ -179,6 +179,10 @@ pub struct FramedWal {
     path: Mutex<PathBuf>,
     published_highwater_path: PathBuf,
     published_highwater_tmp_path: PathBuf,
+    // Serializes published-highwater marker writes. Ingest publishes and WAL
+    // resets share one fixed tmp path; racing them produced rename ENOENTs
+    // (volatile acks) and could regress the persisted marker.
+    published_marker_lock: Mutex<()>,
     writer: Mutex<BufWriter<File>>,
     active_segment: AtomicU64,
     active_segment_size_bytes: AtomicU64,
