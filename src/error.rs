@@ -86,7 +86,7 @@ pub enum TsinkError {
     },
 
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[source] std::io::Error),
 
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
@@ -152,6 +152,21 @@ pub enum TsinkError {
 
     #[error("Other error: {0}")]
     Other(String),
+}
+
+impl From<std::io::Error> for TsinkError {
+    fn from(err: std::io::Error) -> Self {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            // Bare ENOENT conversions lose the failing site. While the
+            // flush-pipeline ENOENT is being hunted, capture where it is
+            // created so the server log points at the exact operation.
+            eprintln!(
+                "tsink: bare ENOENT io error created at:\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        TsinkError::Io(err)
+    }
 }
 
 impl<T> From<std::sync::PoisonError<T>> for TsinkError {

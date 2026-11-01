@@ -60,6 +60,9 @@ harness = false
 lto = true
 codegen-units = 1
 opt-level = 3
+# Line tables keep release backtraces readable (file:line) so production
+# incidents point at the failing site without shipping full debug info.
+debug = "line-tables-only"
 
 [profile.bench]
 inherits = "release"
