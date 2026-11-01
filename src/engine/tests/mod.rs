@@ -65,6 +65,12 @@ mod failure_modes;
 mod ingest_concurrency;
 mod ingest_core;
 mod ingest_failures;
+#[path = "repro_flush_visibility.rs"]
+mod repro_flush_visibility;
+#[path = "repro_registry_delta.rs"]
+mod repro_registry_delta;
+#[path = "repro_registry_multi_delta.rs"]
+mod repro_registry_multi_delta;
 mod persistence_background;
 mod persistence_recovery;
 mod persistence_segments;
