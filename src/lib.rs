@@ -35,9 +35,9 @@ pub use storage::{
     RemoteSegmentCachePolicy, RemoteStorageObservabilitySnapshot, RetentionObservabilitySnapshot,
     RollupObservabilitySnapshot, RollupPolicy, RollupPolicyStatus, SeriesMatcher, SeriesMatcherOp,
     SeriesPoints, SeriesSelection, ShardWindowDigest, ShardWindowRowsPage, ShardWindowScanOptions,
-    Storage, StorageBuilder, StorageObservabilitySnapshot, StorageRuntimeMode, TimestampPrecision,
-    WalObservabilitySnapshot, WriteAcknowledgement, WriteResult,
-    DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
+    Storage, StorageBuilder, StorageHealthSnapshot, StorageObservabilitySnapshot,
+    StorageRuntimeMode, TimestampPrecision, WalObservabilitySnapshot, WriteAcknowledgement,
+    WriteResult, DEFAULT_MAX_ACTIVE_PARTITION_HEADS_PER_SERIES,
 };
 pub use value::{
     Aggregator, BytesAggregation, Codec, CodecAggregator, HistogramBucketSpan, HistogramCount,

@@ -3,6 +3,7 @@ use super::*;
 mod cluster;
 
 use self::cluster::ClusterMetrics;
+use tsink::StorageHealthSnapshot;
 
 struct MetricsCollectionError {
     collector: &'static str,
@@ -685,10 +686,53 @@ pub(super) fn render_metrics(
     append_tenant_admission_metrics(&mut body, tenant_admission_metrics);
     append_security_metrics(&mut body, security_manager, rbac_registry);
     append_usage_metrics(&mut body, &usage_status);
+    append_storage_health_metrics(&mut body, &obs.health);
     append_metrics_collection_errors(&mut body, &collection_errors);
 
     HttpResponse::new(200, body.into_bytes())
         .with_header("Content-Type", "text/plain; version=0.0.4")
+}
+
+/// Engine health: the fail-fast fence and the errors that may have triggered
+/// it. `last_background_error` / `last_maintenance_error` carry the reason an
+/// operator needs when writes start failing with "Storage is shutting down".
+fn append_storage_health_metrics(body: &mut String, health: &StorageHealthSnapshot) {
+    body.push_str(
+        "# HELP tsink_storage_fail_fast Whether the engine fenced new work after a background failure\n\
+         # TYPE tsink_storage_fail_fast gauge\n",
+    );
+    body.push_str(&format!(
+        "tsink_storage_fail_fast {}\n",
+        u8::from(health.fail_fast_triggered)
+    ));
+    body.push_str(
+        "# HELP tsink_storage_background_errors_total Background worker errors recorded since startup\n\
+         # TYPE tsink_storage_background_errors_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_storage_background_errors_total {}\n",
+        health.background_errors_total
+    ));
+    body.push_str(
+        "# HELP tsink_storage_maintenance_errors_total Maintenance operation errors recorded since startup\n\
+         # TYPE tsink_storage_maintenance_errors_total counter\n",
+    );
+    body.push_str(&format!(
+        "tsink_storage_maintenance_errors_total {}\n",
+        health.maintenance_errors_total
+    ));
+    if let Some(error) = health
+        .last_background_error
+        .as_deref()
+        .or(health.last_maintenance_error.as_deref())
+    {
+        let error = prometheus_escape_label_value(error);
+        body.push_str(
+            "# HELP tsink_storage_last_error_info The last recorded background or maintenance error\n\
+             # TYPE tsink_storage_last_error_info gauge\n",
+        );
+        body.push_str(&format!("tsink_storage_last_error_info{{error=\"{error}\"}} 1\n"));
+    }
 }
 
 fn append_metrics_collection_errors(body: &mut String, errors: &[MetricsCollectionError]) {

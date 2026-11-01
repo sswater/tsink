@@ -95,6 +95,20 @@ impl StorageObservabilityCounters {
             .fetch_add(1, Ordering::Relaxed);
         *self.health.last_background_error.write() =
             Some(format!("{worker} worker error: {error}"));
+        // Surface the reason in the server log: without this line the only
+        // copy of the failure lived in an in-memory field, and operators saw
+        // nothing but "Storage is shutting down" on every later request.
+        tracing::error!(
+            worker,
+            fail_fast = fail_fast_enabled,
+            error = %error,
+            "background worker failed; {}",
+            if fail_fast_enabled {
+                "new work is fenced until restart"
+            } else {
+                "the worker will retry on its next pass"
+            }
+        );
         if fail_fast_enabled {
             self.health
                 .fail_fast_triggered

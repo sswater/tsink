@@ -2564,6 +2564,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
  "tsink",
  "x509-parser",
  "xxhash-rust",

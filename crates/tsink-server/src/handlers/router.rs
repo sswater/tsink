@@ -115,7 +115,24 @@ pub(super) async fn route_request(
             HttpResponse::new(200, "ok\n").with_header("Content-Type", "text/plain")
         }
         ("GET", "/ready") => {
-            HttpResponse::new(200, "ready\n").with_header("Content-Type", "text/plain")
+            let health = storage.observability_snapshot().health;
+            if health.fail_fast_triggered {
+                // The engine fenced new work after a background failure; keep
+                // serving /healthz (process alive) but tell load balancers the
+                // storage is not usable, and surface the reason.
+                let reason = health
+                    .last_background_error
+                    .or(health.last_maintenance_error)
+                    .unwrap_or_else(|| "background maintenance failed".to_string());
+                HttpResponse::new(
+                    503,
+                    format!("not ready: storage fenced by background failure: {reason}\n"),
+                )
+                .with_header("Content-Type", "text/plain")
+                .with_header("Retry-After", "30")
+            } else {
+                HttpResponse::new(200, "ready\n").with_header("Content-Type", "text/plain")
+            }
         }
         ("GET", "/metrics") => handle_metrics(
             storage,

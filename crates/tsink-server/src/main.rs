@@ -36,6 +36,16 @@ use crate::server::{run_server, ServerConfig};
 
 #[tokio::main]
 async fn main() {
+    // Engine failures (flush/compaction/refresh) are reported through
+    // `tracing`; without a subscriber those messages were silently dropped
+    // and operators only saw "Storage is shutting down" with no reason.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
+
     if let Err(err) = run().await {
         eprintln!("{err}");
         std::process::exit(1);
@@ -233,6 +243,14 @@ struct ServerCliArgs {
         help = "Budget for value-filtered streaming scans (for example 30s); unlimited when unset"
     )]
     filtered_scan_timeout: Option<Duration>,
+    #[arg(
+        long,
+        value_name = "BOOL",
+        default_value = "true",
+        value_parser = parse_bool,
+        help = "Fence new work (writes return 'Storage is shutting down') after a background worker failure; restart clears it. Set false to keep serving from the WAL while flush failures retry"
+    )]
+    background_fail_fast: bool,
     #[arg(
         long,
         value_name = "MODE",
@@ -461,6 +479,7 @@ impl ServerCliArgs {
             chunk_points: self.chunk_points,
             max_writers: self.max_writers,
             filtered_scan_timeout: self.filtered_scan_timeout,
+            background_fail_fast: self.background_fail_fast,
             wal_sync_mode: self.wal_sync_mode,
             wal_replay_mode: self.wal_replay_mode,
             tls_cert: self.tls_cert,
