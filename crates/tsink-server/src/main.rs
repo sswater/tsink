@@ -247,6 +247,7 @@ struct ServerCliArgs {
         long,
         value_name = "BOOL",
         default_value = "true",
+        action = clap::ArgAction::Set,
         value_parser = parse_bool,
         help = "Fence new work (writes return 'Storage is shutting down') after a background worker failure; restart clears it. Set false to keep serving from the WAL while flush failures retry"
     )]
