@@ -110,12 +110,19 @@ fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> 
         .collect::<Result<Vec<_>>>()?;
 
     for output in &output_segments {
-        if !output.join("manifest.bin").exists() {
-            return Err(TsinkError::DataCorruption(format!(
-                "compaction replacement output segment missing manifest: {}",
-                output.display()
-            )));
+        if output.join("manifest.bin").exists() {
+            continue;
         }
+        // Marker files are written only after the outputs are written and
+        // synced, so a pending marker's output was fully published at marker
+        // time. A missing manifest now means a later maintenance pass already
+        // consumed this output (as a compaction source or a retention expiry)
+        // and is mid-removal — the replacement is superseded, not corrupt.
+        // Finish retiring the sources instead of failing the pass.
+        tracing::warn!(
+            output = %output.display(),
+            "Compaction replacement output already consumed or mid-removal; completing source retirement"
+        );
     }
 
     let mut deferred_source_removals = Vec::new();
@@ -649,5 +656,76 @@ impl Ord for MergeCursorKey {
             .cmp(&self.ts)
             .then_with(|| other.chunk_order.cmp(&self.chunk_order))
             .then_with(|| other.cursor_idx.cmp(&self.cursor_idx))
+    }
+}
+
+#[cfg(test)]
+mod replacement_marker_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    const SOURCE_REL: &str = "lane_numeric/segments/L0/seg-0000000000000020";
+    const OUTPUT_REL: &str = "lane_numeric/segments/L1/seg-0000000000000022";
+
+    fn setup_marker(data_path: &Path) -> PathBuf {
+        let source = data_path.join(SOURCE_REL);
+        let output = data_path.join(OUTPUT_REL);
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("manifest.bin"), b"manifest").unwrap();
+        fs::write(source.join("manifest.bin"), b"manifest").unwrap();
+
+        let marker = CompactionReplacementMarker {
+            version: COMPACTION_REPLACEMENT_VERSION,
+            source_segments: vec![SOURCE_REL.to_string()],
+            output_segments: vec![OUTPUT_REL.to_string()],
+        };
+        let marker_dir = compaction_replacement_dir(data_path);
+        fs::create_dir_all(&marker_dir).unwrap();
+        let marker_path = marker_dir.join("marker-test.json");
+        fs::write(&marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+        marker_path
+    }
+
+    fn assert_sources_retired(data_path: &Path, marker_path: &Path) {
+        assert!(
+            !data_path.join(SOURCE_REL).exists(),
+            "retired source must be removed"
+        );
+        assert!(
+            !marker_path.exists(),
+            "a fully applied marker must be deleted"
+        );
+    }
+
+    #[test]
+    fn apply_completes_when_output_intact() {
+        let tmp = TempDir::new().unwrap();
+        let marker_path = setup_marker(tmp.path());
+        apply_compaction_replacement_marker(tmp.path(), &marker_path).unwrap();
+        assert!(tmp.path().join(OUTPUT_REL).join("manifest.bin").exists());
+        assert_sources_retired(tmp.path(), &marker_path);
+    }
+
+    #[test]
+    fn apply_completes_when_output_already_consumed_and_removed() {
+        let tmp = TempDir::new().unwrap();
+        let marker_path = setup_marker(tmp.path());
+        // A later maintenance pass consumed the output entirely before this
+        // marker was finalized (production NFS backtrace, 2026-11-02).
+        fs::remove_dir_all(tmp.path().join(OUTPUT_REL)).unwrap();
+        apply_compaction_replacement_marker(tmp.path(), &marker_path).unwrap();
+        assert_sources_retired(tmp.path(), &marker_path);
+    }
+
+    #[test]
+    fn apply_completes_when_output_is_mid_removal() {
+        let tmp = TempDir::new().unwrap();
+        let marker_path = setup_marker(tmp.path());
+        // NFS silly rename: the later consumer unlinked the manifest first;
+        // the root still exists with placeholder files inside.
+        fs::remove_file(tmp.path().join(OUTPUT_REL).join("manifest.bin")).unwrap();
+        apply_compaction_replacement_marker(tmp.path(), &marker_path).unwrap();
+        assert_sources_retired(tmp.path(), &marker_path);
     }
 }
