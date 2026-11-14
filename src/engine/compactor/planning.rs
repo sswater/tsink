@@ -1,12 +1,26 @@
 use super::*;
+use crate::engine::segment::SegmentManifest;
+use crate::engine::storage_engine::tiering::PersistedSegmentTier;
 use tracing::warn;
+
+/// One compaction source as planning sees it: the inventory snapshot's view of
+/// a segment (root + manifest), never its payload.
+///
+/// Planning — counting, overlap detection, window selection — only needs the
+/// manifest, so it runs entirely on the snapshot. Only the members of the
+/// selected window are loaded from disk.
+#[derive(Debug, Clone)]
+pub(in crate::engine) struct PlanningCandidate {
+    pub root: PathBuf,
+    pub manifest: SegmentManifest,
+}
 
 impl Compactor {
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
         // Skip before any disk access: the background compaction thread wakes up
         // before the inventory provider is injected, and must not fall back to an
         // O(N) scan in that window.
-        let Some(_inventory) = self.planning_inventory()? else {
+        let Some(inventory) = self.planning_inventory()? else {
             return Ok(CompactionOutcome::default());
         };
 
@@ -17,6 +31,7 @@ impl Compactor {
             CompactionLevel::L0,
             CompactionLevel::L1,
             self.l0_trigger,
+            &inventory,
             &tombstones,
         )? {
             return Ok(outcome);
@@ -26,6 +41,7 @@ impl Compactor {
             CompactionLevel::L1,
             CompactionLevel::L2,
             self.l1_trigger,
+            &inventory,
             &tombstones,
         )? {
             return Ok(outcome);
@@ -34,46 +50,108 @@ impl Compactor {
         Ok(CompactionOutcome::default())
     }
 
+    /// Planning candidates for `level`, taken from the inventory snapshot.
+    ///
+    /// Only this lane's hot segments take part: segments tiered away to
+    /// warm/cold are no longer compacted from the lane root. Ordering matches
+    /// the previous disk-driven planning (ascending `segment_id`).
+    fn planning_candidates(
+        &self,
+        inventory: &SegmentInventory,
+        level: u8,
+    ) -> Vec<PlanningCandidate> {
+        let mut candidates = inventory
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.root.starts_with(&self.data_path)
+                    && entry.manifest.level == level
+                    && entry.tier == PersistedSegmentTier::Hot
+            })
+            .map(|entry| PlanningCandidate {
+                root: entry.root.clone(),
+                manifest: entry.manifest.clone(),
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| candidate.manifest.segment_id);
+        candidates
+    }
+
     fn try_compact_level(
         &self,
         source: CompactionLevel,
         target: CompactionLevel,
         count_trigger: usize,
+        inventory: &SegmentInventory,
         tombstones: &TombstoneMap,
     ) -> Result<Option<CompactionOutcome>> {
         let source_level = level_to_u8(source);
         let target_level = level_to_u8(target);
 
-        if count_level_segments_for_compaction(&self.data_path, source_level)? < 2 {
+        let candidates = self.planning_candidates(inventory, source_level);
+        if candidates.len() < 2 {
             return Ok(None);
         }
 
-        let mut segments = load_segments_for_level_runtime_strict(&self.data_path, source_level)?;
-        if segments.len() < 2 {
-            return Ok(None);
-        }
-
-        segments.sort_by_key(|segment| segment.manifest.segment_id);
-
-        let should_compact = segments.len() >= count_trigger || has_time_overlap(&segments);
+        let candidate_refs = candidates.iter().collect::<Vec<_>>();
+        let should_compact = candidates.len() >= count_trigger || has_time_overlap(&candidate_refs);
         if !should_compact {
             return Ok(None);
         }
 
         let window =
-            select_compaction_window(&segments, count_trigger, DEFAULT_SOURCE_WINDOW_SEGMENTS);
+            select_compaction_window(&candidates, count_trigger, DEFAULT_SOURCE_WINDOW_SEGMENTS);
         if window.len() < 2 {
             return Ok(None);
         }
 
-        let mut outcome = self.compact_segments(target_level, &window, tombstones)?;
+        let (segments, retired_roots) = load_window_members(&window)?;
+        if !retired_roots.is_empty() {
+            warn!(
+                roots = ?retired_roots,
+                "Compaction window members vanished before load; dropping them from this window"
+            );
+        }
+        if segments.len() < 2 {
+            return Ok(None);
+        }
+
+        let segment_refs = segments.iter().collect::<Vec<_>>();
+        let mut outcome = self.compact_segments(target_level, &segment_refs, tombstones)?;
         outcome.stats.compacted = true;
+        outcome.stats.windows_merged = 1;
         outcome.stats.source_level = Some(source_level);
         outcome.stats.target_level = Some(target_level);
         Ok(Some(outcome))
     }
 }
 
+/// Loads the selected window from disk, root by root.
+///
+/// Roots whose segment vanished mid-removal are returned separately so the
+/// caller can retire them from its view; the survivors are merged.
+fn load_window_members(
+    window: &[&PlanningCandidate],
+) -> Result<(Vec<LoadedSegment>, Vec<PathBuf>)> {
+    let mut segments = Vec::with_capacity(window.len());
+    let mut retired_roots = Vec::new();
+
+    for candidate in window {
+        match load_segment_root_for_compaction(&candidate.root)? {
+            Some(segment) => segments.push(segment),
+            None => retired_roots.push(candidate.root.clone()),
+        }
+    }
+
+    Ok((segments, retired_roots))
+}
+
+/// Counts the segments of `level` under `base`.
+///
+/// Kept for the disk fallback path (standalone compactor / reconciliation
+/// scan), which only needs a count; planning itself now counts the inventory
+/// snapshot's candidates and never rescans the level.
+#[allow(dead_code)]
 pub(super) fn count_level_segments_for_compaction(base: &Path, level: u8) -> Result<usize> {
     let expected_level_dir = format!("L{level}");
     let mut count = 0usize;
@@ -124,14 +202,14 @@ pub(super) fn count_level_segments_for_compaction(base: &Path, level: u8) -> Res
     Ok(count)
 }
 
-pub(super) fn has_time_overlap(segments: &[LoadedSegment]) -> bool {
-    let mut ranges = segments
+pub(super) fn has_time_overlap(candidates: &[&PlanningCandidate]) -> bool {
+    let mut ranges = candidates
         .iter()
-        .filter_map(|segment| {
+        .filter_map(|candidate| {
             Some((
-                segment.manifest.min_ts?,
-                segment.manifest.max_ts?,
-                segment.manifest.segment_id,
+                candidate.manifest.min_ts?,
+                candidate.manifest.max_ts?,
+                candidate.manifest.segment_id,
             ))
         })
         .collect::<Vec<_>>();
@@ -154,20 +232,20 @@ pub(super) fn has_time_overlap(segments: &[LoadedSegment]) -> bool {
 }
 
 pub(super) fn select_compaction_window(
-    segments: &[LoadedSegment],
+    candidates: &[PlanningCandidate],
     count_trigger: usize,
     max_segments: usize,
-) -> Vec<&LoadedSegment> {
+) -> Vec<&PlanningCandidate> {
     let max_segments = max_segments.max(2);
-    if let Some(indexes) = overlapping_window_indexes(segments, max_segments) {
+    if let Some(indexes) = overlapping_window_indexes(candidates, max_segments) {
         return indexes
             .into_iter()
-            .filter_map(|index| segments.get(index))
+            .filter_map(|index| candidates.get(index))
             .collect();
     }
 
-    let window_len = count_trigger.max(2).min(max_segments).min(segments.len());
-    segments.iter().take(window_len).collect()
+    let window_len = count_trigger.max(2).min(max_segments).min(candidates.len());
+    candidates.iter().take(window_len).collect()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,18 +257,18 @@ struct SegmentTimeRange {
 }
 
 fn overlapping_window_indexes(
-    segments: &[LoadedSegment],
+    candidates: &[PlanningCandidate],
     max_segments: usize,
 ) -> Option<Vec<usize>> {
-    let mut ranges = segments
+    let mut ranges = candidates
         .iter()
         .enumerate()
-        .filter_map(|(index, segment)| {
+        .filter_map(|(index, candidate)| {
             Some(SegmentTimeRange {
                 index,
-                segment_id: segment.manifest.segment_id,
-                min_ts: segment.manifest.min_ts?,
-                max_ts: segment.manifest.max_ts?,
+                segment_id: candidate.manifest.segment_id,
+                min_ts: candidate.manifest.min_ts?,
+                max_ts: candidate.manifest.max_ts?,
             })
         })
         .collect::<Vec<_>>();

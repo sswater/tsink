@@ -116,6 +116,19 @@ fn background_compaction_reduces_l0_segments_while_storage_is_open() {
     )
     .unwrap();
 
+    // `new_with_data_path_and_options` deliberately skips startup recovery
+    // (public callers must use `StorageBuilder::build`, which discovers and
+    // hydrates the inventory). Compaction now plans from that inventory, so
+    // simulate the discovery a real startup would have done over the four
+    // pre-existing segments.
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut compacted = false;
 

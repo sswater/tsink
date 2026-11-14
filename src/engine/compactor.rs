@@ -11,7 +11,7 @@ use crate::engine::durability::WalHighWatermark;
 use crate::engine::encoder::Encoder;
 use crate::engine::fs_utils::{remove_dir_if_exists, write_file_atomically_and_sync_parent};
 use crate::engine::segment::{
-    is_vanished_source_error, list_segment_dirs, load_segments_for_level_runtime_strict,
+    is_vanished_source_error, list_segment_dirs, load_segment_root_for_compaction,
     load_segments_runtime_strict, read_segment_manifest, segment_validation_error, LoadedSegment,
     PersistedSeries, SegmentValidationContext, SegmentWriter,
 };
@@ -31,9 +31,8 @@ mod inventory_source;
 mod planning;
 
 pub(in crate::engine) use self::execution::finalize_pending_compaction_replacements;
-#[allow(unused_imports)]
 pub(in crate::engine) use self::inventory_source::{
-    scan_inventory_from_disk, CompactionInventorySource, InventoryProvider,
+    scan_inventory_from_disk, CompactionInventorySource,
 };
 
 const DEFAULT_L0_TRIGGER: usize = 4;

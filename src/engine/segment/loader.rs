@@ -23,8 +23,9 @@ use super::types::{
     SegmentContentFingerprint, SegmentFileFingerprint, SegmentLayout, SegmentManifest,
 };
 use super::validation::{
-    handle_segment_dir_load_error, is_not_found_error, segment_validation_error_message,
-    SegmentLoadPolicy, SegmentValidationContext,
+    handle_segment_dir_load_error, is_not_found_error, is_vanished_source_error,
+    segment_validation_error, segment_validation_error_message, SegmentLoadPolicy,
+    SegmentValidationContext,
 };
 use super::{quarantine_invalid_startup_segment, StartupQuarantinedSegment, WalHighWatermark};
 
@@ -133,6 +134,35 @@ pub fn load_segment(path: impl AsRef<Path>) -> Result<LoadedSegment> {
         series: segment.series,
         chunks_by_series: segment.chunks_by_series,
     })
+}
+
+/// Loads one compaction window member by its root.
+///
+/// A root that vanished between the inventory snapshot and this read — retired
+/// by a concurrent compaction or retention pass, close/delete, or with a
+/// required file already unlinked — is skipped (`Ok(None)`): the planner loses
+/// one window member, not the round. Any other failure is a real corruption and
+/// is surfaced as a compaction validation error so it still fails the pass.
+pub(crate) fn load_segment_root_for_compaction(root: &Path) -> Result<Option<LoadedSegment>> {
+    match load_segment(root) {
+        Ok(segment) => Ok(Some(segment)),
+        Err(err) if is_vanished_source_error(&err) => {
+            warn!(
+                path = %root.display(),
+                error = %err,
+                "Segment vanished before compaction loaded it; skipping window member"
+            );
+            Ok(None)
+        }
+        Err(err) => match segment_validation_error_message(&err) {
+            Some(details) => Err(segment_validation_error(
+                root,
+                SegmentValidationContext::Compaction,
+                &details,
+            )),
+            None => Err(err),
+        },
+    }
 }
 
 pub fn load_segment_index(path: impl AsRef<Path>) -> Result<IndexedSegment> {
@@ -346,17 +376,6 @@ fn finalize_loaded_segment_indexes(
 
 pub fn load_segments_for_level(base: impl AsRef<Path>, level: u8) -> Result<Vec<LoadedSegment>> {
     load_segments_for_level_with_policy(base, level, SegmentLoadPolicy::SkipInvalid)
-}
-
-pub(crate) fn load_segments_for_level_runtime_strict(
-    base: impl AsRef<Path>,
-    level: u8,
-) -> Result<Vec<LoadedSegment>> {
-    load_segments_for_level_with_policy(
-        base,
-        level,
-        SegmentLoadPolicy::FailOnInvalid(SegmentValidationContext::Compaction),
-    )
 }
 
 fn load_segments_for_level_with_policy(

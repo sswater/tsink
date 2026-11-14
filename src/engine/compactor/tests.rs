@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -524,27 +525,235 @@ fn injected_inventory_source_falls_through_to_existing_planning() {
     );
 }
 
+#[test]
+fn inventory_driven_planning_matches_disk_driven_outcome() {
+    let disk_dir = TempDir::new().unwrap();
+    let inventory_dir = TempDir::new().unwrap();
+    write_time_overlapping_l0_segments(disk_dir.path(), 5);
+    write_time_overlapping_l0_segments(inventory_dir.path(), 5);
+
+    let disk_outcome = Compactor::new(disk_dir.path(), 8)
+        .compact_once_with_changes()
+        .unwrap();
+
+    // Snapshot the inventory, then inject it: planning must reach the same
+    // decision an on-disk scan would have reached.
+    let inventory = scan_inventory_from_disk(inventory_dir.path()).unwrap();
+    let source = CompactionInventorySource::default();
+    source.set(Arc::new(move || inventory.clone()));
+    let compactor = Compactor::new_with_inventory_source(
+        inventory_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(6)),
+        source,
+    );
+    let inventory_outcome = compactor.compact_once_with_changes().unwrap();
+
+    assert!(disk_outcome.stats.compacted);
+    assert!(inventory_outcome.stats.compacted);
+    assert_eq!(
+        relative_roots(disk_dir.path(), &disk_outcome.source_roots),
+        relative_roots(inventory_dir.path(), &inventory_outcome.source_roots),
+        "same source window must be selected"
+    );
+    assert_eq!(
+        relative_roots(disk_dir.path(), &disk_outcome.output_roots),
+        relative_roots(inventory_dir.path(), &inventory_outcome.output_roots),
+        "same outputs must be published"
+    );
+    assert_eq!(
+        disk_outcome.stats.windows_merged,
+        inventory_outcome.stats.windows_merged
+    );
+    assert_eq!(
+        disk_outcome.stats.source_segments,
+        inventory_outcome.stats.source_segments
+    );
+    assert_eq!(
+        disk_outcome.stats.output_segments,
+        inventory_outcome.stats.output_segments
+    );
+    assert_eq!(
+        disk_outcome.stats.source_chunks,
+        inventory_outcome.stats.source_chunks
+    );
+    assert_eq!(
+        disk_outcome.stats.output_points,
+        inventory_outcome.stats.output_points
+    );
+}
+
+#[test]
+fn vanished_window_member_is_skipped_and_survivors_compacted() {
+    let temp_dir = TempDir::new().unwrap();
+    let roots = write_non_overlapping_l0_segments(temp_dir.path(), 4);
+
+    // The snapshot still lists all four; one is retired (manifest unlinked)
+    // right before the window is loaded — the NFS mid-removal race.
+    let inventory = scan_inventory_from_disk(temp_dir.path()).unwrap();
+    let vanished_root = roots[1].clone();
+    fs::remove_file(vanished_root.join("manifest.bin")).unwrap();
+
+    let source = CompactionInventorySource::default();
+    source.set(Arc::new(move || inventory.clone()));
+    let compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source,
+    );
+
+    let outcome = compactor.compact_once_with_changes().unwrap();
+    assert!(outcome.stats.compacted);
+    assert_eq!(outcome.stats.windows_merged, 1);
+    assert!(!outcome.output_roots.is_empty());
+    assert_eq!(
+        outcome.stats.source_segments, 3,
+        "the three surviving window members must be merged"
+    );
+    assert_eq!(outcome.source_roots.len(), 3);
+    assert!(
+        !outcome.source_roots.contains(&vanished_root),
+        "a vanished member must not be reported as a source"
+    );
+
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    assert_eq!(l1.len(), 1);
+    assert_eq!(l1[0].manifest.point_count, 3);
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 0).unwrap().len(),
+        0,
+        "only the vanished root stays behind, and it no longer loads"
+    );
+}
+
+#[test]
+fn corrupt_window_member_still_fails_the_round() {
+    let temp_dir = TempDir::new().unwrap();
+    let roots = write_non_overlapping_l0_segments(temp_dir.path(), 4);
+    let inventory = scan_inventory_from_disk(temp_dir.path()).unwrap();
+
+    // A real corruption (payload hash mismatch, not a missing file) must keep
+    // failing the pass: vanished-source tolerance is not damage tolerance.
+    let corrupted_root = roots[1].clone();
+    let chunks_path = corrupted_root.join("chunks.bin");
+    let mut chunks_bytes = fs::read(&chunks_path).unwrap();
+    let last = chunks_bytes.len() - 1;
+    chunks_bytes[last] ^= 0xff;
+    fs::write(&chunks_path, chunks_bytes).unwrap();
+
+    let source = CompactionInventorySource::default();
+    source.set(Arc::new(move || inventory.clone()));
+    let compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source,
+    );
+
+    let err = compactor.compact_once_with_changes().unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("failed compaction validation"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains(&corrupted_root.display().to_string()),
+        "unexpected error: {message}"
+    );
+    assert!(
+        load_segments_for_level(temp_dir.path(), 1)
+            .unwrap()
+            .is_empty(),
+        "no replacement output may be published when a window member is corrupt"
+    );
+}
+
+#[test]
+fn planning_reads_scale_with_window_not_inventory_size() {
+    let temp_dir = TempDir::new().unwrap();
+    write_non_overlapping_l0_segments(temp_dir.path(), 12);
+    let inventory = scan_inventory_from_disk(temp_dir.path()).unwrap();
+
+    let source = CompactionInventorySource::default();
+    source.set(Arc::new(move || inventory.clone()));
+    let compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source,
+    );
+
+    let _guard = CountingSegmentReads::install(temp_dir.path());
+    let outcome = compactor.compact_once_with_changes().unwrap();
+    let reads = count_segment_file_reads_under(temp_dir.path());
+
+    assert!(outcome.stats.compacted);
+    assert_eq!(
+        outcome.stats.source_segments, 4,
+        "the trigger window is the first four candidates"
+    );
+    assert_eq!(
+        reads,
+        4 * 5,
+        "only the four window members' five files may be read; an inventory of \
+         12 must not add scans (observed {reads})"
+    );
+}
+
 fn write_overlapping_l0_segments(root: &std::path::Path, count: u64) {
+    let _ = write_l0_segment_roots(root, count, false);
+}
+
+/// Writes `count` L0 segments whose time ranges all overlap.
+fn write_time_overlapping_l0_segments(root: &std::path::Path, count: u64) {
+    let _ = write_l0_segment_roots(root, count, true);
+}
+
+/// Writes `count` L0 segments with disjoint one-point time ranges and returns
+/// their roots in segment-id order.
+fn write_non_overlapping_l0_segments(root: &std::path::Path, count: u64) -> Vec<PathBuf> {
+    write_l0_segment_roots(root, count, false)
+}
+
+fn write_l0_segment_roots(root: &std::path::Path, count: u64, overlap: bool) -> Vec<PathBuf> {
     let registry = SeriesRegistry::new();
     let series_id = registry
         .resolve_or_insert("cpu", &[Label::new("host", "a")])
         .unwrap()
         .series_id;
 
+    let mut roots = Vec::new();
     for segment_id in 1..=count {
+        let points = if overlap {
+            vec![(10, segment_id as f64), (20, segment_id as f64 + 0.5)]
+        } else {
+            vec![(segment_id as i64, segment_id as f64)]
+        };
+
         let mut chunks = HashMap::new();
-        chunks.insert(
-            series_id,
-            vec![make_numeric_chunk(
-                series_id,
-                &[(segment_id as i64, segment_id as f64)],
-            )],
-        );
-        SegmentWriter::new(root, 0, segment_id)
-            .unwrap()
-            .write_segment(&registry, &chunks)
-            .unwrap();
+        chunks.insert(series_id, vec![make_numeric_chunk(series_id, &points)]);
+
+        let writer = SegmentWriter::new(root, 0, segment_id).unwrap();
+        writer.write_segment(&registry, &chunks).unwrap();
+        roots.push(writer.layout().root.clone());
     }
+
+    roots
+}
+
+fn relative_roots(base: &std::path::Path, roots: &[PathBuf]) -> Vec<String> {
+    let mut relative = roots
+        .iter()
+        .map(|root| {
+            root.strip_prefix(base)
+                .expect("segment root must live under the comparison base")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    relative.sort();
+    relative
 }
 
 fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {
