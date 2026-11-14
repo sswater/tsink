@@ -2101,6 +2101,22 @@ fn flush_pipeline_writes_incremental_registry_sidecar_without_rewriting_checkpoi
     let visible_inventory =
         super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
             .unwrap();
+    // C-2: the publish only marks the catalog dirty; the refresh pass owns the
+    // rewrite, so the sidecar still lags the published segment here.
+    assert!(super::super::registry_catalog::validate_registry_catalog(
+        &checkpoint_path,
+        &super::super::registry_catalog::inventory_sources(&visible_inventory),
+    )
+    .unwrap()
+    .is_none());
+    assert!(storage
+        .persisted
+        .registry_catalog_dirty
+        .load(std::sync::atomic::Ordering::SeqCst));
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
     assert!(super::super::registry_catalog::validate_registry_catalog(
         &checkpoint_path,
         &super::super::registry_catalog::inventory_sources(&visible_inventory),
@@ -4273,6 +4289,19 @@ fn catalog_write_after_publish_does_not_touch_segment_files() {
         );
     }
 
+    // Task 12: the publish only marks the catalog dirty; the refresh pass writes
+    // it from memory once the diff has been applied to the persisted index.
+    let guard = crate::engine::fs_utils::CountingSegmentReads::install(temp_dir.path());
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    let refresh_reads = crate::engine::fs_utils::count_segment_file_reads_under(temp_dir.path());
+    drop(guard);
+    assert_eq!(
+        refresh_reads, 0,
+        "the debounced catalog write must be built from memory, not segment files"
+    );
+
     let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
     let catalog = std::fs::read(super::super::registry_catalog::catalog_path(
         &checkpoint_path,
@@ -4282,10 +4311,237 @@ fn catalog_write_after_publish_does_not_touch_segment_files() {
     assert_eq!(
         catalog["segments"].as_array().unwrap().len(),
         2,
-        "the catalog write after publish must describe both visible segments"
+        "the debounced catalog write must describe both visible segments"
     );
 
     storage.close().unwrap();
+}
+
+/// Publishes one segment and lets the refresh pass materialize the catalog, so a
+/// following flush has a baseline catalog file to leave untouched.
+fn storage_with_materialized_registry_catalog(
+    lane_path: &Path,
+) -> (ChunkStorage, std::path::PathBuf) {
+    let storage = new_raw_numeric_storage(lane_path.to_path_buf(), 1);
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_debounce_base",
+            vec![Label::new("host", "base")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .expect("the refresh pass must write the materialized catalog");
+    let checkpoint_path = lane_path
+        .parent()
+        .expect("the lane path has a data path parent")
+        .join(SERIES_INDEX_FILE_NAME);
+    (storage, checkpoint_path)
+}
+
+/// C-2: the catalog sidecar rewrite is debounced off the flush critical path.
+/// A publish that rewrote the multi-MB JSON + fsync inline starved compaction
+/// windows under write-triggered flush.
+#[test]
+fn flush_publish_does_not_rewrite_catalog_inline() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let (storage, checkpoint_path) = storage_with_materialized_registry_catalog(&lane_path);
+    let catalog_path = super::super::registry_catalog::catalog_path(&checkpoint_path);
+
+    let baseline_bytes = std::fs::read(&catalog_path).unwrap();
+    let baseline_mtime = std::fs::metadata(&catalog_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert!(
+        !storage
+            .persisted
+            .registry_catalog_dirty
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the materialized catalog starts clean"
+    );
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_debounce_publish",
+            vec![Label::new("host", "publish")],
+            DataPoint::new(2, 2.0),
+        )])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+
+    assert_eq!(
+        std::fs::read(&catalog_path).unwrap(),
+        baseline_bytes,
+        "a flush publish must not rewrite the catalog sidecar inline"
+    );
+    assert_eq!(
+        std::fs::metadata(&catalog_path)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        baseline_mtime,
+        "the catalog sidecar mtime must be untouched by the flush publish"
+    );
+    assert!(
+        storage
+            .persisted
+            .registry_catalog_dirty
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the flush publish must mark the catalog dirty for the refresh pass"
+    );
+
+    storage.close().unwrap();
+}
+
+/// C-2: the refresh pass owns the debounced rewrite, after the diff is applied
+/// (so the catalog describes the post-diff inventory) and from memory only.
+#[test]
+fn refresh_pass_writes_debounced_catalog_after_diff_application() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let (storage, checkpoint_path) = storage_with_materialized_registry_catalog(&lane_path);
+    let catalog_path = super::super::registry_catalog::catalog_path(&checkpoint_path);
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_debounce_refresh",
+            vec![Label::new("host", "refresh")],
+            DataPoint::new(2, 2.0),
+        )])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    assert!(
+        storage
+            .persisted
+            .registry_catalog_dirty
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the publish must leave the catalog dirty until the refresh pass"
+    );
+
+    let guard = crate::engine::fs_utils::CountingSegmentReads::install(temp_dir.path());
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    let segment_reads = crate::engine::fs_utils::count_segment_file_reads_under(temp_dir.path());
+    drop(guard);
+
+    assert_eq!(
+        segment_reads, 0,
+        "the debounced catalog write must be built from the in-memory inventory"
+    );
+    assert!(
+        !storage
+            .persisted
+            .registry_catalog_dirty
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "a successful debounced write clears the dirty marker"
+    );
+
+    let inventory = storage.persisted_segment_inventory();
+    assert_eq!(
+        inventory.entries().len(),
+        2,
+        "the catalog must describe the post-diff inventory"
+    );
+    let sources = super::super::registry_catalog::inventory_sources(&inventory);
+    let validated =
+        super::super::registry_catalog::validate_registry_catalog(&checkpoint_path, &sources)
+            .unwrap()
+            .expect("the debounced catalog must match the post-diff inventory");
+    assert_eq!(
+        validated.series_fingerprint.expect("catalog fingerprint"),
+        super::super::registry_catalog::build_series_fingerprint_from_sources(&sources).unwrap(),
+        "the memory-built fingerprint must equal the disk-derived one"
+    );
+
+    let expected = super::super::registry_catalog::build_catalog_from_memory(
+        &sources,
+        &storage.persisted.registry_contributions,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&catalog_path).unwrap(),
+        serde_json::to_vec_pretty(&expected).unwrap(),
+        "the catalog file must contain exactly the in-memory build"
+    );
+
+    storage.close().unwrap();
+}
+
+/// C-2 trade-off: a catalog left stale by a crash between publish and the
+/// debounced write must not lose data. Startup sees a fingerprint mismatch,
+/// falls back to the full rebuild, and heals the sidecar.
+#[test]
+fn stale_catalog_falls_back_to_full_rebuild_on_startup() {
+    let temp_dir = TempDir::new().unwrap();
+    let metric = "stale_catalog_rebuild";
+    let labels = vec![Label::new("host", "stale")];
+    let expected_points = vec![DataPoint::new(1, 1.0), DataPoint::new(2, 2.0)];
+
+    {
+        let storage = StorageBuilder::new()
+            .with_data_path(temp_dir.path())
+            .with_timestamp_precision(TimestampPrecision::Seconds)
+            .with_chunk_points(2)
+            .build()
+            .unwrap();
+        storage
+            .insert_rows(&[
+                Row::with_labels(metric, labels.clone(), expected_points[0].clone()),
+                Row::with_labels(metric, labels.clone(), expected_points[1].clone()),
+            ])
+            .unwrap();
+        storage.close().unwrap();
+    }
+
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let catalog_path = super::super::registry_catalog::catalog_path(&checkpoint_path);
+    let mut catalog: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+    assert_eq!(
+        catalog["segments"].as_array().unwrap().len(),
+        1,
+        "the closed store describes its one visible segment"
+    );
+
+    // Simulate the accepted C-2 crash window: the catalog lags the segments.
+    catalog["segments"] = serde_json::Value::Array(Vec::new());
+    std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+
+    let reopened = StorageBuilder::new()
+        .with_data_path(temp_dir.path())
+        .with_timestamp_precision(TimestampPrecision::Seconds)
+        .with_chunk_points(2)
+        .build()
+        .unwrap();
+
+    assert_eq!(
+        reopened.select(metric, &labels, 0, 10).unwrap(),
+        expected_points,
+        "a stale catalog must fall back to the full rebuild without losing data"
+    );
+    assert_eq!(
+        reopened
+            .select_series(&SeriesSelection::new().with_metric(metric))
+            .unwrap()
+            .len(),
+        1,
+        "startup recovery must restore the complete registry"
+    );
+
+    let healed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
+    assert_eq!(
+        healed["segments"].as_array().unwrap().len(),
+        1,
+        "startup recovery must heal the stale catalog sidecar"
+    );
+
+    reopened.close().unwrap();
 }
 
 /// Contributions come from segment series files only. The registry is allowed

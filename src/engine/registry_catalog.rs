@@ -122,9 +122,41 @@ pub(super) fn persist_registry_catalog(
     sources: &[PersistedRegistryCatalogSource],
     contributions: &RegistryContributions,
 ) -> Result<()> {
-    let path = catalog_path(snapshot_path);
-    let bytes = serde_json::to_vec_pretty(&build_catalog_from_memory(sources, contributions)?)?;
-    write_file_atomically_and_sync_parent(&path, &bytes)
+    write_registry_catalog(
+        snapshot_path,
+        &build_catalog_from_memory(sources, contributions)?,
+    )
+}
+
+/// Writes the catalog from an inventory snapshot, with no segment reads: the
+/// entries come straight from the inventory and the series fingerprint from the
+/// contribution cache.
+///
+/// This is the refresh thread's debounced write path (C-2): by the time it runs
+/// the persisted index already reflects the applied segment diff, so the
+/// catalog describes the post-diff inventory.
+pub(super) fn persist_registry_catalog_from_inventory(
+    snapshot_path: &Path,
+    inventory: &super::tiering::SegmentInventory,
+    contributions: &RegistryContributions,
+) -> Result<()> {
+    let sources = inventory_sources(inventory);
+    write_registry_catalog(
+        snapshot_path,
+        &PersistedRegistryCatalogFile {
+            version: REGISTRY_CATALOG_VERSION,
+            segments: build_catalog_entries_from_inventory(inventory, contributions)?,
+            series_fingerprint: Some(build_series_fingerprint_from_contributions(
+                &sources,
+                contributions,
+            )?),
+        },
+    )
+}
+
+fn write_registry_catalog(snapshot_path: &Path, file: &PersistedRegistryCatalogFile) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(file)?;
+    write_file_atomically_and_sync_parent(&catalog_path(snapshot_path), &bytes)
 }
 
 pub(super) fn inventory_sources(
@@ -207,7 +239,6 @@ pub(super) fn build_catalog_from_disk(
 /// the same inventory/contributions pair. Entries themselves are fully
 /// inventory-driven and only fall back to one manifest read per entry whose
 /// inventory source lacks the recorded file fingerprints.
-#[allow(dead_code)] // inventory-entry contract for the in-memory build
 pub(super) fn build_catalog_entries_from_inventory(
     inventory: &super::tiering::SegmentInventory,
     _contributions: &RegistryContributions,

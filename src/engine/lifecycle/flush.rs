@@ -322,10 +322,9 @@ impl ChunkStorage {
         }
 
         // The verification load already parsed the new segments' series
-        // payload, so their catalog contributions are free here. The catalog
-        // write that follows this stage (recovery metadata) then avoids
-        // re-reading `series.bin` for the fresh roots as well as for every
-        // already known segment.
+        // payload, so their catalog contributions are free here. The debounced
+        // catalog rewrite (refresh pass, C-2) then costs no `series.bin` read for
+        // the fresh roots or for any already known segment.
         self.prime_registry_contributions_for_segments(&loaded_segments);
 
         Ok(VerifiedFlushPublish {
@@ -355,11 +354,12 @@ impl ChunkStorage {
             }
         }
 
-        let registry_catalog_sources = self
-            .persisted_registry_catalog_sources_with_root_changes(published_segment_roots, &[])?;
-        if let Err(err) =
-            self.persist_series_registry_index_with_catalog_sources(&registry_catalog_sources)
-        {
+        // The registry delta is crash-recovery metadata and stays inline; the
+        // catalog sidecar is a derived startup accelerator, so the publish only
+        // marks it dirty. Rewriting it here (multi-MB JSON + atomic swap +
+        // parent fsync per publish) starved compaction windows under
+        // write-triggered flush; the refresh pass rebuilds it from memory.
+        if let Err(err) = self.persist_series_registry_index_deferring_catalog() {
             if let Err(rollback_err) =
                 self.rollback_published_segment_roots(published_segment_roots)
             {

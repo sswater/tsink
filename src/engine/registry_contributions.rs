@@ -141,20 +141,6 @@ impl RegistryContributions {
     pub(in crate::engine::storage_engine) fn entry_count(&self) -> usize {
         self.inner.lock().entry_count
     }
-
-    /// Merges every cached run in [`SeriesId`] order.
-    ///
-    /// Only safe as a whole-world fingerprint when the cache is known to be in
-    /// sync with the persisted index; catalog production instead resolves runs
-    /// per source root so an unprimed root cannot be silently dropped.
-    #[allow(dead_code)] // engine-facing whole-cache contract; catalog writes resolve per root
-    pub(in crate::engine::storage_engine) fn merge_fingerprint(
-        &self,
-    ) -> Result<PersistedRegistrySeriesFingerprint> {
-        let runs = self.inner.lock().runs.values().cloned().collect::<Vec<_>>();
-        let runs = runs.iter().map(|run| run.as_ref()).collect::<Vec<_>>();
-        merge_series_runs(&runs)
-    }
 }
 
 /// K-way merges `SeriesId`-sorted runs into the catalog series fingerprint.
@@ -338,18 +324,20 @@ mod tests {
             )
         }));
 
-        assert_eq!(contributions.merge_fingerprint().unwrap(), expected);
+        let first = run(&first);
+        let second = run(&second);
+        let merged = merge_series_runs(&[&first, &second]).unwrap();
+        assert_eq!(merged, expected);
         assert_eq!(expected.series_count, 3);
         assert_eq!(contributions.entry_count(), 4, "footprint is Σ per-segment");
     }
 
     #[test]
     fn merge_rejects_one_id_bound_to_two_keys() {
-        let contributions = RegistryContributions::new();
-        contributions.replace_root(Path::new("/seg/one"), run(&[series(1, "cpu", &[])]));
-        contributions.replace_root(Path::new("/seg/two"), run(&[series(1, "mem", &[])]));
+        let first = run(&[series(1, "cpu", &[])]);
+        let second = run(&[series(1, "mem", &[])]);
 
-        let err = contributions.merge_fingerprint().unwrap_err();
+        let err = merge_series_runs(&[&first, &second]).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -362,17 +350,10 @@ mod tests {
 
     #[test]
     fn merge_rejects_one_key_bound_to_two_ids() {
-        let contributions = RegistryContributions::new();
-        contributions.replace_root(
-            Path::new("/seg/one"),
-            run(&[series(1, "cpu", &[("host", "a")])]),
-        );
-        contributions.replace_root(
-            Path::new("/seg/two"),
-            run(&[series(4, "cpu", &[("host", "a")])]),
-        );
+        let first = run(&[series(1, "cpu", &[("host", "a")])]);
+        let second = run(&[series(4, "cpu", &[("host", "a")])]);
 
-        let err = contributions.merge_fingerprint().unwrap_err();
+        let err = merge_series_runs(&[&first, &second]).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -397,7 +378,8 @@ mod tests {
         contributions.remove_root(Path::new("/seg/two"));
         assert!(contributions.run_for_root(Path::new("/seg/two")).is_none());
         assert_eq!(contributions.entry_count(), 1);
-        assert_eq!(contributions.merge_fingerprint().unwrap().series_count, 1);
+        let remaining = contributions.run_for_root(Path::new("/seg/one")).unwrap();
+        assert_eq!(merge_series_runs(&[&remaining]).unwrap().series_count, 1);
 
         contributions.remove_root(Path::new("/seg/two"));
         assert_eq!(contributions.entry_count(), 1, "eviction is idempotent");
@@ -424,7 +406,8 @@ mod tests {
     #[test]
     fn empty_cache_merges_to_the_empty_union_fingerprint() {
         let contributions = RegistryContributions::new();
-        let fingerprint = contributions.merge_fingerprint().unwrap();
+        assert_eq!(contributions.entry_count(), 0);
+        let fingerprint = merge_series_runs(&[]).unwrap();
         assert_eq!(fingerprint.series_count, 0);
         assert_eq!(
             fingerprint,

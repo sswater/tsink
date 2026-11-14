@@ -177,6 +177,15 @@ impl ChunkStorage {
     }
 
     pub(in super::super) fn sync_persisted_segments_from_disk_if_dirty(&self) -> Result<()> {
+        self.refresh_persisted_segments_from_disk_if_dirty()?;
+        // The debounced catalog rewrite runs after every early-returning branch
+        // above, so a flush that only marked the catalog dirty still gets it
+        // rewritten here — and always after the segment diff has been applied,
+        // so the catalog describes the post-diff inventory.
+        self.persist_debounced_registry_catalog_if_dirty()
+    }
+
+    fn refresh_persisted_segments_from_disk_if_dirty(&self) -> Result<()> {
         let ctx = self.catalog_refresh_context();
         if ctx.should_refresh_remote_catalog() {
             let Some(_refresh_claim) = ctx.try_claim_persisted_refresh() else {
@@ -212,5 +221,35 @@ impl ChunkStorage {
         }
 
         self.refresh_dirty_persisted_segments_claimed()
+    }
+
+    /// Rewrites the registry catalog sidecar when a flush published segments
+    /// since the last write (C-2), built entirely from memory.
+    ///
+    /// The rewrite is claimed by clearing the marker first: a publish that lands
+    /// while this write is in flight re-arms it, so the next pass rewrites the
+    /// catalog for the newer inventory instead of the marker being lost. A
+    /// failed write re-arms the marker too; if the process stops first, startup
+    /// sees a stale catalog and falls back to its full rebuild.
+    pub(in super::super) fn persist_debounced_registry_catalog_if_dirty(&self) -> Result<()> {
+        if !self.take_registry_catalog_dirty() {
+            return Ok(());
+        }
+
+        let Some(checkpoint_path) = self.persisted.series_index_path.as_deref() else {
+            return Ok(());
+        };
+        let inventory = self.persisted_segment_inventory();
+        match registry_catalog::persist_registry_catalog_from_inventory(
+            checkpoint_path,
+            &inventory,
+            &self.persisted.registry_contributions,
+        ) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.mark_registry_catalog_dirty();
+                Err(err)
+            }
+        }
     }
 }

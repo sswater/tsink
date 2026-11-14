@@ -205,4 +205,15 @@ fn close_defers_compaction_when_a_visible_manifest_is_unreadable() {
         checkpoint_path.exists(),
         "the registry checkpoint must still be written when the catalog index is skipped"
     );
+
+    // Task 12: the catalog rewrite is debounced off the flush path, but close
+    // still writes it synchronously. This close cannot rebuild it (the catalog
+    // fingerprint needs the series payload the corrupted manifest gates), so
+    // the deferred path leaves the sidecar absent instead of failing close —
+    // restart rebuilds it from its disk walk.
+    let catalog_path = super::super::registry_catalog::catalog_path(&checkpoint_path);
+    assert!(
+        !catalog_path.exists(),
+        "a deferred close must not leave a catalog sidecar it could not rebuild"
+    );
 }

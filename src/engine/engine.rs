@@ -181,6 +181,13 @@ struct PersistedStorageState {
     /// happen under the persisted-index lock.
     registry_contributions: registry_contributions::RegistryContributions,
     persisted_index_dirty: Arc<AtomicBool>,
+    /// Set when a flush published segments while the derived registry catalog
+    /// sidecar was left for the refresh thread to rewrite (C-2: rewriting a
+    /// multi-megabyte JSON + parent fsync per publish on the flush path starved
+    /// compaction windows). The catalog is a startup accelerator, not
+    /// crash-recovery metadata: a stale one only costs a slower restart through
+    /// the existing full rebuild fallback.
+    registry_catalog_dirty: AtomicBool,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,
     series_index_path: Option<PathBuf>,

@@ -134,6 +134,34 @@ impl ChunkStorage {
         &self,
         sources: &[registry_catalog::PersistedRegistryCatalogSource],
     ) -> Result<()> {
+        self.persist_series_registry_index_with_catalog_persist(|checkpoint_path| {
+            self.persist_series_registry_catalog_index_with_sources(checkpoint_path, sources)
+        })
+    }
+
+    /// Flush-path registry persistence: the incremental registry delta is
+    /// written inline (it is crash-recovery metadata), while the derived catalog
+    /// sidecar is only marked dirty.
+    ///
+    /// Rewriting the catalog here cost a multi-megabyte JSON serialization plus
+    /// an atomic file swap and parent fsync per publish; under write-triggered
+    /// flush that starved the compaction windows. The refresh thread rewrites it
+    /// from the in-memory inventory once the published segments are in the
+    /// persisted index (C-2).
+    pub(in super::super) fn persist_series_registry_index_deferring_catalog(&self) -> Result<()> {
+        self.persist_series_registry_index_with_catalog_persist(|_checkpoint_path| {
+            self.mark_registry_catalog_dirty();
+            Ok(())
+        })
+    }
+
+    fn persist_series_registry_index_with_catalog_persist<PersistCatalog>(
+        &self,
+        persist_catalog_index: PersistCatalog,
+    ) -> Result<()>
+    where
+        PersistCatalog: Fn(&Path) -> Result<()>,
+    {
         let Some(checkpoint_path) = &self.persisted.series_index_path else {
             return Ok(());
         };
@@ -144,13 +172,23 @@ impl ChunkStorage {
                 checkpoint_path,
                 &delta_path,
                 &delta_dir_path,
-                sources,
-                |checkpoint_path, sources| {
-                    self.persist_series_registry_catalog_index_with_sources(
-                        checkpoint_path,
-                        sources,
-                    )
-                },
+                persist_catalog_index,
             )
+    }
+
+    /// Marks the derived registry catalog sidecar as needing a rewrite from the
+    /// in-memory inventory.
+    pub(in super::super) fn mark_registry_catalog_dirty(&self) {
+        self.persisted
+            .registry_catalog_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Claims the pending catalog rewrite: returns `true` exactly once per dirty
+    /// epoch and clears the mark so a concurrent publish can re-arm it.
+    pub(in super::super) fn take_registry_catalog_dirty(&self) -> bool {
+        self.persisted
+            .registry_catalog_dirty
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 }

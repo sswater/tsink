@@ -198,17 +198,15 @@ impl<'a> RegistryPersistenceContext<'a> {
         checkpoint_path: &Path,
         delta_path: &Path,
         delta_dir_path: &Path,
-        sources: &[registry_catalog::PersistedRegistryCatalogSource],
         persist_catalog_index: PersistCatalog,
     ) -> Result<()>
     where
-        PersistCatalog:
-            Fn(&Path, &[registry_catalog::PersistedRegistryCatalogSource]) -> Result<()>,
+        PersistCatalog: Fn(&Path) -> Result<()>,
     {
         let _registry_persistence_guard = self.persistence_lock.lock();
         let pending_series_ids = self.pending_series_ids_snapshot();
         if pending_series_ids.is_empty() {
-            return persist_catalog_index(checkpoint_path, sources);
+            return persist_catalog_index(checkpoint_path);
         }
 
         let pending_registry = self.pending_registry_subset(&pending_series_ids)?;
@@ -228,7 +226,7 @@ impl<'a> RegistryPersistenceContext<'a> {
                 delta_path,
                 delta_dir_path,
                 false,
-                |checkpoint_path| persist_catalog_index(checkpoint_path, sources),
+                persist_catalog_index,
             );
         }
 
@@ -240,7 +238,7 @@ impl<'a> RegistryPersistenceContext<'a> {
                         delta_path,
                         delta_dir_path,
                         false,
-                        |checkpoint_path| persist_catalog_index(checkpoint_path, sources),
+                        persist_catalog_index,
                     ),
                 _ => Err(err),
             };
@@ -251,7 +249,7 @@ impl<'a> RegistryPersistenceContext<'a> {
             current_delta_series_count
                 .saturating_add(saturating_u64_from_usize(persisted_series_ids.len())),
         );
-        persist_catalog_index(checkpoint_path, sources)
+        persist_catalog_index(checkpoint_path)
     }
 }
 
