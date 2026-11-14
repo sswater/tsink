@@ -36,8 +36,9 @@ pub(crate) use self::loader::{
 };
 pub(crate) use self::types::SegmentContentFingerprint;
 pub(crate) use self::validation::{
-    is_not_found_error, is_vanished_source_error, quarantine_invalid_startup_segment,
-    quarantine_segment_root, runtime_refresh_disappearance_error, segment_validation_error,
+    is_runtime_refresh_disappearance_error, is_vanished_source_error,
+    quarantine_invalid_startup_segment, quarantine_segment_root,
+    runtime_refresh_disappearance_error, segment_validation_error,
     segment_validation_error_message, SegmentValidationContext, StartupQuarantinedSegment,
 };
 #[cfg(test)]

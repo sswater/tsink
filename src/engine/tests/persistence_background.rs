@@ -1536,6 +1536,252 @@ fn stranded_known_diff_is_refreshed_without_dirty_flag() {
 }
 
 #[test]
+fn runtime_refresh_disappearance_is_transient_and_does_not_fence_writes() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let metric = "runtime_refresh_transient_metric";
+
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert(metric, &labels)
+        .unwrap()
+        .series_id;
+
+    write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+
+    // Fail-fast is on: `ChunkStorageOptions::default()` carries
+    // `background_fail_fast: true`, exactly like `StorageBuilder`'s default.
+    let storage = new_raw_numeric_storage(lane_path.clone(), 2);
+    storage
+        .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap(), false)
+        .unwrap();
+
+    // A write-triggered flush publishes a tiny L0 segment and records it as a
+    // pending added root, arming the dirty flag, without applying it yet.
+    let published_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 2, &[(2, 2.0)]);
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(std::iter::once(published_root.clone()), std::iter::empty());
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    // A back-to-back compaction pass merges that micro-segment away before the
+    // refresh worker loads it: the root is already gone from disk.
+    crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&published_root).unwrap();
+
+    let err = storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap_err();
+    assert!(
+        crate::engine::segment::is_runtime_refresh_disappearance_error(&err),
+        "the seeded interleaving must produce the runtime-refresh disappearance error, got: {err}"
+    );
+
+    // Drive the error through the worker's real error handling. This is the
+    // exact classification the persisted-refresh thread applies (src/engine/runtime.rs).
+    let worker_would_exit =
+        storage.handle_background_worker_result_for_tests("persisted_refresh", Err(err));
+    assert!(
+        !worker_would_exit,
+        "a transient segment disappearance must not stop the refresh worker under fail-fast"
+    );
+    let health = storage.observability_snapshot().health;
+    assert!(
+        health.fail_fast_enabled,
+        "the fixture must run fail-fast on"
+    );
+    assert!(
+        !health.fail_fast_triggered,
+        "a transient disappearance must not fence new work"
+    );
+    assert_eq!(
+        health.background_errors_total, 0,
+        "a transient disappearance must not be counted as a background failure"
+    );
+    assert!(
+        health.last_background_error.is_none(),
+        "a transient disappearance must not be reported as the last background error"
+    );
+    assert!(
+        storage.has_known_persisted_segment_changes(),
+        "the failed apply must restore the drained diff into pending state"
+    );
+
+    // Compaction's own removal lands in the same pending diff — the convergent
+    // merged state the next tick applies.
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(std::iter::empty(), std::iter::once(published_root.clone()));
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(
+        !storage.has_known_persisted_segment_changes(),
+        "the retried pass should drain the convergent merged diff"
+    );
+    assert!(
+        !storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst),
+        "the retried pass should settle the dirty flag"
+    );
+
+    // Writes are not fenced: the transient race never poisoned the storage.
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(3, 3.0),
+        )])
+        .unwrap();
+    let points = storage.select(metric, &labels, 0, 10).unwrap();
+    assert!(
+        points.contains(&DataPoint::new(3, 3.0)),
+        "a write after the transient disappearance must succeed and be readable"
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn non_transient_runtime_refresh_errors_still_fence_writes_under_fail_fast() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = new_raw_numeric_storage(lane_path, 1);
+
+    // Control: a real validation failure keeps the previous behavior — the
+    // worker stops and fail-fast fences new work.
+    let worker_would_exit = storage.handle_background_worker_result_for_tests(
+        "persisted_refresh",
+        Err(TsinkError::DataCorruption(
+            "persisted segment failed runtime refresh validation: manifest crc32 mismatch"
+                .to_string(),
+        )),
+    );
+    assert!(
+        worker_would_exit,
+        "non-transient refresh errors must still stop the worker under fail-fast"
+    );
+    let health = storage.observability_snapshot().health;
+    assert!(health.fail_fast_triggered);
+    assert_eq!(health.background_errors_total, 1);
+
+    let err = storage
+        .insert_rows(&[Row::new(
+            "runtime_refresh_corruption_metric",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap_err();
+    assert!(matches!(err, TsinkError::StorageShuttingDown));
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn runtime_refresh_load_of_mid_removal_segment_is_transient() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("runtime_refresh_mid_removal_metric", &labels)
+        .unwrap()
+        .series_id;
+
+    // `remove_dir_all` unlinks a retiring segment's files before its root, so a
+    // concurrent reader can see the root with a required file already gone.
+    let mid_removal_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+    std::fs::remove_file(mid_removal_root.join("chunks.bin")).unwrap();
+
+    let err = match ChunkStorage::load_segment_index_for_runtime_refresh(&mid_removal_root) {
+        Ok(_) => panic!("expected the mid-removal load to fail"),
+        Err(err) => err,
+    };
+    assert!(
+        crate::engine::segment::is_runtime_refresh_disappearance_error(&err),
+        "a root whose required file is already unlinked must be reported as the \
+         transient disappearance race, got: {err}"
+    );
+
+    // A genuinely unreadable segment must keep surfacing as validation failure.
+    let corrupt_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 2, &[(2, 2.0)]);
+    std::fs::write(corrupt_root.join("manifest.bin"), b"not a manifest").unwrap();
+
+    let err = match ChunkStorage::load_segment_index_for_runtime_refresh(&corrupt_root) {
+        Ok(_) => panic!("expected the corrupt manifest load to fail"),
+        Err(err) => err,
+    };
+    assert!(
+        !crate::engine::segment::is_runtime_refresh_disappearance_error(&err),
+        "real corruption must not be classified as a transient disappearance: {err}"
+    );
+    assert!(
+        matches!(
+            &err,
+            TsinkError::DataCorruption(message)
+                if message.contains("failed runtime refresh validation")
+        ),
+        "real corruption must still surface as a runtime refresh validation error, got: {err}"
+    );
+}
+
+#[test]
+fn flush_publication_excludes_compaction_until_verification() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let storage = Arc::new(new_raw_numeric_storage(lane_path, 1));
+
+    // The post-publish hook runs after the flush wrote and published its
+    // segment roots, i.e. inside the publication→verification window.
+    let gate_free_during_publish = Arc::new(AtomicBool::new(true));
+    let weak = Arc::downgrade(&storage);
+    storage.set_persist_post_publish_hook({
+        let gate_free_during_publish = Arc::clone(&gate_free_during_publish);
+        move |_roots| {
+            if let Some(storage) = weak.upgrade() {
+                gate_free_during_publish.store(
+                    storage.compaction_gate_is_free_for_tests(),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+    });
+
+    storage
+        .insert_rows(&[Row::new(
+            "flush_compaction_gate_metric",
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+
+    assert!(
+        !gate_free_during_publish.load(Ordering::SeqCst),
+        "flush publication must exclude compaction until verification: a back-to-back \
+         compaction pass could otherwise retire the just-published segment before the \
+         flush verified it"
+    );
+
+    storage.clear_persist_post_publish_hook();
+    storage.close().unwrap();
+}
+
+#[test]
 fn dirty_persisted_refresh_waits_for_inflight_tombstone_visibility_publication() {
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
@@ -4788,8 +5034,10 @@ fn oversized_contribution_footprint_falls_back_to_the_disk_fingerprint() {
     );
     assert_eq!(
         over_ceiling,
-        super::super::registry_catalog::build_series_fingerprint_from_sources(&[source.clone()])
-            .unwrap(),
+        super::super::registry_catalog::build_series_fingerprint_from_sources(
+            std::slice::from_ref(&source),
+        )
+        .unwrap(),
         "over the ceiling the write re-reads the segments"
     );
     assert_ne!(over_ceiling, cache_only);

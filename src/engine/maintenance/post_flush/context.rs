@@ -118,7 +118,7 @@ impl<'a> RetentionMaintenanceContext<'a> {
                 tier: state.tier,
                 root: root.clone(),
                 manifest: state.manifest.clone(),
-                files: state.files.clone(),
+                files: state.files,
             })
             .collect::<Vec<_>>();
         SegmentInventory::from_entries(entries)
@@ -423,7 +423,7 @@ impl<'a> RetentionMaintenanceContext<'a> {
                         tier: move_action.target_tier,
                         root: final_root,
                         manifest: entry.manifest.clone(),
-                        files: entry.files.clone(),
+                        files: entry.files,
                     },
                 );
                 retired_roots.push(RetiredPostFlushRoot {

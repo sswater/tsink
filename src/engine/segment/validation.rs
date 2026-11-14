@@ -172,6 +172,52 @@ pub(crate) fn is_vanished_source_error(err: &TsinkError) -> bool {
         || matches!(err, TsinkError::DataCorruption(message) if message.starts_with("missing "))
 }
 
+/// A segment that disappears between an inventory snapshot and the runtime
+/// refresh load that follows it was retired by a concurrent compaction or
+/// retention pass. For the runtime-refresh worker this is a transient race:
+/// the drained diff is restored into pending state and re-armed as dirty, and
+/// the next pass applies the convergent merged state. It must therefore not
+/// fence service the way a real background failure does.
+pub(crate) fn is_runtime_refresh_disappearance_error(err: &TsinkError) -> bool {
+    matches!(
+        err,
+        TsinkError::Other(message) if message.contains("disappeared during runtime refresh")
+    )
+}
+
+#[cfg(test)]
+mod transient_refresh_predicate_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_refresh_disappearance_error_matches_transient_shape_only() {
+        let constructed = runtime_refresh_disappearance_error(
+            Path::new("/segments/L0/seg-1"),
+            &TsinkError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        );
+        assert!(is_runtime_refresh_disappearance_error(&constructed));
+        assert!(is_runtime_refresh_disappearance_error(&TsinkError::Other(
+            "persisted segment /segments/L1/seg-34 disappeared during runtime refresh \
+             (transient disappearance race): IO error: No such file or directory"
+                .to_string()
+        )));
+
+        assert!(!is_runtime_refresh_disappearance_error(
+            &TsinkError::DataCorruption(
+                "persisted segment /segments/L0/seg-1 failed runtime refresh validation: \
+                 manifest crc32 mismatch"
+                    .to_string()
+            )
+        ));
+        assert!(!is_runtime_refresh_disappearance_error(&TsinkError::Other(
+            "persisted segment /segments/L0/seg-1 failed runtime refresh validation".to_string()
+        )));
+        assert!(!is_runtime_refresh_disappearance_error(&TsinkError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+    }
+}
+
 #[cfg(test)]
 mod vanished_predicate_tests {
     use super::*;

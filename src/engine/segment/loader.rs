@@ -54,6 +54,10 @@ enum IndexedSegmentLoadMode {
     StartupRecoverable,
 }
 
+// The loaded variant dominates by design — one parsed segment per directory —
+// and wrapping it in a Box would add a heap allocation per segment load for no
+// behavioral gain.
+#[allow(clippy::large_enum_variant)]
 enum IndexedSegmentLoadOutcome {
     Loaded(ParsedIndexedSegment),
     Skipped,

@@ -186,6 +186,12 @@ impl ChunkStorage {
         self.coordination.compaction_lock.lock()
     }
 
+    /// Test-only probe: whether the compaction gate is currently free.
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn compaction_gate_is_free_for_tests(&self) -> bool {
+        self.coordination.compaction_lock.try_lock().is_some()
+    }
+
     pub(in crate::engine::storage_engine) fn current_timestamp_units(&self) -> i64 {
         #[cfg(test)]
         {

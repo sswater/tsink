@@ -521,10 +521,19 @@ impl ChunkStorage {
                 wal: self.persisted.wal.as_ref(),
             };
             let publish_ctx = FlushPublishContext(&self.persisted.persisted_index_dirty);
-            let Some(staged_flush) = self.stage_flush_segment_publication(snapshot_ctx)? else {
-                return Ok(PersistSegmentOutcome::default());
+            // Keep compaction off the lanes from segment publication through the
+            // verification load: a back-to-back compaction pass must not consume a
+            // just-published segment before the flush verified it (and, on a real
+            // failure, rolled it back so WAL replay can recover). This is the same
+            // gate the recovery-metadata stage already takes; it is acquired
+            // sequentially here, never nested.
+            let verified_flush = {
+                let _compaction_guard = self.compaction_gate();
+                let Some(staged_flush) = self.stage_flush_segment_publication(snapshot_ctx)? else {
+                    return Ok(PersistSegmentOutcome::default());
+                };
+                self.verify_flush_segment_publication(staged_flush)?
             };
-            let verified_flush = self.verify_flush_segment_publication(staged_flush)?;
             self.persist_flush_recovery_metadata_stage(
                 publish_ctx,
                 &verified_flush.published_segment_roots,

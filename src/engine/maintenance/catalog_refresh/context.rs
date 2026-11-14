@@ -10,7 +10,7 @@ use super::super::{
 };
 use super::*;
 use crate::engine::segment::{
-    is_not_found_error, runtime_refresh_disappearance_error, segment_validation_error,
+    is_vanished_source_error, runtime_refresh_disappearance_error, segment_validation_error,
     segment_validation_error_message, IndexedSegment, SegmentValidationContext,
 };
 
@@ -356,7 +356,12 @@ impl ChunkStorage {
     ) -> Result<IndexedSegment> {
         match crate::engine::segment::load_segment_index(root) {
             Ok(segment) => Ok(segment),
-            Err(err) if is_not_found_error(&err) => {
+            // A root whose directory is gone — or whose required files are
+            // already unlinked by a concurrent remover — was retired between
+            // the inventory snapshot and this load. That is the transient
+            // disappearance race, not corruption: report it as such so the
+            // worker retries instead of fencing service.
+            Err(err) if is_vanished_source_error(&err) => {
                 Err(runtime_refresh_disappearance_error(root, &err))
             }
             Err(err) => {

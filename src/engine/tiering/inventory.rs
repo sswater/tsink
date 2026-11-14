@@ -103,7 +103,7 @@ impl SegmentInventory {
                 tier: state.tier,
                 root: root.clone(),
                 manifest: state.manifest.clone(),
-                files: state.files.clone(),
+                files: state.files,
             })
             .collect::<Vec<_>>();
         Self::from_entries(entries)

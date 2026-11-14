@@ -154,7 +154,7 @@ pub(crate) fn notify_segment_file_read(path: &Path) {
 
 #[cfg(test)]
 pub(crate) fn set_segment_file_read_hook(
-    hook: Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+    hook: Option<std::sync::Arc<SegmentFileReadHook>>,
 ) -> ReadHookGuard {
     let lock = segment_read_test_lock()
         .lock()
@@ -333,12 +333,6 @@ pub(crate) fn remove_dir_if_exists(path: &Path) -> std::io::Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
     }
-}
-
-/// Whether the error is a rmdir/remove_dir failure on a directory that still
-/// contains entries — the signature of a concurrent remover mid-way.
-pub(crate) fn is_directory_not_empty_error(err: &std::io::Error) -> bool {
-    err.kind() == std::io::ErrorKind::DirectoryNotEmpty
 }
 
 pub(crate) fn remove_file_if_exists(path: &Path) -> std::io::Result<bool> {

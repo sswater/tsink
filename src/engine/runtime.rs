@@ -1,3 +1,5 @@
+use crate::engine::segment::is_runtime_refresh_disappearance_error;
+
 use super::{
     compaction_park_interval, elapsed_nanos_u64, Arc, AtomicBool, AtomicU8,
     BackgroundWorkerSupervisorState, ChunkStorage, Compactor, Duration, Instant, Mutex, Ordering,
@@ -90,6 +92,21 @@ impl<'a> BackgroundWorkerControl<'a> {
     fn handle_result<T>(&self, worker: &'static str, result: Result<T>) -> BackgroundWorkerFlow {
         match result {
             Ok(_) => BackgroundWorkerFlow::Continue,
+            Err(err) if is_runtime_refresh_disappearance_error(&err) => {
+                // The runtime-refresh apply path already restored the drained
+                // diff into pending state and re-armed the dirty flag, and the
+                // concurrent compaction's removal lands in that same pending
+                // diff, so the next pass applies the convergent merged state.
+                // Fencing service here would turn a self-healing race into a
+                // permanent outage, so this is warned about but never poisoned.
+                tracing::warn!(
+                    worker,
+                    error = %err,
+                    "Background worker hit a segment retired by a concurrent compaction; \
+                     transient; diff restored and retried next pass"
+                );
+                BackgroundWorkerFlow::Continue
+            }
             Err(err) => {
                 ChunkStorage::record_background_worker_error(
                     worker,
@@ -480,6 +497,22 @@ impl ChunkStorage {
             error = %error,
             "Background worker execution failed"
         );
+    }
+
+    /// Test-only entry point into the background worker's error handling, so a
+    /// seeded storage can be driven through exactly the classification the
+    /// worker threads use. Returns `true` when the worker loop would stop.
+    #[cfg(test)]
+    pub(super) fn handle_background_worker_result_for_tests(
+        &self,
+        worker: &'static str,
+        result: Result<()>,
+    ) -> bool {
+        let control = BackgroundWorkerControl::for_storage(self);
+        matches!(
+            control.handle_result(worker, result),
+            BackgroundWorkerFlow::Exit
+        )
     }
 
     pub(super) fn flush_pipeline_once(&self) -> Result<()> {
