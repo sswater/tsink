@@ -161,3 +161,37 @@ pub(crate) fn handle_segment_dir_load_error(
 pub(crate) fn is_not_found_error(err: &TsinkError) -> bool {
     matches!(err, TsinkError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound)
 }
+
+/// A source that vanished (root directory removed, or one of its required
+/// files already unlinked) between an inventory snapshot and the read that
+/// follows is a segment mid-removal: compaction or retention retired it
+/// concurrently. Callers that skip vanished sources surface neither error
+/// shape, so both are recognized here.
+pub(crate) fn is_vanished_source_error(err: &TsinkError) -> bool {
+    is_not_found_error(err)
+        || matches!(err, TsinkError::DataCorruption(message) if message.starts_with("missing "))
+}
+
+#[cfg(test)]
+mod vanished_predicate_tests {
+    use super::*;
+
+    #[test]
+    fn vanished_source_error_matches_raw_missing_and_not_found() {
+        assert!(is_vanished_source_error(&TsinkError::DataCorruption(
+            "missing manifest.bin".to_string()
+        )));
+        assert!(is_vanished_source_error(&TsinkError::DataCorruption(
+            "missing chunks.bin".to_string()
+        )));
+        assert!(is_vanished_source_error(&TsinkError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+        assert!(!is_vanished_source_error(&TsinkError::DataCorruption(
+            "bad magic".to_string()
+        )));
+        assert!(!is_vanished_source_error(&TsinkError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied)
+        )));
+    }
+}

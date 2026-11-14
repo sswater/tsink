@@ -7,7 +7,7 @@ use xxhash_rust::xxh64::Xxh64;
 use super::tiering::SegmentLaneFamily;
 use super::*;
 use crate::engine::fs_utils::{path_exists_no_follow, write_file_atomically_and_sync_parent};
-use crate::engine::segment::IndexedSegment;
+use crate::engine::segment::{is_vanished_source_error, IndexedSegment};
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::Label;
 use tracing::warn;
@@ -143,11 +143,7 @@ fn build_catalog(
 /// catalog describes surviving segments, so skip the source instead of
 /// failing — surfacing the error would fence the engine on a transient state.
 fn is_vanished_catalog_source_error(err: &TsinkError) -> bool {
-    match err {
-        TsinkError::Io(io_err) => io_err.kind() == std::io::ErrorKind::NotFound,
-        TsinkError::DataCorruption(message) => message.starts_with("missing "),
-        _ => false,
-    }
+    is_vanished_source_error(err)
 }
 
 fn build_catalog_entries(
