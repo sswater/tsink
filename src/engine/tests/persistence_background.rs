@@ -3784,3 +3784,265 @@ fn close_waits_for_inflight_background_refresh_before_final_persist() {
     close_thread.join().unwrap();
     assert!(scan_calls.load(Ordering::SeqCst) >= 1);
 }
+
+#[test]
+fn window_diff_is_merged_into_pending_diff_immediately() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("window_diff_merge", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    // Twelve disjoint L0 segments drain as three windows in a single round.
+    for segment_id in 1..=12u64 {
+        write_numeric_segment_to_path(
+            &lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+
+    let mut storage = new_raw_numeric_storage(lane_path, 13);
+    // A real startup discovers the inventory and injects it; without it the
+    // compactor refuses to plan (no on-disk fallback for the storage path).
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    storage
+        .persisted
+        .numeric_compactor
+        .as_mut()
+        .unwrap()
+        .set_pass_wall_budget(Duration::from_secs(60));
+
+    let mut added_after_each_window = Vec::new();
+    let stats = ChunkStorage::compact_compactors_with_changes(
+        storage.persisted.numeric_compactor.as_ref(),
+        None,
+        Some(storage.observability.as_ref()),
+        &mut |window| {
+            ChunkStorage::merge_published_window(
+                storage.persisted.pending_persisted_segment_diff.as_ref(),
+                storage.persisted.persisted_index_dirty.as_ref(),
+                window,
+            );
+            // The contract the background worker and close path rely on: the
+            // window's roots are already merged and the index is already dirty
+            // when the callback returns — not at the end of the round.
+            assert!(
+                storage
+                    .persisted
+                    .persisted_index_dirty
+                    .load(Ordering::SeqCst),
+                "each published window must mark the persisted index dirty"
+            );
+            added_after_each_window.push(
+                storage
+                    .persisted
+                    .pending_persisted_segment_diff
+                    .lock()
+                    .added_roots
+                    .len(),
+            );
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        added_after_each_window.len(),
+        stats.windows_merged as usize,
+        "one callback per merged window"
+    );
+    assert!(
+        added_after_each_window.len() >= 2,
+        "the fixture must produce a multi-window round, got {}",
+        added_after_each_window.len()
+    );
+    assert!(
+        added_after_each_window
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "the pending diff must grow window by window: {added_after_each_window:?}"
+    );
+    assert_eq!(
+        storage
+            .persisted
+            .pending_persisted_segment_diff
+            .lock()
+            .added_roots
+            .len(),
+        3,
+        "three L0 windows publish three L1 outputs, all pending"
+    );
+    assert_eq!(
+        storage
+            .persisted
+            .pending_persisted_segment_diff
+            .lock()
+            .removed_roots
+            .len(),
+        12,
+        "all twelve L0 sources must be pending removal"
+    );
+
+    // Apply the merged diff before closing: the close pipeline plans from the
+    // same persisted index, and stale source entries would only be retired as
+    // ghosts there.
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    storage.close().unwrap();
+}
+
+#[test]
+fn blob_lane_failure_keeps_the_numeric_lane_windows_already_merged() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let numeric_lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let blob_lane_path = temp_dir.path().join(BLOB_LANE_ROOT);
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cross_lane_partial_failure", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    // Numeric: eight disjoint L0 segments, i.e. two windows that both publish.
+    for segment_id in 1..=8u64 {
+        write_numeric_segment_to_path(
+            &numeric_lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        );
+    }
+    // Blob: four L0 segments is one window; the payload family is irrelevant for
+    // the failure this test needs — the lane only has to reach its window load
+    // and fail there.
+    let mut blob_roots = Vec::new();
+    for segment_id in 1..=4u64 {
+        blob_roots.push(write_numeric_segment_to_path(
+            &blob_lane_path,
+            &registry,
+            series_id,
+            0,
+            segment_id,
+            &[(segment_id as i64, segment_id as f64)],
+        ));
+    }
+
+    let mut storage = ChunkStorage::new_with_data_path_and_options(
+        8,
+        None,
+        Some(numeric_lane_path.clone()),
+        Some(blob_lane_path),
+        9,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    storage
+        .persisted
+        .numeric_compactor
+        .as_mut()
+        .unwrap()
+        .set_pass_wall_budget(Duration::from_secs(60));
+    storage
+        .persisted
+        .blob_compactor
+        .as_mut()
+        .unwrap()
+        .set_pass_wall_budget(Duration::from_secs(60));
+
+    // Corrupt one blob window member (payload hash mismatch, not a vanished
+    // file) and keep the bytes so the fixture can be closed cleanly afterwards.
+    let corrupt_chunks_path = blob_roots[1].join("chunks.bin");
+    let original_chunks = std::fs::read(&corrupt_chunks_path).unwrap();
+    let mut corrupted = original_chunks.clone();
+    let last = corrupted.len() - 1;
+    corrupted[last] ^= 0xff;
+    std::fs::write(&corrupt_chunks_path, corrupted).unwrap();
+
+    let mut merged_windows = 0usize;
+    let err = ChunkStorage::compact_compactors_with_changes(
+        storage.persisted.numeric_compactor.as_ref(),
+        storage.persisted.blob_compactor.as_ref(),
+        Some(storage.observability.as_ref()),
+        &mut |window| {
+            merged_windows += 1;
+            ChunkStorage::merge_published_window(
+                storage.persisted.pending_persisted_segment_diff.as_ref(),
+                storage.persisted.persisted_index_dirty.as_ref(),
+                window,
+            );
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("failed compaction validation"),
+        "the corrupt blob member must fail the pass: {err}"
+    );
+
+    // The numeric lane ran before the blob lane. Its two published windows were
+    // already merged, so the later lane's error cannot diverge disk from index.
+    assert_eq!(
+        merged_windows, 2,
+        "both numeric windows must have been merged before the blob failure"
+    );
+    assert!(
+        storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst),
+        "a merged window must leave the persisted index dirty even when a later lane fails"
+    );
+    let pending = storage.persisted.pending_persisted_segment_diff.lock();
+    assert_eq!(
+        pending.added_roots.len(),
+        2,
+        "both numeric L1 outputs must be pending addition"
+    );
+    assert_eq!(
+        pending.removed_roots.len(),
+        8,
+        "all eight numeric L0 sources must be pending removal"
+    );
+    assert!(
+        pending
+            .added_roots
+            .iter()
+            .all(|root| root.starts_with(&numeric_lane_path) && root.exists()),
+        "the numeric lane's replacements are already on disk: {:?}",
+        pending.added_roots
+    );
+    drop(pending);
+
+    std::fs::write(&corrupt_chunks_path, original_chunks).unwrap();
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    storage.close().unwrap();
+}

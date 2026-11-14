@@ -316,7 +316,6 @@ impl Compactor {
                 },
                 source_roots,
                 output_roots: Vec::new(),
-                retired_roots: Vec::new(),
             });
         }
 
@@ -415,7 +414,6 @@ impl Compactor {
                 },
                 source_roots,
                 output_roots,
-                retired_roots: Vec::new(),
             });
         }
 
@@ -440,7 +438,6 @@ impl Compactor {
             },
             source_roots,
             output_roots,
-            retired_roots: Vec::new(),
         })
     }
 
@@ -780,5 +777,20 @@ mod replacement_marker_tests {
 
         apply_compaction_replacement_marker(tmp.path(), &marker_path).unwrap();
         assert!(!marker_path.exists());
+    }
+
+    #[test]
+    fn apply_still_fails_on_present_but_corrupt_marker() {
+        let tmp = TempDir::new().unwrap();
+        let marker_path = setup_marker(tmp.path());
+        // A marker that is *present* but unreadable is damage, not the vanished
+        // marker a concurrent finalize leaves behind: it must fail loudly.
+        fs::write(&marker_path, b"").unwrap();
+
+        assert!(apply_compaction_replacement_marker(tmp.path(), &marker_path).is_err());
+        assert!(
+            tmp.path().join(SOURCE_REL).exists(),
+            "a corrupt marker must not retire its sources"
+        );
     }
 }

@@ -25,21 +25,18 @@ pub(in crate::engine::storage_engine) struct RemoteCatalogRefreshState {
 }
 
 #[derive(Debug, Default, Clone)]
-pub(in crate::engine::storage_engine) struct PendingPersistedSegmentDiff {
-    pub(in crate::engine::storage_engine) added_roots: BTreeSet<PathBuf>,
-    pub(in crate::engine::storage_engine) removed_roots: BTreeSet<PathBuf>,
+pub(in crate::engine) struct PendingPersistedSegmentDiff {
+    pub(in crate::engine) added_roots: BTreeSet<PathBuf>,
+    pub(in crate::engine) removed_roots: BTreeSet<PathBuf>,
 }
 
 impl PendingPersistedSegmentDiff {
-    pub(in crate::engine::storage_engine) fn is_empty(&self) -> bool {
+    pub(in crate::engine) fn is_empty(&self) -> bool {
         self.added_roots.is_empty() && self.removed_roots.is_empty()
     }
 
-    pub(in crate::engine::storage_engine) fn record_changes<I, J>(
-        &mut self,
-        added_roots: I,
-        removed_roots: J,
-    ) where
+    pub(in crate::engine) fn record_changes<I, J>(&mut self, added_roots: I, removed_roots: J)
+    where
         I: IntoIterator<Item = PathBuf>,
         J: IntoIterator<Item = PathBuf>,
     {
@@ -53,7 +50,7 @@ impl PendingPersistedSegmentDiff {
         }
     }
 
-    pub(in crate::engine::storage_engine) fn merge(&mut self, other: Self) {
+    pub(in crate::engine) fn merge(&mut self, other: Self) {
         self.record_changes(other.added_roots, other.removed_roots);
     }
 }

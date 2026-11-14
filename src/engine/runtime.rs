@@ -279,14 +279,20 @@ impl ChunkStorage {
                                 numeric_compactor.as_ref(),
                                 blob_compactor.as_ref(),
                                 Some(observability.as_ref()),
+                                &mut |window| {
+                                    // Merge each window as it is published: a
+                                    // later window's error must not drop the
+                                    // roots of a window already replaced on disk.
+                                    ChunkStorage::merge_published_window(
+                                        pending_persisted_segment_diff.as_ref(),
+                                        persisted_index_dirty.as_ref(),
+                                        window,
+                                    );
+                                },
                             ) {
-                                Ok((changes, stats)) => {
+                                Ok(stats) => {
                                     park_duration =
                                         compaction_park_interval(&stats, compaction_interval);
-                                    if !changes.is_empty() {
-                                        pending_persisted_segment_diff.lock().merge(changes);
-                                        persisted_index_dirty.store(true, Ordering::SeqCst);
-                                    }
                                 }
                                 Err(err) => {
                                     park_duration = compaction_interval;

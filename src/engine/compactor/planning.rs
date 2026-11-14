@@ -21,11 +21,14 @@ pub(in crate::engine) struct PlanningCandidate {
 enum WindowStep {
     /// No source level is at or beyond its trigger: the pass has drained.
     Converged,
-    /// One window's survivors were merged and absorbed into the working copy.
-    Merged,
-    /// No survivors of the window were loadable; the ghosts were retired from
-    /// the working copy and the loop re-selects from what is left.
-    Retired,
+    /// One window's effects on the persisted catalog are complete on disk: a
+    /// merged window's replacement is published and its sources are gone, a
+    /// window of vanished members is retired from the working copy, or both.
+    ///
+    /// The diff is returned instead of being accumulated for the end of the
+    /// round, so the caller can merge it immediately: a later window's error
+    /// must not be able to drop an already-published window's diff.
+    Published(PendingPersistedSegmentDiff),
     /// The window produced no output segments because every point was
     /// tombstoned, so its sources are still on disk and must not be absorbed.
     /// The caller skips those candidates for the rest of the pass (they keep
@@ -153,12 +156,24 @@ impl Compactor {
     /// it before the next one, so flush, retention, snapshot, and catalog
     /// refresh can interleave between windows instead of waiting for a full
     /// round.
-    pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
+    ///
+    /// `on_window` is the partial-failure contract: it runs once per window
+    /// whose roots changed on disk, immediately after that window is published
+    /// and with the gate already released. The caller merges the diff into its
+    /// pending catalog diff there, so a window that fails later in the round
+    /// (`?`) cannot drop the diff of the windows that already succeeded. A
+    /// window that only retires vanished members also reports a diff (removed
+    /// roots, no output): those roots are gone from disk but must still leave
+    /// the catalog. A round that publishes nothing calls back zero times.
+    pub(in crate::engine) fn compact_round_with_changes(
+        &self,
+        on_window: &mut dyn FnMut(PendingPersistedSegmentDiff),
+    ) -> Result<CompactionRunStats> {
         // Skip before any disk access: the background compaction thread wakes up
         // before the inventory provider is injected, and must not fall back to an
         // O(N) scan in that window.
         let Some(inventory) = self.planning_inventory()? else {
-            return Ok(CompactionOutcome::default());
+            return Ok(CompactionRunStats::default());
         };
 
         finalize_pending_compaction_replacements(&self.data_path)?;
@@ -166,23 +181,25 @@ impl Compactor {
 
         let mut working = WorkingInventory::from_inventory(self, &inventory);
         let deadline = Instant::now() + self.pass_wall_budget;
-        let mut outcome = CompactionOutcome::default();
+        let mut stats = CompactionRunStats::default();
 
         loop {
-            if outcome.stats.windows_merged > 0 && Instant::now() >= deadline {
+            if stats.windows_merged > 0 && Instant::now() >= deadline {
                 break;
             }
 
             // `parking_lot::Mutex` is not reentrant: no caller may hold this
             // gate around the pass (see the background worker and shutdown
-            // call sites). The guard is dropped before the loop continues.
+            // call sites). The guard is dropped before the step's diff is
+            // handed over, so `on_window` never runs under the gate either.
             let step = {
                 let _guard = self.gate.as_ref().map(|gate| gate.lock());
-                self.merge_one_window(&mut working, &tombstones, &mut outcome)?
+                self.merge_one_window(&mut working, &tombstones, &mut stats)?
             };
 
             match step {
-                WindowStep::Merged | WindowStep::Retired | WindowStep::NoOutput => {}
+                WindowStep::Published(diff) => on_window(diff),
+                WindowStep::NoOutput => {}
                 WindowStep::Converged => break,
             }
         }
@@ -191,11 +208,10 @@ impl Compactor {
         // exhausted, or a window that could not be merged) needs the next pass
         // to run immediately rather than park a full interval. Windows skipped
         // for producing no output still count: their sources are still on disk.
-        outcome.stats.source_above_trigger = working
-            .above_trigger(CompactionLevel::L0, self.l0_trigger)
+        stats.source_above_trigger = working.above_trigger(CompactionLevel::L0, self.l0_trigger)
             || working.above_trigger(CompactionLevel::L1, self.l1_trigger);
 
-        Ok(outcome)
+        Ok(stats)
     }
 
     /// Picks the next source level to drain: L0 first, then L1.
@@ -213,15 +229,15 @@ impl Compactor {
 
     /// Merges at most one window of the selected source level.
     ///
-    /// Every step either merges a window (strictly shrinking the selectable
-    /// source level), retires a vanished root (also strictly shrinking it), or
+    /// Every step either publishes a window (strictly shrinking the selectable
+    /// source level), retires vanished roots (also strictly shrinking it), or
     /// skips a zero-output window out of this pass's selection (again strictly
     /// shrinking it), so the loop cannot revisit the same state.
     fn merge_one_window(
         &self,
         working: &mut WorkingInventory,
         tombstones: &TombstoneMap,
-        outcome: &mut CompactionOutcome,
+        stats: &mut CompactionRunStats,
     ) -> Result<WindowStep> {
         let Some((source, target, trigger)) = self.select_source_level(working) else {
             return Ok(WindowStep::Converged);
@@ -242,22 +258,20 @@ impl Compactor {
         .cloned()
         .collect::<Vec<_>>();
 
-        let (segments, retired_roots) = load_window_members(&window)?;
-        let retired_any = !retired_roots.is_empty();
-        if retired_any {
+        let (segments, mut retired_roots) = load_window_members(&window)?;
+        if !retired_roots.is_empty() {
             warn!(
                 roots = ?retired_roots,
                 "Compaction window members vanished before load; retiring them from the planning inventory"
             );
             working.remove_roots(source, &retired_roots);
-            outcome.retired_roots.extend(retired_roots);
         }
 
         if segments.len() < 2 {
             // Only ghosts were left in this window. Their eviction already
             // shrank the source level, so the next iteration re-selects from
             // the surviving candidates instead of merging this window.
-            if !retired_any {
+            if retired_roots.is_empty() {
                 // Selection always yields at least two members and every member
                 // either loads or is retired, so reaching here means the
                 // invariant broke. Fail loudly instead of spinning the drain
@@ -269,7 +283,9 @@ impl Compactor {
                     segments.len()
                 )));
             }
-            return Ok(WindowStep::Retired);
+            // Already gone from disk, but they still have to leave the
+            // inventory and the catalog, otherwise every pass re-selects them.
+            return Ok(WindowStep::Published(retired_roots_diff(retired_roots)));
         }
 
         let segment_refs = segments.iter().collect::<Vec<_>>();
@@ -283,29 +299,38 @@ impl Compactor {
             // pass so the remaining windows drain; they keep counting toward
             // `source_above_trigger`, and the next pass retries them.
             working.skip_roots(source, &window_outcome.source_roots);
-            return Ok(WindowStep::NoOutput);
+            if retired_roots.is_empty() {
+                return Ok(WindowStep::NoOutput);
+            }
+            // The window produced no replacement, but its vanished members are
+            // still gone: report them so the catalog drops them now.
+            return Ok(WindowStep::Published(retired_roots_diff(retired_roots)));
         }
 
         working.remove_roots(source, &window_outcome.source_roots);
         working.absorb_outputs(target, &window_outcome.output_roots)?;
 
-        outcome.stats.compacted = true;
-        outcome
-            .stats
-            .source_level
-            .get_or_insert(level_to_u8(source));
-        outcome.stats.target_level = Some(level_to_u8(target));
-        outcome.stats.source_segments += window_outcome.stats.source_segments;
-        outcome.stats.output_segments += window_outcome.stats.output_segments;
-        outcome.stats.source_chunks += window_outcome.stats.source_chunks;
-        outcome.stats.output_chunks += window_outcome.stats.output_chunks;
-        outcome.stats.source_points += window_outcome.stats.source_points;
-        outcome.stats.output_points += window_outcome.stats.output_points;
-        outcome.stats.windows_merged = outcome.stats.windows_merged.saturating_add(1);
-        outcome.source_roots.extend(window_outcome.source_roots);
-        outcome.output_roots.extend(window_outcome.output_roots);
+        stats.compacted = true;
+        stats.source_level.get_or_insert(level_to_u8(source));
+        stats.target_level = Some(level_to_u8(target));
+        stats.source_segments += window_outcome.stats.source_segments;
+        stats.output_segments += window_outcome.stats.output_segments;
+        stats.source_chunks += window_outcome.stats.source_chunks;
+        stats.output_chunks += window_outcome.stats.output_chunks;
+        stats.source_points += window_outcome.stats.source_points;
+        stats.output_points += window_outcome.stats.output_points;
+        stats.windows_merged = stats.windows_merged.saturating_add(1);
 
-        Ok(WindowStep::Merged)
+        // `record_changes` adds before it removes, so a root this window both
+        // published and consumed (the same L1 output in a later window) ends up
+        // on the removed side. That ordering is what lets L0→L1→L2 ride one
+        // accumulating diff: the intermediate L1 roots are added by their L0
+        // window and removed by the L1→L2 window.
+        let mut diff = PendingPersistedSegmentDiff::default();
+        let mut removed_roots = window_outcome.source_roots;
+        removed_roots.append(&mut retired_roots);
+        diff.record_changes(window_outcome.output_roots, removed_roots);
+        Ok(WindowStep::Published(diff))
     }
 
     /// Planning candidates for `level`, taken from the inventory snapshot.
@@ -340,6 +365,17 @@ impl Compactor {
 /// at/above its count trigger or holds time-overlapping segments.
 fn should_compact_level(candidates: &[PlanningCandidate], count_trigger: usize) -> bool {
     candidates.len() >= 2 && (candidates.len() >= count_trigger || has_time_overlap(candidates))
+}
+
+/// Diff for a window whose only effect was retiring vanished members.
+///
+/// Nothing was published, but those roots are already gone from disk and must
+/// still leave the inventory and the catalog, otherwise every pass re-selects
+/// the same ghosts.
+fn retired_roots_diff(retired_roots: Vec<PathBuf>) -> PendingPersistedSegmentDiff {
+    let mut diff = PendingPersistedSegmentDiff::default();
+    diff.record_changes(std::iter::empty::<PathBuf>(), retired_roots);
+    diff
 }
 
 /// Loads the selected window from disk, root by root.

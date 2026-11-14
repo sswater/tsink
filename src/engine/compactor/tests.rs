@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -9,8 +9,8 @@ use tempfile::TempDir;
 
 use super::{
     compaction_park_interval, execution, finalize_pending_compaction_replacements,
-    scan_inventory_from_disk, CompactionInventorySource, CompactionOutcome, CompactionRunStats,
-    Compactor, COMPACTION_BACKLOG_PARK,
+    scan_inventory_from_disk, CompactionInventorySource, CompactionRunStats, Compactor,
+    COMPACTION_BACKLOG_PARK,
 };
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::encoder::Encoder;
@@ -25,6 +25,7 @@ use crate::engine::series::{SeriesRegistry, SeriesValueFamily};
 use crate::engine::storage_engine::tiering::{
     PersistedSegmentTier, SegmentInventory, SegmentInventoryEntry, SegmentLaneFamily,
 };
+use crate::engine::storage_engine::PendingPersistedSegmentDiff;
 use crate::engine::tombstone::{persist_tombstones, TombstoneRange, TOMBSTONES_FILE_NAME};
 use crate::{
     HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, NativeHistogram, Value,
@@ -544,9 +545,7 @@ fn inventory_driven_planning_matches_disk_driven_outcome() {
     write_time_overlapping_l0_segments(disk_dir.path(), 5);
     write_time_overlapping_l0_segments(inventory_dir.path(), 5);
 
-    let disk_outcome = Compactor::new(disk_dir.path(), 8)
-        .compact_once_with_changes()
-        .unwrap();
+    let disk_outcome = RoundCapture::run(&Compactor::new(disk_dir.path(), 8)).unwrap();
 
     // Snapshot the inventory, then inject it: planning must reach the same
     // decision an on-disk scan would have reached.
@@ -559,18 +558,18 @@ fn inventory_driven_planning_matches_disk_driven_outcome() {
         Arc::new(AtomicU64::new(6)),
         source,
     );
-    let inventory_outcome = compactor.compact_once_with_changes().unwrap();
+    let inventory_outcome = RoundCapture::run(&compactor).unwrap();
 
     assert!(disk_outcome.stats.compacted);
     assert!(inventory_outcome.stats.compacted);
     assert_eq!(
-        relative_roots(disk_dir.path(), &disk_outcome.source_roots),
-        relative_roots(inventory_dir.path(), &inventory_outcome.source_roots),
+        relative_roots(disk_dir.path(), &disk_outcome.removed_roots()),
+        relative_roots(inventory_dir.path(), &inventory_outcome.removed_roots()),
         "same source window must be selected"
     );
     assert_eq!(
-        relative_roots(disk_dir.path(), &disk_outcome.output_roots),
-        relative_roots(inventory_dir.path(), &inventory_outcome.output_roots),
+        relative_roots(disk_dir.path(), &disk_outcome.added_roots()),
+        relative_roots(inventory_dir.path(), &inventory_outcome.added_roots()),
         "same outputs must be published"
     );
     assert_eq!(
@@ -615,18 +614,23 @@ fn vanished_window_member_is_skipped_and_survivors_compacted() {
         source,
     );
 
-    let outcome = compactor.compact_once_with_changes().unwrap();
+    let outcome = RoundCapture::run(&compactor).unwrap();
     assert!(outcome.stats.compacted);
     assert_eq!(outcome.stats.windows_merged, 1);
-    assert!(!outcome.output_roots.is_empty());
+    assert!(!outcome.added_roots().is_empty());
     assert_eq!(
         outcome.stats.source_segments, 3,
         "the three surviving window members must be merged"
     );
-    assert_eq!(outcome.source_roots.len(), 3);
+    let removed = outcome.removed_roots();
+    assert_eq!(
+        removed.len(),
+        4,
+        "the three merged sources plus the retired ghost must leave the catalog: {removed:?}"
+    );
     assert!(
-        !outcome.source_roots.contains(&vanished_root),
-        "a vanished member must not be reported as a source"
+        removed.contains(&vanished_root),
+        "a vanished member is already gone from disk, but must still be retired from the catalog"
     );
 
     let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
@@ -663,7 +667,9 @@ fn corrupt_window_member_still_fails_the_round() {
         source,
     );
 
-    let err = compactor.compact_once_with_changes().unwrap_err();
+    let err = compactor
+        .compact_round_with_changes(&mut |_| {})
+        .unwrap_err();
     let message = err.to_string();
     assert!(
         message.contains("failed compaction validation"),
@@ -701,7 +707,7 @@ fn planning_reads_scale_with_window_not_inventory_size() {
     compactor.set_pass_wall_budget(Duration::ZERO);
 
     let _guard = CountingSegmentReads::install(temp_dir.path());
-    let outcome = compactor.compact_once_with_changes().unwrap();
+    let outcome = RoundCapture::run(&compactor).unwrap();
     let reads = count_segment_file_reads_under(temp_dir.path());
 
     assert!(outcome.stats.compacted);
@@ -815,12 +821,16 @@ fn vanished_member_is_evicted_and_round_converges() {
         }
     })));
 
-    let first = compactor.compact_once_with_changes().unwrap();
+    let first = RoundCapture::run(&compactor).unwrap();
     assert_eq!(first.stats.windows_merged, 1);
-    assert_eq!(
-        first.retired_roots,
-        vec![ghost_root.clone()],
-        "the vanished member must be reported as a retired root"
+    assert!(
+        first.removed_roots().contains(&ghost_root),
+        "the vanished member must leave the catalog through the window diff: {:?}",
+        first.removed_roots()
+    );
+    assert!(
+        !first.added_roots().contains(&ghost_root),
+        "a retired root must never be re-added"
     );
     assert!(
         first.stats.source_above_trigger,
@@ -833,9 +843,9 @@ fn vanished_member_is_evicted_and_round_converges() {
 
     // The pass's diff flows out of the inventory: retired and merged roots
     // leave, output roots enter.
-    let updated = apply_outcome_to_inventory(
+    let updated = apply_diff_to_inventory(
         live_inventory.lock().unwrap().clone(),
-        &first,
+        &first.diff(),
         SegmentLaneFamily::Numeric,
     );
     *live_inventory.lock().unwrap() = updated;
@@ -843,16 +853,16 @@ fn vanished_member_is_evicted_and_round_converges() {
     compactor.set_pass_wall_budget(Duration::from_secs(60));
     ghost_reads.store(0, Ordering::SeqCst);
 
-    let second = compactor.compact_once_with_changes().unwrap();
+    let second = RoundCapture::run(&compactor).unwrap();
     assert_eq!(
         ghost_reads.load(Ordering::SeqCst),
         0,
         "an already-retired ghost must not be touched again"
     );
     assert!(
-        second.retired_roots.is_empty(),
+        !second.removed_roots().contains(&ghost_root),
         "round two has no ghosts left: {:?}",
-        second.retired_roots
+        second.removed_roots()
     );
     assert!(
         second.stats.windows_merged >= 1,
@@ -997,7 +1007,7 @@ fn no_output_head_window_is_skipped_and_later_windows_merge() {
         }
     })));
 
-    let outcome = compactor.compact_once_with_changes().unwrap();
+    let outcome = RoundCapture::run(&compactor).unwrap();
     let pass_reads = head_reads.load(Ordering::SeqCst);
 
     assert_eq!(
@@ -1006,9 +1016,17 @@ fn no_output_head_window_is_skipped_and_later_windows_merge() {
     );
     assert!(outcome.stats.compacted);
     assert!(
-        outcome.retired_roots.is_empty(),
+        !outcome
+            .removed_roots()
+            .iter()
+            .any(|root| roots[..4].contains(root)),
         "a zero-output window is not a retirement: {:?}",
-        outcome.retired_roots
+        outcome.removed_roots()
+    );
+    assert_eq!(
+        outcome.windows.len(),
+        1,
+        "only the merged window may report a diff"
     );
     assert!(
         outcome.stats.source_above_trigger,
@@ -1066,13 +1084,15 @@ fn all_tombstoned_window_reports_no_output_and_parks_full_interval() {
 
     let mut compactor = Compactor::new(temp_dir.path(), 8);
     compactor.set_pass_wall_budget(Duration::from_secs(60));
-    let outcome = compactor.compact_once_with_changes().unwrap();
+    let outcome = RoundCapture::run(&compactor).unwrap();
 
     assert!(!outcome.stats.compacted);
     assert_eq!(outcome.stats.windows_merged, 0);
-    assert!(outcome.retired_roots.is_empty());
-    assert!(outcome.source_roots.is_empty());
-    assert!(outcome.output_roots.is_empty());
+    assert!(
+        outcome.windows.is_empty(),
+        "a zero-output round must not report any diff: {:?}",
+        outcome.windows
+    );
     for root in &roots {
         assert!(
             root.exists(),
@@ -1116,12 +1136,13 @@ fn ghost_member_is_evicted_once_with_full_budget() {
     compactor.set_pass_wall_budget(Duration::from_secs(60));
 
     let _guard = CountingSegmentReads::install(temp_dir.path());
-    let outcome = compactor.compact_once_with_changes().unwrap();
+    let outcome = RoundCapture::run(&compactor).unwrap();
 
+    let removed = outcome.removed_roots();
     assert_eq!(
-        outcome.retired_roots,
-        vec![ghost_root.clone()],
-        "the vanished member must be retired exactly once"
+        removed.iter().filter(|root| **root == ghost_root).count(),
+        1,
+        "the vanished member must be retired exactly once: {removed:?}"
     );
     assert_eq!(
         outcome.stats.windows_merged, 3,
@@ -1138,25 +1159,383 @@ fn ghost_member_is_evicted_once_with_full_budget() {
         .is_empty());
 }
 
+#[test]
+fn partial_failure_preserves_published_windows_diff() {
+    let temp_dir = TempDir::new().unwrap();
+    // Twelve disjoint L0 segments drain as three 4-segment windows; the middle
+    // window's member is corrupt, so the round publishes window one and then
+    // fails.
+    let roots = write_non_overlapping_l0_segments(temp_dir.path(), 12);
+    // The snapshot is the persisted index: it is taken while everything is
+    // healthy, so only the window load can discover the damage (the standalone
+    // disk-scan fallback would validate it during planning instead).
+    let inventory = scan_inventory_from_disk(temp_dir.path()).unwrap();
+    let corrupt_root = roots[5].clone();
+    let chunks_path = corrupt_root.join("chunks.bin");
+    let mut chunks_bytes = fs::read(&chunks_path).unwrap();
+    let last = chunks_bytes.len() - 1;
+    chunks_bytes[last] ^= 0xff;
+    fs::write(&chunks_path, chunks_bytes).unwrap();
+
+    let source = CompactionInventorySource::default();
+    source.set(Arc::new(move || inventory.clone()));
+    let mut compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source,
+    );
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+
+    let mut windows = Vec::new();
+    let err = compactor
+        .compact_round_with_changes(&mut |window| windows.push(window))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("failed compaction validation"),
+        "the corrupt member must fail the round: {err}"
+    );
+
+    // The window that was already replaced on disk must still be handed to the
+    // caller: dropping it on the error is what diverges disk and persisted index.
+    assert_eq!(
+        windows.len(),
+        1,
+        "the first window's diff must survive the second window's failure"
+    );
+    let published = &windows[0];
+    assert_eq!(
+        published.removed_roots,
+        roots[..4].iter().cloned().collect(),
+        "the first window's sources must be reported as removed"
+    );
+    assert_eq!(
+        published.added_roots.len(),
+        1,
+        "the first window's L1 replacement must be reported as added: {:?}",
+        published.added_roots
+    );
+    for root in &published.removed_roots {
+        assert!(
+            !root.exists(),
+            "a reported source is already gone from disk: {}",
+            root.display()
+        );
+    }
+    for root in &published.added_roots {
+        assert!(
+            root.exists(),
+            "a reported output is already published on disk: {}",
+            root.display()
+        );
+    }
+    for root in &roots[4..] {
+        assert!(
+            root.exists(),
+            "windows that never published must not be reported: {}",
+            root.display()
+        );
+    }
+}
+
+#[test]
+fn same_pass_intermediate_l1_roots_are_removed_after_being_added() {
+    let temp_dir = TempDir::new().unwrap();
+    // Four L0 windows publish four L1 outputs; the L1 trigger then consumes
+    // exactly those four in the same pass. Each L1 root is therefore both an
+    // added root (its L0 window) and a removed root (the L1→L2 window).
+    write_non_overlapping_l0_segments(temp_dir.path(), 16);
+
+    let mut compactor = Compactor::new(temp_dir.path(), 8);
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+    let capture = RoundCapture::run(&compactor).unwrap();
+
+    assert_eq!(capture.stats.windows_merged, 5);
+    assert_eq!(
+        capture.windows.len(),
+        5,
+        "one callback per merged window, in publication order"
+    );
+    assert_eq!(
+        capture.intermediate_roots.len(),
+        4,
+        "the four L1 outputs of this pass must come back as removals: {:?}",
+        capture.intermediate_roots
+    );
+
+    // `record_changes` adds before it removes. If it were the other way round,
+    // these intermediate L1 roots would stay on the added side of the
+    // accumulating diff and the persisted index would keep catalog entries for
+    // segments this pass already deleted.
+    let diff = capture.diff();
+    let l2 = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    assert_eq!(l2.len(), 1, "the four L1 outputs merge into one L2 segment");
+    assert_eq!(
+        diff.added_roots.len(),
+        1,
+        "only the L2 output may remain added: {:?}",
+        diff.added_roots
+    );
+    assert!(diff.added_roots.contains(&l2[0].root));
+    for root in &capture.intermediate_roots {
+        assert!(
+            !diff.added_roots.contains(root),
+            "an intermediate L1 root must not stay added: {}",
+            root.display()
+        );
+        assert!(
+            diff.removed_roots.contains(root),
+            "an intermediate L1 root must end up removed: {}",
+            root.display()
+        );
+    }
+    assert_eq!(
+        diff.removed_roots.len(),
+        20,
+        "16 L0 sources plus the 4 intermediate L1 roots"
+    );
+}
+
+#[test]
+fn window_gate_blocks_only_the_next_window() {
+    let temp_dir = TempDir::new().unwrap();
+    // Eight disjoint L0 segments: exactly two windows of four.
+    write_non_overlapping_l0_segments(temp_dir.path(), 8);
+
+    let gate = Arc::new(parking_lot::Mutex::new(()));
+    let mut compactor = Compactor::new(temp_dir.path(), 8).with_gate(Arc::clone(&gate));
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+
+    let (window_tx, window_rx) = std::sync::mpsc::channel::<usize>();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+
+    let worker = std::thread::spawn(move || {
+        let resume_rx = resume_rx;
+        let mut windows = 0usize;
+        let result = compactor.compact_round_with_changes(&mut |_diff| {
+            windows += 1;
+            let _ = window_tx.send(windows);
+            if windows == 1 {
+                // Hold the round between windows until the main thread has
+                // taken the gate: that is the only point where the test can
+                // prove the gate is released between windows.
+                let _ = resume_rx.recv();
+            }
+        });
+        (result, windows)
+    });
+
+    window_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("window 1 must publish within 2s");
+
+    // `on_window` runs after the window's guard is dropped, so the gate is free
+    // while the round sits between windows. Taking it here stands in for a
+    // flush/snapshot pass.
+    let held = gate
+        .try_lock_for(Duration::from_secs(2))
+        .expect("the per-window gate must be free while the callback runs");
+    resume_tx.send(()).expect("worker must still be waiting");
+
+    match window_rx.recv_timeout(Duration::from_millis(200)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        other => panic!("window 2 ran while the gate was held: {other:?}"),
+    }
+
+    drop(held);
+    assert_eq!(
+        window_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the released gate must let window 2 finish"),
+        2
+    );
+
+    let (result, windows) = worker.join().unwrap();
+    result.unwrap();
+    assert_eq!(
+        windows, 2,
+        "eight L0 segments drain over exactly two windows"
+    );
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 1).unwrap().len(),
+        2,
+        "both windows must leave their L1 output behind"
+    );
+}
+
+#[test]
+fn l1_to_l2_no_output_window_is_skipped_and_reported() {
+    let temp_dir = TempDir::new().unwrap();
+    // Four L1 segments is exactly the L1 trigger, and every point is
+    // tombstoned, so the L1→L2 window can never produce output. L0 is empty:
+    // this pins the L1 half of RULING 2 (`skipped_l1`).
+    let roots = write_l1_segments(temp_dir.path(), 4);
+
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    let mut tombstones = HashMap::new();
+    tombstones.insert(series_id, vec![TombstoneRange { start: 1, end: 5 }]);
+    persist_tombstones(&temp_dir.path().join(TOMBSTONES_FILE_NAME), &tombstones).unwrap();
+
+    let mut compactor = Compactor::new(temp_dir.path(), 8);
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+    let capture = RoundCapture::run(&compactor).unwrap();
+
+    assert!(!capture.stats.compacted);
+    assert_eq!(capture.stats.windows_merged, 0);
+    assert!(
+        capture.windows.is_empty(),
+        "a zero-output window reports no diff: {:?}",
+        capture.windows
+    );
+    for root in &roots {
+        assert!(
+            root.exists(),
+            "no-output L1 sources must stay on disk: {}",
+            root.display()
+        );
+    }
+    assert!(
+        capture.stats.source_above_trigger,
+        "the skipped L1 window still counts toward the trigger line"
+    );
+    assert_eq!(
+        compaction_park_interval(&capture.stats, Duration::from_secs(5)),
+        Duration::from_secs(5),
+        "a zero-output pass must not hot-loop"
+    );
+}
+
+#[test]
+fn backlog_drain_keeps_up_with_write_triggered_production() {
+    let temp_dir = TempDir::new().unwrap();
+    // Stand-in for ingest: every round starts 20 freshly written L0 segments on
+    // top of whatever the previous round left behind. No "N segments per second"
+    // assumption is made here — the question is only whether a round drains the
+    // backlog that exists when it starts.
+    let mut compactor = Compactor::new(temp_dir.path(), 8);
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+
+    let mut next_id = 1u64;
+    let mut observed_l0 = Vec::new();
+    for _round in 0..3 {
+        write_non_overlapping_l0_segments_from(temp_dir.path(), next_id, 20);
+        next_id += 20;
+
+        let stats = compactor.compact_round_with_changes(&mut |_| {}).unwrap();
+        let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap().len();
+        observed_l0.push(l0);
+
+        assert!(
+            stats.windows_merged >= 5,
+            "twenty fresh L0 segments must drain over at least five windows, got {}",
+            stats.windows_merged
+        );
+        assert!(
+            !stats.source_above_trigger,
+            "the round must end with nothing left above the trigger line"
+        );
+        assert!(
+            l0 < 4,
+            "the round must drain below the L0 trigger instead of falling behind \
+             (round {_round} left {l0} segments)"
+        );
+    }
+
+    // A round with no new ingest converges the same way: the backlog does not
+    // grow monotonically across rounds.
+    let stats = compactor.compact_round_with_changes(&mut |_| {}).unwrap();
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 0).unwrap().len(),
+        0,
+        "an idle round drains the last backlog: {observed_l0:?}"
+    );
+    assert_eq!(stats.windows_merged, 0, "nothing is left to merge");
+}
+
+/// One round's outcome, rebuilt from the per-window callback.
+///
+/// The round API reports each published window as it happens, so the tests can
+/// see exactly what the caller would merge: the flattened roots in callback
+/// order, and the round-level stats.
+#[derive(Debug, Default)]
+struct RoundCapture {
+    stats: CompactionRunStats,
+    /// Diffs in publication order. Empty means the round published nothing.
+    windows: Vec<PendingPersistedSegmentDiff>,
+    /// Roots an earlier window added and a later window removed: the same-pass
+    /// intermediate roots (an L1 output later consumed by L1→L2).
+    intermediate_roots: Vec<PathBuf>,
+}
+
+impl RoundCapture {
+    /// Runs one round, merging every window the way a real caller does.
+    fn run(compactor: &Compactor) -> crate::Result<Self> {
+        Self::run_observing(compactor, |_| {})
+    }
+
+    /// Runs one round and observes the cumulative diff after every window.
+    fn run_observing(
+        compactor: &Compactor,
+        mut observe_window: impl FnMut(&PendingPersistedSegmentDiff),
+    ) -> crate::Result<Self> {
+        let mut capture = Self::default();
+        let mut pending = PendingPersistedSegmentDiff::default();
+        capture.stats = compactor.compact_round_with_changes(&mut |window| {
+            for root in &window.removed_roots {
+                if pending.added_roots.contains(root) {
+                    capture.intermediate_roots.push(root.clone());
+                }
+            }
+            pending.merge(window.clone());
+            observe_window(&window);
+            capture.windows.push(window);
+        })?;
+        Ok(capture)
+    }
+
+    /// The round's diff as one accumulating diff would see it.
+    fn diff(&self) -> PendingPersistedSegmentDiff {
+        let mut merged = PendingPersistedSegmentDiff::default();
+        for window in &self.windows {
+            merged.merge(window.clone());
+        }
+        merged
+    }
+
+    fn added_roots(&self) -> Vec<PathBuf> {
+        self.windows
+            .iter()
+            .flat_map(|window| window.added_roots.iter().cloned())
+            .collect()
+    }
+
+    fn removed_roots(&self) -> Vec<PathBuf> {
+        self.windows
+            .iter()
+            .flat_map(|window| window.removed_roots.iter().cloned())
+            .collect()
+    }
+}
+
 fn write_overlapping_l0_segments(root: &std::path::Path, count: u64) {
     let _ = write_l0_segment_roots(root, count, false);
 }
 
-/// Applies a pass outcome to an inventory the way `record_changes` does:
-/// retired and merged roots leave, output roots enter.
-fn apply_outcome_to_inventory(
+/// Applies a round's diff to an inventory the way the persisted index does.
+fn apply_diff_to_inventory(
     inventory: SegmentInventory,
-    outcome: &CompactionOutcome,
+    diff: &PendingPersistedSegmentDiff,
     lane: SegmentLaneFamily,
 ) -> SegmentInventory {
-    let excluded = outcome
-        .retired_roots
-        .iter()
-        .chain(outcome.source_roots.iter())
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut entries = inventory.without_roots(&excluded).entries().to_vec();
-    for root in &outcome.output_roots {
+    let mut entries = inventory
+        .without_roots(&diff.removed_roots)
+        .entries()
+        .to_vec();
+    for root in &diff.added_roots {
         entries.push(SegmentInventoryEntry {
             lane,
             tier: PersistedSegmentTier::Hot,
@@ -1178,7 +1557,31 @@ fn write_non_overlapping_l0_segments(root: &std::path::Path, count: u64) -> Vec<
     write_l0_segment_roots(root, count, false)
 }
 
+/// Writes `count` L0 segments whose ids start at `start_id` (and whose one-point
+/// timestamps do too), so successive rounds can stand in for fresh ingest.
+fn write_non_overlapping_l0_segments_from(
+    root: &std::path::Path,
+    start_id: u64,
+    count: u64,
+) -> Vec<PathBuf> {
+    write_segment_roots(root, 0, start_id..start_id + count, false)
+}
+
+/// Writes `count` disjoint one-point L1 segments (nothing to compact from L0).
+fn write_l1_segments(root: &std::path::Path, count: u64) -> Vec<PathBuf> {
+    write_segment_roots(root, 1, 1..=count, false)
+}
+
 fn write_l0_segment_roots(root: &std::path::Path, count: u64, overlap: bool) -> Vec<PathBuf> {
+    write_segment_roots(root, 0, 1..=count, overlap)
+}
+
+fn write_segment_roots(
+    root: &std::path::Path,
+    level: u8,
+    segment_ids: impl Iterator<Item = u64>,
+    overlap: bool,
+) -> Vec<PathBuf> {
     let registry = SeriesRegistry::new();
     let series_id = registry
         .resolve_or_insert("cpu", &[Label::new("host", "a")])
@@ -1186,7 +1589,7 @@ fn write_l0_segment_roots(root: &std::path::Path, count: u64, overlap: bool) -> 
         .series_id;
 
     let mut roots = Vec::new();
-    for segment_id in 1..=count {
+    for segment_id in segment_ids {
         let points = if overlap {
             vec![(10, segment_id as f64), (20, segment_id as f64 + 0.5)]
         } else {
@@ -1196,7 +1599,7 @@ fn write_l0_segment_roots(root: &std::path::Path, count: u64, overlap: bool) -> 
         let mut chunks = HashMap::new();
         chunks.insert(series_id, vec![make_numeric_chunk(series_id, &points)]);
 
-        let writer = SegmentWriter::new(root, 0, segment_id).unwrap();
+        let writer = SegmentWriter::new(root, level, segment_id).unwrap();
         writer.write_segment(&registry, &chunks).unwrap();
         roots.push(writer.layout().root.clone());
     }

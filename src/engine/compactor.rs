@@ -16,6 +16,7 @@ use crate::engine::segment::{
 };
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::engine::storage_engine::tiering::SegmentInventory;
+use crate::engine::storage_engine::PendingPersistedSegmentDiff;
 use crate::engine::tombstone::{
     load_tombstones, timestamp_is_tombstoned, TombstoneMap, TombstoneRange, TOMBSTONES_FILE_NAME,
 };
@@ -106,16 +107,17 @@ pub(in crate::engine) fn compaction_park_interval(
     }
 }
 
+/// One rewrite's (one window's) effect, as [`Compactor::compact_segments`] and
+/// the retention rewrite report it.
+///
+/// The compaction round sums these into [`CompactionRunStats`] and turns each
+/// one into a [`PendingPersistedSegmentDiff`] handed to the round's per-window
+/// callback; nothing round-scoped is accumulated here on purpose.
 #[derive(Debug, Default)]
 pub(super) struct CompactionOutcome {
     pub(super) stats: CompactionRunStats,
     pub(super) source_roots: Vec<PathBuf>,
     pub(super) output_roots: Vec<PathBuf>,
-    /// Roots the inventory listed but that vanished before they could be
-    /// loaded. They are already gone from disk; they must still leave the
-    /// planning inventory and the catalog, so the caller folds them into the
-    /// pass's `removed_roots`.
-    pub(super) retired_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +137,7 @@ pub struct Compactor {
     next_segment_id: Option<Arc<AtomicU64>>,
     source: Option<CompactionInventorySource>,
     /// Storage-wide compaction gate, held for one window at a time by
-    /// [`Self::compact_once_with_changes`].
+    /// [`Self::compact_round_with_changes`].
     ///
     /// `None` for standalone compactors (tests, one-shot maintenance) where no
     /// other thread contends for the storage's cross-subsystem ordering.
@@ -197,7 +199,7 @@ impl Compactor {
     /// (load + merge + replacement marker + source removal) and releases it
     /// between windows, so flush/retention/snapshot can interleave instead of
     /// waiting for a whole round. `parking_lot::Mutex` is not reentrant, so a
-    /// caller of [`Self::compact_once_with_changes`] must not hold this same
+    /// caller of [`Self::compact_round_with_changes`] must not hold this same
     /// gate itself.
     pub(in crate::engine) fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
         self.gate = Some(gate);
@@ -229,8 +231,13 @@ impl Compactor {
         Ok(self.compact_once_with_stats()?.compacted)
     }
 
+    /// Stats of one round, without a diff consumer.
+    ///
+    /// The internal compaction call sites use [`Self::compact_round_with_changes`]
+    /// directly: they must merge each published window's diff as it happens, not
+    /// only if the whole round succeeds.
     pub fn compact_once_with_stats(&self) -> Result<CompactionRunStats> {
-        Ok(self.compact_once_with_changes()?.stats)
+        self.compact_round_with_changes(&mut |_| {})
     }
 }
 

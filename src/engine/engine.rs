@@ -78,9 +78,8 @@ mod visibility;
 mod write_buffer;
 
 use config::ChunkStorageOptions;
-pub(in crate::engine::storage_engine) use construction::{
-    PendingPersistedSegmentDiff, RemoteCatalogRefreshState,
-};
+pub(in crate::engine) use construction::PendingPersistedSegmentDiff;
+pub(in crate::engine::storage_engine) use construction::RemoteCatalogRefreshState;
 pub(in crate::engine::storage_engine) use core_impl::{
     current_unix_millis_u64, duration_to_timestamp_units, elapsed_nanos_u64, lane_for_value,
     partition_id_for_timestamp, persisted_chunk_payload, saturating_u64_from_usize,

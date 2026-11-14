@@ -29,16 +29,23 @@ impl<'a> LifecycleShutdownContext<'a> {
         // reentrant.
         let mut passes = 0usize;
         for _ in 0..max_passes.max(1) {
-            let (changes, _stats) = ChunkStorage::compact_compactors_with_changes(
+            let mut published = false;
+            ChunkStorage::compact_compactors_with_changes(
                 self.numeric_compactor,
                 self.blob_compactor,
                 Some(self.observability),
+                &mut |window| {
+                    published = true;
+                    ChunkStorage::merge_published_window(
+                        self.pending_persisted_segment_diff,
+                        self.persisted_index_dirty,
+                        window,
+                    );
+                },
             )?;
-            if changes.is_empty() {
+            if !published {
                 break;
             }
-            self.pending_persisted_segment_diff.lock().merge(changes);
-            self.persisted_index_dirty.store(true, Ordering::SeqCst);
             passes = passes.saturating_add(1);
         }
         Ok(passes)
@@ -68,47 +75,62 @@ impl ChunkStorage {
         }
     }
 
+    /// Applies one published window's diff to the storage's catalog state.
+    ///
+    /// This is the partial-failure contract's sink: the merge happens as soon
+    /// as the window is published, so a later window's error can no longer drop
+    /// an already-published window's roots. Every caller must use it per window
+    /// instead of merging a round-level diff at the end.
+    pub(in super::super) fn merge_published_window(
+        pending_persisted_segment_diff: &Mutex<PendingPersistedSegmentDiff>,
+        persisted_index_dirty: &AtomicBool,
+        window: PendingPersistedSegmentDiff,
+    ) {
+        pending_persisted_segment_diff.lock().merge(window);
+        persisted_index_dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// Runs one pass per lane, handing every published window's diff to
+    /// `on_window` as soon as that window's publication is complete.
+    ///
+    /// The callback is `&mut dyn FnMut` so a lane can hand its windows over
+    /// without buffering them: the diff of an already-published window survives
+    /// even when a later window (of this lane or the other one) fails and the
+    /// pass returns `Err`.
     pub(in super::super) fn compact_compactors_with_changes(
         numeric_compactor: Option<&Compactor>,
         blob_compactor: Option<&Compactor>,
         observability: Option<&StorageObservabilityCounters>,
-    ) -> Result<(PendingPersistedSegmentDiff, CompactionRunStats)> {
-        let mut changes = PendingPersistedSegmentDiff::default();
+        on_window: &mut dyn FnMut(PendingPersistedSegmentDiff),
+    ) -> Result<CompactionRunStats> {
         let mut stats = CompactionRunStats::default();
         if let Some(compactor) = numeric_compactor {
-            let (lane_changes, lane_stats) = Self::run_compactor_once(compactor, observability)?;
-            changes.merge(lane_changes);
+            let lane_stats = Self::run_compactor_once(compactor, observability, on_window)?;
             accumulate_run_stats(&mut stats, lane_stats);
         }
         if let Some(compactor) = blob_compactor {
-            let (lane_changes, lane_stats) = Self::run_compactor_once(compactor, observability)?;
-            changes.merge(lane_changes);
+            let lane_stats = Self::run_compactor_once(compactor, observability, on_window)?;
             accumulate_run_stats(&mut stats, lane_stats);
         }
-        Ok((changes, stats))
+        Ok(stats)
     }
 
     fn run_compactor_once(
         compactor: &Compactor,
         observability: Option<&StorageObservabilityCounters>,
-    ) -> Result<(PendingPersistedSegmentDiff, CompactionRunStats)> {
+        on_window: &mut dyn FnMut(PendingPersistedSegmentDiff),
+    ) -> Result<CompactionRunStats> {
         let started = Instant::now();
-        match compactor.compact_once_with_changes() {
-            Ok(outcome) => {
-                let stats = outcome.stats;
+        // Observability is recorded once per lane-round with the round's window
+        // sums (never per window, which is what a per-window callback would make
+        // easy to get wrong); a failing round records one error and stops the
+        // pass, so the two lanes never double-report an error.
+        match compactor.compact_round_with_changes(on_window) {
+            Ok(stats) => {
                 if let Some(obs) = observability {
                     obs.record_compaction_result(stats, elapsed_nanos_u64(started));
                 }
-                let mut changes = PendingPersistedSegmentDiff::default();
-                if stats.compacted || !outcome.retired_roots.is_empty() {
-                    // Vanished window members are already gone from disk, but
-                    // they must still leave the inventory and the catalog,
-                    // otherwise every pass re-selects the same ghosts.
-                    let mut removed = outcome.source_roots;
-                    removed.extend(outcome.retired_roots);
-                    changes.record_changes(outcome.output_roots, removed);
-                }
-                Ok((changes, stats))
+                Ok(stats)
             }
             Err(err) => {
                 if let Some(obs) = observability {
@@ -168,9 +190,14 @@ impl ChunkStorage {
 
 /// Folds one lane's pass statistics into the pass total.
 ///
-/// Only `windows_merged` and `source_above_trigger` drive the worker's park
-/// decision, but the whole struct is summed so the aggregate stays meaningful
-/// for future consumers.
+/// `windows_merged` and `source_above_trigger` drive the worker's park decision;
+/// they are summed and OR-ed respectively. The remaining counters are summed so
+/// the aggregate stays meaningful for the observability snapshot.
+///
+/// `source_level` / `target_level` are *or-ed*, not summed: they name one
+/// (source, target) pair, so the aggregate reports the first lane that had one
+/// and keeps it even when the other lane compacted a different pair. Consumers
+/// must treat them as "some pair", not as a per-lane list.
 fn accumulate_run_stats(total: &mut CompactionRunStats, lane: CompactionRunStats) {
     total.compacted |= lane.compacted;
     total.source_level = total.source_level.or(lane.source_level);

@@ -8,7 +8,8 @@ mod resources;
 use self::assembly::StorageStateAssembly;
 use self::resources::StorageAssemblyResources;
 
-pub(super) use self::resources::{PendingPersistedSegmentDiff, RemoteCatalogRefreshState};
+pub(in crate::engine) use self::resources::PendingPersistedSegmentDiff;
+pub(super) use self::resources::RemoteCatalogRefreshState;
 
 impl ChunkStorage {
     pub fn try_new(chunk_point_cap: usize, wal: Option<FramedWal>) -> Result<Self> {
