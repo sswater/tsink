@@ -1,5 +1,7 @@
 use super::super::*;
 use super::{PendingPersistedSegmentDiff, RemoteCatalogRefreshState, StorageAssemblyResources};
+use crate::engine::compactor::CompactionInventorySource;
+use crate::engine::storage_engine::tiering::SegmentInventory;
 
 pub(super) struct StorageStateAssembly {
     pub(super) catalog: CatalogState,
@@ -28,6 +30,7 @@ impl StorageStateAssembly {
             next_segment_id,
             numeric_compactor,
             blob_compactor,
+            compaction_inventory_source,
             lifecycle,
             compaction_lock,
             compaction_thread,
@@ -36,24 +39,27 @@ impl StorageStateAssembly {
             observability,
         } = resources;
 
+        let persisted = Self::build_persisted_storage_state(
+            numeric_lane_path,
+            blob_lane_path,
+            series_index_path.clone(),
+            next_segment_id,
+            numeric_compactor,
+            blob_compactor,
+            wal,
+            options.tiered_storage.clone(),
+            options.remote_segment_cache_policy,
+            options.remote_segment_refresh_interval,
+            persisted_index_dirty,
+            pending_persisted_segment_diff,
+        );
+        Self::inject_compaction_inventory_source(&persisted, &compaction_inventory_source);
+
         Self {
             catalog: Self::build_catalog_state(options.metadata_shard_count),
             chunks: Self::build_chunk_buffer_state(chunk_point_cap),
             visibility: ChunkStorage::build_visibility_state(),
-            persisted: Self::build_persisted_storage_state(
-                numeric_lane_path,
-                blob_lane_path,
-                series_index_path.clone(),
-                next_segment_id,
-                numeric_compactor,
-                blob_compactor,
-                wal,
-                options.tiered_storage.clone(),
-                options.remote_segment_cache_policy,
-                options.remote_segment_refresh_interval,
-                persisted_index_dirty,
-                pending_persisted_segment_diff,
-            ),
+            persisted,
             runtime: Self::build_runtime_config_state(options),
             memory: Self::build_memory_accounting_state(options),
             coordination: Self::build_coordination_state(lifecycle, compaction_lock),
@@ -64,6 +70,24 @@ impl StorageStateAssembly {
             rollups: Self::build_rollup_state(series_index_path),
             observability,
         }
+    }
+
+    /// Publishes the storage's persisted index to the compaction inventory
+    /// source.
+    ///
+    /// The provider captures the `Arc`-shared index handle instead of the
+    /// storage value because assembly only holds by-value state; it is the same
+    /// lock the storage publishes into. It takes the read lock only, and must
+    /// never be called while that lock (or the compaction gate) is held by the
+    /// caller.
+    fn inject_compaction_inventory_source(
+        persisted: &PersistedStorageState,
+        source: &CompactionInventorySource,
+    ) {
+        let persisted_index = Arc::clone(&persisted.persisted_index);
+        source.set(Arc::new(move || {
+            SegmentInventory::from_persisted_index(&persisted_index.read())
+        }));
     }
 
     fn build_catalog_state(metadata_shard_count: Option<u32>) -> CatalogState {
@@ -103,7 +127,7 @@ impl StorageStateAssembly {
         pending_persisted_segment_diff: Arc<Mutex<PendingPersistedSegmentDiff>>,
     ) -> PersistedStorageState {
         PersistedStorageState {
-            persisted_index: RwLock::new(PersistedIndexState::default()),
+            persisted_index: Arc::new(RwLock::new(PersistedIndexState::default())),
             persisted_index_dirty,
             numeric_lane_path,
             blob_lane_path,

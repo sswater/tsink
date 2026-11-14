@@ -1,4 +1,4 @@
-use super::super::tiering::{self, PersistedSegmentTier, SegmentInventory, SegmentInventoryEntry};
+use super::super::tiering::{self, PersistedSegmentTier, SegmentInventory};
 #[cfg(test)]
 use super::super::Arc;
 use super::super::{
@@ -163,19 +163,7 @@ impl<'a> CatalogRefreshContext<'a> {
     }
 
     pub(super) fn persisted_segment_inventory(self) -> SegmentInventory {
-        let entries = self
-            .persisted_index
-            .read()
-            .segments_by_root
-            .iter()
-            .map(|(root, state)| SegmentInventoryEntry {
-                lane: state.lane,
-                tier: state.tier,
-                root: root.clone(),
-                manifest: state.manifest.clone(),
-            })
-            .collect::<Vec<_>>();
-        SegmentInventory::from_entries(entries)
+        SegmentInventory::from_persisted_index(&self.persisted_index.read())
     }
 
     fn capture_persisted_catalog_refresh_snapshot(self) -> Result<PersistedCatalogRefreshSnapshot> {

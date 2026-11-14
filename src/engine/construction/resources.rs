@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::compactor::CompactionInventorySource;
 use std::time::Instant;
 
 pub(in crate::engine::storage_engine) struct StorageAssemblyResources {
@@ -6,6 +7,7 @@ pub(in crate::engine::storage_engine) struct StorageAssemblyResources {
     pub(in crate::engine::storage_engine) next_segment_id: Arc<AtomicU64>,
     pub(in crate::engine::storage_engine) numeric_compactor: Option<Compactor>,
     pub(in crate::engine::storage_engine) blob_compactor: Option<Compactor>,
+    pub(in crate::engine::storage_engine) compaction_inventory_source: CompactionInventorySource,
     pub(in crate::engine::storage_engine) lifecycle: Arc<AtomicU8>,
     pub(in crate::engine::storage_engine) compaction_lock: Arc<Mutex<()>>,
     pub(in crate::engine::storage_engine) compaction_thread: Option<std::thread::JoinHandle<()>>,
@@ -69,18 +71,21 @@ impl ChunkStorage {
             blob_lane_path.map(|path| path.as_path()),
         );
         let next_segment_id = Arc::new(AtomicU64::new(next_segment_id.max(1)));
+        let compaction_inventory_source = CompactionInventorySource::default();
         let numeric_compactor = numeric_lane_path.map(|path| {
-            Compactor::new_with_segment_id_allocator(
+            Compactor::new_with_inventory_source(
                 path,
                 chunk_point_cap,
                 Arc::clone(&next_segment_id),
+                compaction_inventory_source.clone(),
             )
         });
         let blob_compactor = blob_lane_path.map(|path| {
-            Compactor::new_with_segment_id_allocator(
+            Compactor::new_with_inventory_source(
                 path,
                 chunk_point_cap,
                 Arc::clone(&next_segment_id),
+                compaction_inventory_source.clone(),
             )
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
@@ -110,6 +115,7 @@ impl ChunkStorage {
             next_segment_id,
             numeric_compactor,
             blob_compactor,
+            compaction_inventory_source,
             lifecycle,
             compaction_lock,
             compaction_thread,

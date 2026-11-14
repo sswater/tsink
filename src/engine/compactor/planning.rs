@@ -3,6 +3,13 @@ use tracing::warn;
 
 impl Compactor {
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
+        // Skip before any disk access: the background compaction thread wakes up
+        // before the inventory provider is injected, and must not fall back to an
+        // O(N) scan in that window.
+        let Some(_inventory) = self.planning_inventory()? else {
+            return Ok(CompactionOutcome::default());
+        };
+
         finalize_pending_compaction_replacements(&self.data_path)?;
         let tombstones = load_tombstones(&self.data_path.join(TOMBSTONES_FILE_NAME))?;
 

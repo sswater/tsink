@@ -1,30 +1,40 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::super::{BLOB_LANE_ROOT, NUMERIC_LANE_ROOT};
+use super::super::{PersistedIndexState, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT};
 use crate::engine::segment::SegmentManifest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(in crate::engine::storage_engine) enum SegmentLaneFamily {
+pub(in crate::engine) enum SegmentLaneFamily {
     Numeric,
     Blob,
 }
 
 impl SegmentLaneFamily {
-    pub(in crate::engine::storage_engine) fn root_name(self) -> &'static str {
+    pub(in crate::engine) fn root_name(self) -> &'static str {
         match self {
             Self::Numeric => NUMERIC_LANE_ROOT,
             Self::Blob => BLOB_LANE_ROOT,
+        }
+    }
+
+    /// Classifies a lane root (`.../lane_numeric`, `.../lane_blob`).
+    ///
+    /// Unknown roots are treated as numeric, matching compaction's default lane.
+    pub(in crate::engine) fn for_lane_root(lane_root: &Path) -> Self {
+        match lane_root.file_name().and_then(|name| name.to_str()) {
+            Some(BLOB_LANE_ROOT) => Self::Blob,
+            _ => Self::Numeric,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(in crate::engine::storage_engine) enum PersistedSegmentTier {
+pub(in crate::engine) enum PersistedSegmentTier {
     Hot,
     Warm,
     Cold,
@@ -41,22 +51,20 @@ impl PersistedSegmentTier {
 }
 
 #[derive(Debug, Clone)]
-pub(in crate::engine::storage_engine) struct SegmentInventoryEntry {
-    pub(in crate::engine::storage_engine) lane: SegmentLaneFamily,
-    pub(in crate::engine::storage_engine) tier: PersistedSegmentTier,
-    pub(in crate::engine::storage_engine) root: PathBuf,
-    pub(in crate::engine::storage_engine) manifest: SegmentManifest,
+pub(in crate::engine) struct SegmentInventoryEntry {
+    pub(in crate::engine) lane: SegmentLaneFamily,
+    pub(in crate::engine) tier: PersistedSegmentTier,
+    pub(in crate::engine) root: PathBuf,
+    pub(in crate::engine) manifest: SegmentManifest,
 }
 
 #[derive(Debug, Default, Clone)]
-pub(in crate::engine::storage_engine) struct SegmentInventory {
+pub(in crate::engine) struct SegmentInventory {
     entries: Vec<SegmentInventoryEntry>,
 }
 
 impl SegmentInventory {
-    pub(in crate::engine::storage_engine) fn from_entries(
-        mut entries: Vec<SegmentInventoryEntry>,
-    ) -> Self {
+    pub(in crate::engine) fn from_entries(mut entries: Vec<SegmentInventoryEntry>) -> Self {
         entries.sort_by(|a, b| {
             (
                 a.lane,
@@ -76,21 +84,37 @@ impl SegmentInventory {
         Self { entries }
     }
 
-    pub(in crate::engine::storage_engine) fn entries(&self) -> &[SegmentInventoryEntry] {
+    /// Materializes the inventory from the published persisted index.
+    ///
+    /// Callers must not already hold any guard over the same `RwLock`.
+    pub(in crate::engine::storage_engine) fn from_persisted_index(
+        persisted_index: &PersistedIndexState,
+    ) -> Self {
+        let entries = persisted_index
+            .segments_by_root
+            .iter()
+            .map(|(root, state)| SegmentInventoryEntry {
+                lane: state.lane,
+                tier: state.tier,
+                root: root.clone(),
+                manifest: state.manifest.clone(),
+            })
+            .collect::<Vec<_>>();
+        Self::from_entries(entries)
+    }
+
+    pub(in crate::engine) fn entries(&self) -> &[SegmentInventoryEntry] {
         &self.entries
     }
 
-    pub(in crate::engine::storage_engine) fn root_set(&self) -> BTreeSet<PathBuf> {
+    pub(in crate::engine) fn root_set(&self) -> BTreeSet<PathBuf> {
         self.entries
             .iter()
             .map(|entry| entry.root.clone())
             .collect()
     }
 
-    pub(in crate::engine::storage_engine) fn roots_for_lane(
-        &self,
-        lane: SegmentLaneFamily,
-    ) -> Vec<PathBuf> {
+    pub(in crate::engine) fn roots_for_lane(&self, lane: SegmentLaneFamily) -> Vec<PathBuf> {
         let mut roots = self
             .entries
             .iter()
@@ -101,7 +125,7 @@ impl SegmentInventory {
         roots
     }
 
-    pub(in crate::engine::storage_engine) fn tier_counts(&self) -> (u64, u64, u64) {
+    pub(in crate::engine) fn tier_counts(&self) -> (u64, u64, u64) {
         let mut hot = 0u64;
         let mut warm = 0u64;
         let mut cold = 0u64;
@@ -115,10 +139,7 @@ impl SegmentInventory {
         (hot, warm, cold)
     }
 
-    pub(in crate::engine::storage_engine) fn without_roots(
-        &self,
-        excluded_roots: &BTreeSet<PathBuf>,
-    ) -> Self {
+    pub(in crate::engine) fn without_roots(&self, excluded_roots: &BTreeSet<PathBuf>) -> Self {
         Self::from_entries(
             self.entries
                 .iter()

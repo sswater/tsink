@@ -16,6 +16,7 @@ use crate::engine::segment::{
     PersistedSeries, SegmentValidationContext, SegmentWriter,
 };
 use crate::engine::series::{SeriesId, SeriesRegistry};
+use crate::engine::storage_engine::tiering::SegmentInventory;
 use crate::engine::tombstone::{
     load_tombstones, timestamp_is_tombstoned, TombstoneMap, TombstoneRange, TOMBSTONES_FILE_NAME,
 };
@@ -24,10 +25,16 @@ use serde::{Deserialize, Serialize};
 
 #[path = "compactor/execution.rs"]
 mod execution;
+#[path = "compactor/inventory_source.rs"]
+mod inventory_source;
 #[path = "compactor/planning.rs"]
 mod planning;
 
 pub(in crate::engine) use self::execution::finalize_pending_compaction_replacements;
+#[allow(unused_imports)]
+pub(in crate::engine) use self::inventory_source::{
+    scan_inventory_from_disk, CompactionInventorySource, InventoryProvider,
+};
 
 const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
@@ -58,6 +65,8 @@ pub struct CompactionRunStats {
     pub output_chunks: usize,
     pub source_points: usize,
     pub output_points: usize,
+    pub windows_merged: u32,
+    pub source_above_trigger: bool,
 }
 
 #[allow(dead_code)]
@@ -82,6 +91,7 @@ pub struct Compactor {
     l0_trigger: usize,
     l1_trigger: usize,
     next_segment_id: Option<Arc<AtomicU64>>,
+    source: Option<CompactionInventorySource>,
 }
 
 impl Compactor {
@@ -92,6 +102,7 @@ impl Compactor {
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: None,
+            source: None,
         }
     }
 
@@ -106,6 +117,35 @@ impl Compactor {
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
             next_segment_id: Some(next_segment_id),
+            source: None,
+        }
+    }
+
+    pub(in crate::engine) fn new_with_inventory_source(
+        data_path: impl AsRef<Path>,
+        point_cap: usize,
+        next_segment_id: Arc<AtomicU64>,
+        source: CompactionInventorySource,
+    ) -> Self {
+        Self {
+            data_path: data_path.as_ref().to_path_buf(),
+            point_cap: point_cap.clamp(1, u16::MAX as usize),
+            l0_trigger: DEFAULT_L0_TRIGGER,
+            l1_trigger: DEFAULT_L1_TRIGGER,
+            next_segment_id: Some(next_segment_id),
+            source: Some(source),
+        }
+    }
+
+    /// Inventory to plan this round from.
+    ///
+    /// `Ok(None)` means "no snapshot injected yet" and makes the pass skip
+    /// before any disk access. Without a source (standalone compactor), the
+    /// inventory is rebuilt from disk — the same scan used for reconciliation.
+    fn planning_inventory(&self) -> Result<Option<SegmentInventory>> {
+        match self.source.as_ref() {
+            None => Ok(Some(scan_inventory_from_disk(&self.data_path)?)),
+            Some(source) => Ok(source.snapshot()),
         }
     }
 

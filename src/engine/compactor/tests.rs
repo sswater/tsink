@@ -5,13 +5,18 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
-use super::{execution, finalize_pending_compaction_replacements, Compactor};
+use super::{
+    execution, finalize_pending_compaction_replacements, scan_inventory_from_disk,
+    CompactionInventorySource, Compactor,
+};
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::encoder::Encoder;
+use crate::engine::fs_utils::{count_segment_file_reads_under, CountingSegmentReads};
 use crate::engine::segment::{
     load_segments, load_segments_for_level, SegmentWriter, WalHighWatermark,
 };
 use crate::engine::series::{SeriesRegistry, SeriesValueFamily};
+use crate::engine::storage_engine::tiering::{PersistedSegmentTier, SegmentLaneFamily};
 use crate::engine::tombstone::{persist_tombstones, TombstoneRange, TOMBSTONES_FILE_NAME};
 use crate::{
     HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, NativeHistogram, Value,
@@ -421,6 +426,125 @@ fn finalize_pending_replacements_removes_marked_source_segments() {
         !marker_path.exists(),
         "replacement marker should be removed after apply"
     );
+}
+
+#[test]
+fn compactor_skips_round_until_inventory_source_is_set() {
+    let temp_dir = TempDir::new().unwrap();
+    write_overlapping_l0_segments(temp_dir.path(), 6);
+
+    let compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        CompactionInventorySource::default(),
+    );
+
+    let _guard = CountingSegmentReads::install(temp_dir.path());
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(!stats.compacted);
+    assert_eq!(stats.windows_merged, 0);
+    assert_eq!(
+        count_segment_file_reads_under(temp_dir.path()),
+        0,
+        "注入前不得扫盘"
+    );
+}
+
+#[test]
+fn disk_scan_inventory_fills_lane_and_tier() {
+    let temp_dir = TempDir::new().unwrap();
+    write_overlapping_l0_segments(temp_dir.path(), 2);
+
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "b")])
+        .unwrap()
+        .series_id;
+    let mut l1_chunks = HashMap::new();
+    l1_chunks.insert(series_id, vec![make_numeric_chunk(series_id, &[(1, 1.0)])]);
+    SegmentWriter::new(temp_dir.path(), 1, 3)
+        .unwrap()
+        .write_segment(&registry, &l1_chunks)
+        .unwrap();
+
+    let inventory = scan_inventory_from_disk(temp_dir.path()).unwrap();
+    let levels = inventory
+        .entries()
+        .iter()
+        .map(|entry| entry.manifest.level)
+        .collect::<Vec<_>>();
+    assert_eq!(levels, vec![0, 0, 1]);
+    assert!(inventory
+        .entries()
+        .iter()
+        .all(|entry| entry.lane == SegmentLaneFamily::Numeric
+            && entry.tier == PersistedSegmentTier::Hot));
+
+    let blob_root = temp_dir.path().join("lane_blob");
+    let mut blob_chunks = HashMap::new();
+    blob_chunks.insert(series_id, vec![make_histogram_chunk(series_id, &[1, 2])]);
+    SegmentWriter::new(&blob_root, 0, 1)
+        .unwrap()
+        .write_segment(&registry, &blob_chunks)
+        .unwrap();
+
+    let blob_inventory = scan_inventory_from_disk(&blob_root).unwrap();
+    assert_eq!(blob_inventory.entries().len(), 1);
+    assert_eq!(blob_inventory.entries()[0].lane, SegmentLaneFamily::Blob);
+    assert_eq!(blob_inventory.entries()[0].tier, PersistedSegmentTier::Hot);
+}
+
+#[test]
+fn injected_inventory_source_falls_through_to_existing_planning() {
+    let temp_dir = TempDir::new().unwrap();
+    write_overlapping_l0_segments(temp_dir.path(), 6);
+
+    let source = CompactionInventorySource::default();
+    let compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source.clone(),
+    );
+    let scan_root = temp_dir.path().to_path_buf();
+    source.set(Arc::new(move || {
+        scan_inventory_from_disk(scan_root.as_path()).unwrap()
+    }));
+
+    let stats = compactor.compact_once_with_stats().unwrap();
+    assert!(stats.compacted);
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 0).unwrap().len(),
+        2
+    );
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 1).unwrap().len(),
+        1
+    );
+}
+
+fn write_overlapping_l0_segments(root: &std::path::Path, count: u64) {
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    for segment_id in 1..=count {
+        let mut chunks = HashMap::new();
+        chunks.insert(
+            series_id,
+            vec![make_numeric_chunk(
+                series_id,
+                &[(segment_id as i64, segment_id as f64)],
+            )],
+        );
+        SegmentWriter::new(root, 0, segment_id)
+            .unwrap()
+            .write_segment(&registry, &chunks)
+            .unwrap();
+    }
 }
 
 fn make_numeric_chunk(series_id: u64, points: &[(i64, f64)]) -> Chunk {

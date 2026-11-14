@@ -18,7 +18,7 @@ pub(super) use discovery::{
     build_segment_inventory_fail_on_invalid, build_segment_inventory_runtime_strict,
     build_segment_inventory_startup_recoverable, StartupRecoveredSegmentInventory,
 };
-pub(super) use inventory::{
+pub(in crate::engine) use inventory::{
     PersistedSegmentTier, SegmentInventory, SegmentInventoryEntry, SegmentLaneFamily,
 };
 pub(super) use layout::{destination_segment_root, move_segment_to_tier, SegmentPathResolver};

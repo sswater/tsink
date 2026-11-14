@@ -279,6 +279,7 @@ impl Compactor {
                     output_chunks: 0,
                     source_points,
                     output_points: 0,
+                    ..CompactionRunStats::default()
                 },
                 source_roots,
                 output_roots: Vec::new(),
@@ -376,6 +377,7 @@ impl Compactor {
                     output_chunks: emitted_chunks,
                     source_points,
                     output_points: emitted_points,
+                    ..CompactionRunStats::default()
                 },
                 source_roots,
                 output_roots,
@@ -399,6 +401,7 @@ impl Compactor {
                 output_chunks: emitted_chunks,
                 source_points,
                 output_points: emitted_points,
+                ..CompactionRunStats::default()
             },
             source_roots,
             output_roots,

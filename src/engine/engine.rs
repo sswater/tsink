@@ -173,7 +173,7 @@ struct VisibilityState {
 
 /// Persisted segment inventory, WAL handles, and remote refresh state.
 struct PersistedStorageState {
-    persisted_index: RwLock<PersistedIndexState>,
+    persisted_index: Arc<RwLock<PersistedIndexState>>,
     persisted_index_dirty: Arc<AtomicBool>,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,
