@@ -20,6 +20,7 @@ use crate::engine::tombstone::{
     load_tombstones, timestamp_is_tombstoned, TombstoneMap, TombstoneRange, TOMBSTONES_FILE_NAME,
 };
 use crate::{Result, TsinkError};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 #[path = "compactor/execution.rs"]
@@ -45,6 +46,12 @@ const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
 /// drains at least one window per pass. Back-to-back passes (not a bigger
 /// budget) are what keep the drain rate up.
 const DEFAULT_COMPACTION_PASS_WALL_BUDGET: Duration = Duration::from_secs(1);
+/// Park duration for the background compaction worker after a pass that made
+/// progress while sources are still above their trigger line.
+///
+/// A backlogged, productive pass parks for 1ms so consecutive passes drain
+/// back-to-back instead of waiting a full interval per window.
+pub(in crate::engine) const COMPACTION_BACKLOG_PARK: Duration = Duration::from_millis(1);
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -72,6 +79,31 @@ pub struct CompactionRunStats {
     pub output_points: usize,
     pub windows_merged: u32,
     pub source_above_trigger: bool,
+}
+
+/// How long the background compaction worker parks after one pass.
+///
+/// The decision is keyed on *progress*, not on the backlog alone: a pass that
+/// merged no window parks the full interval even when sources remain above
+/// their trigger line. That is what keeps a window that can never produce
+/// output (every point tombstoned) from becoming a 1ms hot loop that reloads
+/// the same window forever — it is exactly today's idle tick for every
+/// no-progress pass.
+///
+/// A productive pass with sources still above their trigger parks
+/// [`COMPACTION_BACKLOG_PARK`] so passes run back-to-back and the drain keeps
+/// up with ingest.
+pub(in crate::engine) fn compaction_park_interval(
+    stats: &CompactionRunStats,
+    interval: Duration,
+) -> Duration {
+    if stats.windows_merged == 0 {
+        interval
+    } else if stats.source_above_trigger {
+        COMPACTION_BACKLOG_PARK
+    } else {
+        interval
+    }
 }
 
 #[derive(Debug, Default)]
@@ -102,6 +134,12 @@ pub struct Compactor {
     pass_wall_budget: Duration,
     next_segment_id: Option<Arc<AtomicU64>>,
     source: Option<CompactionInventorySource>,
+    /// Storage-wide compaction gate, held for one window at a time by
+    /// [`Self::compact_once_with_changes`].
+    ///
+    /// `None` for standalone compactors (tests, one-shot maintenance) where no
+    /// other thread contends for the storage's cross-subsystem ordering.
+    gate: Option<Arc<Mutex<()>>>,
 }
 
 impl Compactor {
@@ -114,6 +152,7 @@ impl Compactor {
             pass_wall_budget: DEFAULT_COMPACTION_PASS_WALL_BUDGET,
             next_segment_id: None,
             source: None,
+            gate: None,
         }
     }
 
@@ -130,6 +169,7 @@ impl Compactor {
             pass_wall_budget: DEFAULT_COMPACTION_PASS_WALL_BUDGET,
             next_segment_id: Some(next_segment_id),
             source: None,
+            gate: None,
         }
     }
 
@@ -147,7 +187,21 @@ impl Compactor {
             pass_wall_budget: DEFAULT_COMPACTION_PASS_WALL_BUDGET,
             next_segment_id: Some(next_segment_id),
             source: Some(source),
+            gate: None,
         }
+    }
+
+    /// Shares the storage's compaction gate with this compactor.
+    ///
+    /// The pass then holds the gate for exactly one window step at a time
+    /// (load + merge + replacement marker + source removal) and releases it
+    /// between windows, so flush/retention/snapshot can interleave instead of
+    /// waiting for a whole round. `parking_lot::Mutex` is not reentrant, so a
+    /// caller of [`Self::compact_once_with_changes`] must not hold this same
+    /// gate itself.
+    pub(in crate::engine) fn with_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// Overrides the per-pass wall-clock budget.

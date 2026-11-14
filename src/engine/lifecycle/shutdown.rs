@@ -5,7 +5,6 @@ use std::sync::atomic::AtomicBool;
 #[derive(Clone, Copy)]
 struct LifecycleShutdownContext<'a> {
     background_maintenance_lock: &'a Mutex<()>,
-    compaction_lock: &'a Mutex<()>,
     write_limiter: &'a crate::concurrency::Semaphore,
     write_timeout: std::time::Duration,
     numeric_compactor: Option<&'a Compactor>,
@@ -20,19 +19,17 @@ impl<'a> LifecycleShutdownContext<'a> {
         self.background_maintenance_lock.lock()
     }
 
-    fn compaction_gate(self) -> MutexGuard<'a, ()> {
-        self.compaction_lock.lock()
-    }
-
     fn acquire_close_write_permits(self) -> Result<Vec<crate::concurrency::SemaphoreGuard<'a>>> {
         self.write_limiter.acquire_all(self.write_timeout)
     }
 
     fn compact_until_settled(self, max_passes: usize) -> Result<usize> {
-        let _compaction_guard = self.compaction_gate();
+        // The compactor holds the compaction gate per window itself. Taking it
+        // here as well would self-deadlock: `parking_lot::Mutex` is not
+        // reentrant.
         let mut passes = 0usize;
         for _ in 0..max_passes.max(1) {
-            let changes = ChunkStorage::compact_compactors_with_changes(
+            let (changes, _stats) = ChunkStorage::compact_compactors_with_changes(
                 self.numeric_compactor,
                 self.blob_compactor,
                 Some(self.observability),
@@ -61,7 +58,6 @@ impl ChunkStorage {
     fn lifecycle_shutdown_context(&self) -> LifecycleShutdownContext<'_> {
         LifecycleShutdownContext {
             background_maintenance_lock: &self.coordination.background_maintenance_lock,
-            compaction_lock: self.coordination.compaction_lock.as_ref(),
             write_limiter: &self.runtime.write_limiter,
             write_timeout: self.runtime.write_timeout,
             numeric_compactor: self.persisted.numeric_compactor.as_ref(),
@@ -76,21 +72,26 @@ impl ChunkStorage {
         numeric_compactor: Option<&Compactor>,
         blob_compactor: Option<&Compactor>,
         observability: Option<&StorageObservabilityCounters>,
-    ) -> Result<PendingPersistedSegmentDiff> {
+    ) -> Result<(PendingPersistedSegmentDiff, CompactionRunStats)> {
         let mut changes = PendingPersistedSegmentDiff::default();
+        let mut stats = CompactionRunStats::default();
         if let Some(compactor) = numeric_compactor {
-            changes.merge(Self::run_compactor_once(compactor, observability)?);
+            let (lane_changes, lane_stats) = Self::run_compactor_once(compactor, observability)?;
+            changes.merge(lane_changes);
+            accumulate_run_stats(&mut stats, lane_stats);
         }
         if let Some(compactor) = blob_compactor {
-            changes.merge(Self::run_compactor_once(compactor, observability)?);
+            let (lane_changes, lane_stats) = Self::run_compactor_once(compactor, observability)?;
+            changes.merge(lane_changes);
+            accumulate_run_stats(&mut stats, lane_stats);
         }
-        Ok(changes)
+        Ok((changes, stats))
     }
 
     fn run_compactor_once(
         compactor: &Compactor,
         observability: Option<&StorageObservabilityCounters>,
-    ) -> Result<PendingPersistedSegmentDiff> {
+    ) -> Result<(PendingPersistedSegmentDiff, CompactionRunStats)> {
         let started = Instant::now();
         match compactor.compact_once_with_changes() {
             Ok(outcome) => {
@@ -107,7 +108,7 @@ impl ChunkStorage {
                     removed.extend(outcome.retired_roots);
                     changes.record_changes(outcome.output_roots, removed);
                 }
-                Ok(changes)
+                Ok((changes, stats))
             }
             Err(err) => {
                 if let Some(obs) = observability {
@@ -163,4 +164,23 @@ impl ChunkStorage {
         let close_result = self.execute_close_pipeline();
         self.finish_close_transition(close_result)
     }
+}
+
+/// Folds one lane's pass statistics into the pass total.
+///
+/// Only `windows_merged` and `source_above_trigger` drive the worker's park
+/// decision, but the whole struct is summed so the aggregate stays meaningful
+/// for future consumers.
+fn accumulate_run_stats(total: &mut CompactionRunStats, lane: CompactionRunStats) {
+    total.compacted |= lane.compacted;
+    total.source_level = total.source_level.or(lane.source_level);
+    total.target_level = total.target_level.or(lane.target_level);
+    total.source_segments = total.source_segments.saturating_add(lane.source_segments);
+    total.output_segments = total.output_segments.saturating_add(lane.output_segments);
+    total.source_chunks = total.source_chunks.saturating_add(lane.source_chunks);
+    total.output_chunks = total.output_chunks.saturating_add(lane.output_chunks);
+    total.source_points = total.source_points.saturating_add(lane.source_points);
+    total.output_points = total.output_points.saturating_add(lane.output_points);
+    total.windows_merged = total.windows_merged.saturating_add(lane.windows_merged);
+    total.source_above_trigger |= lane.source_above_trigger;
 }

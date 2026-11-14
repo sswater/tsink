@@ -186,12 +186,6 @@ impl ChunkStorage {
         self.coordination.compaction_lock.lock()
     }
 
-    pub(in crate::engine::storage_engine) fn lock_compaction_gate(
-        compaction_lock: &Mutex<()>,
-    ) -> MutexGuard<'_, ()> {
-        compaction_lock.lock()
-    }
-
     pub(in crate::engine::storage_engine) fn current_timestamp_units(&self) -> i64 {
         #[cfg(test)]
         {

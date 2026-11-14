@@ -72,6 +72,7 @@ impl ChunkStorage {
         );
         let next_segment_id = Arc::new(AtomicU64::new(next_segment_id.max(1)));
         let compaction_inventory_source = CompactionInventorySource::default();
+        let compaction_lock = Arc::new(Mutex::new(()));
         let numeric_compactor = numeric_lane_path.map(|path| {
             Compactor::new_with_inventory_source(
                 path,
@@ -79,6 +80,7 @@ impl ChunkStorage {
                 Arc::clone(&next_segment_id),
                 compaction_inventory_source.clone(),
             )
+            .with_gate(Arc::clone(&compaction_lock))
         });
         let blob_compactor = blob_lane_path.map(|path| {
             Compactor::new_with_inventory_source(
@@ -87,9 +89,9 @@ impl ChunkStorage {
                 Arc::clone(&next_segment_id),
                 compaction_inventory_source.clone(),
             )
+            .with_gate(Arc::clone(&compaction_lock))
         });
         let lifecycle = Arc::new(AtomicU8::new(STORAGE_OPEN));
-        let compaction_lock = Arc::new(Mutex::new(()));
         let persisted_index_dirty = Arc::new(AtomicBool::new(false));
         let pending_persisted_segment_diff =
             Arc::new(Mutex::new(PendingPersistedSegmentDiff::default()));
@@ -97,7 +99,6 @@ impl ChunkStorage {
         let compaction_thread = if options.background_threads_enabled {
             Self::spawn_background_compaction_thread(
                 Arc::downgrade(&lifecycle),
-                Arc::clone(&compaction_lock),
                 numeric_compactor.clone(),
                 blob_compactor.clone(),
                 Arc::clone(&persisted_index_dirty),

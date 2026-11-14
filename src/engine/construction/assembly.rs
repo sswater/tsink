@@ -77,9 +77,11 @@ impl StorageStateAssembly {
     ///
     /// The provider captures the `Arc`-shared index handle instead of the
     /// storage value because assembly only holds by-value state; it is the same
-    /// lock the storage publishes into. It takes the read lock only, and must
-    /// never be called while that lock (or the compaction gate) is held by the
-    /// caller.
+    /// lock the storage publishes into. It takes only the `persisted_index`
+    /// read lock, so it must never be invoked while the `persisted_index`
+    /// *write* lock is held. Holding the compaction gate while calling it is
+    /// fine: gate → index is the global lock order, and compaction acquires
+    /// that gate per window.
     fn inject_compaction_inventory_source(
         persisted: &PersistedStorageState,
         source: &CompactionInventorySource,

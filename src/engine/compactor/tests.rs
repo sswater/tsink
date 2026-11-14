@@ -8,8 +8,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::{
-    execution, finalize_pending_compaction_replacements, scan_inventory_from_disk,
-    CompactionInventorySource, CompactionOutcome, Compactor,
+    compaction_park_interval, execution, finalize_pending_compaction_replacements,
+    scan_inventory_from_disk, CompactionInventorySource, CompactionOutcome, CompactionRunStats,
+    Compactor, COMPACTION_BACKLOG_PARK,
 };
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::encoder::Encoder;
@@ -17,7 +18,8 @@ use crate::engine::fs_utils::{
     count_segment_file_reads_under, set_segment_file_read_hook, CountingSegmentReads,
 };
 use crate::engine::segment::{
-    load_segments, load_segments_for_level, read_segment_manifest, SegmentWriter, WalHighWatermark,
+    load_segment_root_for_compaction, load_segments, load_segments_for_level,
+    read_segment_manifest, SegmentWriter, WalHighWatermark,
 };
 use crate::engine::series::{SeriesRegistry, SeriesValueFamily};
 use crate::engine::storage_engine::tiering::{
@@ -889,6 +891,251 @@ fn same_pass_l1_outputs_are_visible_to_l1_to_l2() {
     let l2 = load_segments_for_level(temp_dir.path(), 2).unwrap();
     assert_eq!(l2.len(), 1);
     assert_eq!(l2[0].manifest.point_count, 16);
+}
+
+#[test]
+fn flush_gate_wait_bounded_by_single_window() {
+    let temp_dir = TempDir::new().unwrap();
+    write_non_overlapping_l0_segments(temp_dir.path(), 4);
+
+    let gate = Arc::new(parking_lot::Mutex::new(()));
+    let compactor = Compactor::new(temp_dir.path(), 8).with_gate(Arc::clone(&gate));
+
+    // The main thread stands in for a flush/snapshot pass holding the gate.
+    let held = gate.lock();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(compactor.compact_once());
+    });
+
+    // The pass must block on the window gate, not finish the whole round.
+    match rx.recv_timeout(Duration::from_millis(200)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        other => panic!("compaction finished while the gate was held: {other:?}"),
+    }
+
+    drop(held);
+    let finished = rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("released gate must let the pass finish within 2s");
+    finished.unwrap();
+    worker.join().unwrap();
+
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 1).unwrap().len(),
+        1,
+        "the released pass must complete its one window"
+    );
+}
+
+#[test]
+fn compaction_park_interval_backlogged_vs_idle() {
+    let interval = Duration::from_secs(5);
+
+    // No-progress pass: full interval even with sources above the trigger. A
+    // fully-tombstoned window produces no output, so parking 1ms here would
+    // reload the same window in a hot loop.
+    let mut stats = CompactionRunStats {
+        source_above_trigger: true,
+        windows_merged: 0,
+        ..CompactionRunStats::default()
+    };
+    assert_eq!(compaction_park_interval(&stats, interval), interval);
+
+    // Productive pass with a backlog still above the trigger: drain back-to-back.
+    stats.windows_merged = 1;
+    assert_eq!(
+        compaction_park_interval(&stats, interval),
+        COMPACTION_BACKLOG_PARK
+    );
+
+    // Productive pass that drained the backlog, and a fully idle pass: both park
+    // the configured interval.
+    stats.source_above_trigger = false;
+    assert_eq!(compaction_park_interval(&stats, interval), interval);
+    assert_eq!(
+        compaction_park_interval(&CompactionRunStats::default(), interval),
+        interval
+    );
+}
+
+#[test]
+fn no_output_head_window_is_skipped_and_later_windows_merge() {
+    let temp_dir = TempDir::new().unwrap();
+    let roots = write_non_overlapping_l0_segments(temp_dir.path(), 8);
+
+    // The head window (segments 1..=4, ts 1..=4) is fully tombstoned, so it can
+    // never produce output; the later four segments are still mergeable.
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    let mut tombstones = HashMap::new();
+    tombstones.insert(series_id, vec![TombstoneRange { start: 1, end: 5 }]);
+    persist_tombstones(&temp_dir.path().join(TOMBSTONES_FILE_NAME), &tombstones).unwrap();
+
+    let inventory = scan_inventory_from_disk(temp_dir.path()).unwrap();
+    let source = CompactionInventorySource::default();
+    source.set(Arc::new(move || inventory.clone()));
+    let mut compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source,
+    );
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+
+    let head_reads = Arc::new(AtomicUsize::new(0));
+    let read_counter = Arc::clone(&head_reads);
+    let head_root = roots[0].clone();
+    let hook_root = head_root.clone();
+    let _hook = set_segment_file_read_hook(Some(Arc::new(move |path: &Path| {
+        if path.starts_with(&hook_root) {
+            read_counter.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
+
+    let outcome = compactor.compact_once_with_changes().unwrap();
+    let pass_reads = head_reads.load(Ordering::SeqCst);
+
+    assert_eq!(
+        outcome.stats.windows_merged, 1,
+        "the pass must skip the unmergeable head window and merge the next one"
+    );
+    assert!(outcome.stats.compacted);
+    assert!(
+        outcome.retired_roots.is_empty(),
+        "a zero-output window is not a retirement: {:?}",
+        outcome.retired_roots
+    );
+    assert!(
+        outcome.stats.source_above_trigger,
+        "the skipped head window still counts toward the trigger line"
+    );
+    for root in &roots[..4] {
+        assert!(
+            root.exists(),
+            "an unmergeable window's sources must stay on disk: {}",
+            root.display()
+        );
+    }
+    for root in &roots[4..] {
+        assert!(
+            !root.exists(),
+            "the mergeable window's sources must be replaced: {}",
+            root.display()
+        );
+    }
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    assert_eq!(l1.len(), 1);
+    assert_eq!(l1[0].manifest.point_count, 4);
+
+    // Exactly one attempt: one load of the head window touches the head root
+    // once per file, so the pass's notification count must equal a single load.
+    head_reads.store(0, Ordering::SeqCst);
+    load_segment_root_for_compaction(&head_root)
+        .unwrap()
+        .unwrap();
+    let single_load_reads = head_reads.load(Ordering::SeqCst);
+    assert!(
+        single_load_reads > 0,
+        "the read hook must observe the loader's notifications"
+    );
+    assert_eq!(
+        pass_reads, single_load_reads,
+        "the skipped head window must be attempted exactly once per pass \
+         (observed {pass_reads} notifications vs {single_load_reads} for one load)"
+    );
+}
+
+#[test]
+fn all_tombstoned_window_reports_no_output_and_parks_full_interval() {
+    let temp_dir = TempDir::new().unwrap();
+    let roots = write_non_overlapping_l0_segments(temp_dir.path(), 4);
+
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+    let mut tombstones = HashMap::new();
+    tombstones.insert(series_id, vec![TombstoneRange { start: 1, end: 5 }]);
+    persist_tombstones(&temp_dir.path().join(TOMBSTONES_FILE_NAME), &tombstones).unwrap();
+
+    let mut compactor = Compactor::new(temp_dir.path(), 8);
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+    let outcome = compactor.compact_once_with_changes().unwrap();
+
+    assert!(!outcome.stats.compacted);
+    assert_eq!(outcome.stats.windows_merged, 0);
+    assert!(outcome.retired_roots.is_empty());
+    assert!(outcome.source_roots.is_empty());
+    assert!(outcome.output_roots.is_empty());
+    for root in &roots {
+        assert!(
+            root.exists(),
+            "no-output sources must stay on disk: {}",
+            root.display()
+        );
+    }
+    assert!(
+        outcome.stats.source_above_trigger,
+        "the untouched window is still above the trigger line"
+    );
+
+    let interval = Duration::from_secs(5);
+    assert_eq!(
+        compaction_park_interval(&outcome.stats, interval),
+        interval,
+        "a zero-output pass must park the full interval, not hot-loop"
+    );
+}
+
+#[test]
+fn ghost_member_is_evicted_once_with_full_budget() {
+    let temp_dir = TempDir::new().unwrap();
+    let roots = write_non_overlapping_l0_segments(temp_dir.path(), 12);
+    let ghost_root = roots[1].clone();
+
+    // The inventory still lists the ghost until this pass's diff retires it.
+    let inventory = scan_inventory_from_disk(temp_dir.path()).unwrap();
+    fs::remove_file(ghost_root.join("manifest.bin")).unwrap();
+
+    let source = CompactionInventorySource::default();
+    source.set(Arc::new(move || inventory.clone()));
+    let mut compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source,
+    );
+    // A full budget: the working copy itself must absorb the eviction, so the
+    // ghost is never selected again within this pass.
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+
+    let _guard = CountingSegmentReads::install(temp_dir.path());
+    let outcome = compactor.compact_once_with_changes().unwrap();
+
+    assert_eq!(
+        outcome.retired_roots,
+        vec![ghost_root.clone()],
+        "the vanished member must be retired exactly once"
+    );
+    assert_eq!(
+        outcome.stats.windows_merged, 3,
+        "twelve L0 segments drain over three windows"
+    );
+    assert!(!outcome.stats.source_above_trigger);
+    assert_eq!(
+        count_segment_file_reads_under(&ghost_root),
+        1,
+        "the ghost may only be touched by the single attempt that retires it"
+    );
+    assert!(load_segments_for_level(temp_dir.path(), 0)
+        .unwrap()
+        .is_empty());
 }
 
 fn write_overlapping_l0_segments(root: &std::path::Path, count: u64) {

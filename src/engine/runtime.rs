@@ -1,8 +1,8 @@
 use super::{
-    elapsed_nanos_u64, Arc, AtomicBool, AtomicU8, BackgroundWorkerSupervisorState, ChunkStorage,
-    Compactor, Duration, Instant, Mutex, Ordering, PendingPersistedSegmentDiff, Result,
-    StorageObservabilityCounters, StorageRuntimeMode, TsinkError, DEFAULT_FLUSH_INTERVAL,
-    STORAGE_CLOSED, STORAGE_CLOSING, STORAGE_OPEN,
+    compaction_park_interval, elapsed_nanos_u64, Arc, AtomicBool, AtomicU8,
+    BackgroundWorkerSupervisorState, ChunkStorage, Compactor, Duration, Instant, Mutex, Ordering,
+    PendingPersistedSegmentDiff, Result, StorageObservabilityCounters, StorageRuntimeMode,
+    TsinkError, DEFAULT_FLUSH_INTERVAL, STORAGE_CLOSED, STORAGE_CLOSING, STORAGE_OPEN,
 };
 
 #[path = "runtime/supervision.rs"]
@@ -239,7 +239,6 @@ impl ChunkStorage {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_background_compaction_thread(
         lifecycle: std::sync::Weak<AtomicU8>,
-        compaction_lock: Arc<Mutex<()>>,
         numeric_compactor: Option<Compactor>,
         blob_compactor: Option<Compactor>,
         persisted_index_dirty: Arc<AtomicBool>,
@@ -254,41 +253,58 @@ impl ChunkStorage {
 
         let handle = std::thread::Builder::new()
             .name("tsink-compaction".to_string())
-            .spawn(move || loop {
-                std::thread::park_timeout(compaction_interval);
+            .spawn(move || {
+                // The compactor acquires the storage compaction gate itself,
+                // one window at a time; the worker never holds it here.
+                let mut park_duration = compaction_interval;
+                loop {
+                    std::thread::park_timeout(park_duration);
 
-                let Some(lifecycle) = lifecycle.upgrade() else {
-                    break;
-                };
+                    let Some(lifecycle) = lifecycle.upgrade() else {
+                        break;
+                    };
 
-                let control = BackgroundWorkerControl::new(
-                    lifecycle.as_ref(),
-                    observability.as_ref(),
-                    background_fail_fast,
-                );
-                match Self::run_background_worker_pass(
-                    &control,
-                    "compaction",
-                    compaction_interval,
-                    || Self::lock_compaction_gate(compaction_lock.as_ref()),
-                    || {
-                        match Self::compact_compactors_with_changes(
-                            numeric_compactor.as_ref(),
-                            blob_compactor.as_ref(),
-                            Some(observability.as_ref()),
-                        ) {
-                            Ok(changes) if !changes.is_empty() => {
-                                pending_persisted_segment_diff.lock().merge(changes);
-                                persisted_index_dirty.store(true, Ordering::SeqCst);
+                    let control = BackgroundWorkerControl::new(
+                        lifecycle.as_ref(),
+                        observability.as_ref(),
+                        background_fail_fast,
+                    );
+                    match Self::run_background_worker_pass(
+                        &control,
+                        "compaction",
+                        compaction_interval,
+                        || (),
+                        || {
+                            match Self::compact_compactors_with_changes(
+                                numeric_compactor.as_ref(),
+                                blob_compactor.as_ref(),
+                                Some(observability.as_ref()),
+                            ) {
+                                Ok((changes, stats)) => {
+                                    park_duration =
+                                        compaction_park_interval(&stats, compaction_interval);
+                                    if !changes.is_empty() {
+                                        pending_persisted_segment_diff.lock().merge(changes);
+                                        persisted_index_dirty.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                Err(err) => {
+                                    park_duration = compaction_interval;
+                                    return Err(err);
+                                }
                             }
-                            Ok(_) => {}
-                            Err(err) => return Err(err),
+                            Ok(())
+                        },
+                    ) {
+                        BackgroundWorkerFlow::Continue => {}
+                        BackgroundWorkerFlow::Pause(_) => {
+                            // Lifecycle is not open (closing/closed): fall back
+                            // to the configured cadence instead of a stale
+                            // backlog park.
+                            park_duration = compaction_interval;
                         }
-                        Ok(())
-                    },
-                ) {
-                    BackgroundWorkerFlow::Continue | BackgroundWorkerFlow::Pause(_) => {}
-                    BackgroundWorkerFlow::Exit => break,
+                        BackgroundWorkerFlow::Exit => break,
+                    }
                 }
             })?;
 

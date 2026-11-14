@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use crate::concurrency::Semaphore;
 use crate::engine::chunk::{self, Chunk, ChunkBuilder, ChunkPoint, ValueLane};
-use crate::engine::compactor::Compactor;
+use crate::engine::compactor::{compaction_park_interval, CompactionRunStats, Compactor};
 use crate::engine::encoder::Encoder;
 use crate::engine::segment::{SegmentWriter, WalHighWatermark};
 use crate::engine::series::{SeriesId, SeriesRegistry, SeriesResolution, SeriesValueFamily};

@@ -26,10 +26,15 @@ enum WindowStep {
     /// No survivors of the window were loadable; the ghosts were retired from
     /// the working copy and the loop re-selects from what is left.
     Retired,
-    /// The window produced no output segments (every point was tombstoned or
-    /// fell before the retention cutoff), so its sources are still on disk and
-    /// must not be absorbed. Ending the pass here keeps the loop from
-    /// re-selecting the same unmergeable window forever.
+    /// The window produced no output segments because every point was
+    /// tombstoned, so its sources are still on disk and must not be absorbed.
+    /// The caller skips those candidates for the rest of the pass (they keep
+    /// counting toward `source_above_trigger`) so the drain loop moves on to
+    /// other windows; the next pass retries them.
+    ///
+    /// The compaction path runs without a retention cutoff, so only the
+    /// tombstone elimination can reach this state; the cutoff half belongs to
+    /// `stage_segment_rewrite_with_retention`.
     NoOutput,
 }
 
@@ -39,9 +44,16 @@ enum WindowStep {
 /// outputs are inserted at the target level. That is what lets the same pass
 /// see its own L1 outputs when the L1→L2 stage runs, and what keeps a vanished
 /// member from being selected again once it has been retired.
+///
+/// Windows that produced no output are moved into `skipped_*`: they are out of
+/// the selection for the rest of this pass — each unmergeable window is
+/// attempted at most once — but they still count as sources above the trigger
+/// line, so the next pass runs soon and retries them.
 struct WorkingInventory {
     l0: Vec<PlanningCandidate>,
     l1: Vec<PlanningCandidate>,
+    skipped_l0: Vec<PathBuf>,
+    skipped_l1: Vec<PathBuf>,
 }
 
 impl WorkingInventory {
@@ -49,6 +61,8 @@ impl WorkingInventory {
         Self {
             l0: compactor.planning_candidates(inventory, level_to_u8(CompactionLevel::L0)),
             l1: compactor.planning_candidates(inventory, level_to_u8(CompactionLevel::L1)),
+            skipped_l0: Vec::new(),
+            skipped_l1: Vec::new(),
         }
     }
 
@@ -65,6 +79,20 @@ impl WorkingInventory {
         self.candidates(level).len()
     }
 
+    fn skipped_count(&self, level: CompactionLevel) -> usize {
+        match level {
+            CompactionLevel::L0 => self.skipped_l0.len(),
+            CompactionLevel::L1 => self.skipped_l1.len(),
+            CompactionLevel::L2 => 0,
+        }
+    }
+
+    /// Sources still at or above the trigger, counting the windows this pass
+    /// could not merge.
+    fn above_trigger(&self, level: CompactionLevel, trigger: usize) -> bool {
+        self.count(level) + self.skipped_count(level) >= trigger
+    }
+
     fn remove_roots(&mut self, level: CompactionLevel, roots: &[PathBuf]) {
         let candidates = match level {
             CompactionLevel::L0 => &mut self.l0,
@@ -72,6 +100,18 @@ impl WorkingInventory {
             CompactionLevel::L2 => return,
         };
         candidates.retain(|candidate| !roots.contains(&candidate.root));
+    }
+
+    /// Removes a window that produced no output from this pass's selection and
+    /// records it as skipped, so it keeps counting toward the trigger line.
+    fn skip_roots(&mut self, level: CompactionLevel, roots: &[PathBuf]) {
+        self.remove_roots(level, roots);
+        let skipped = match level {
+            CompactionLevel::L0 => &mut self.skipped_l0,
+            CompactionLevel::L1 => &mut self.skipped_l1,
+            CompactionLevel::L2 => return,
+        };
+        skipped.extend(roots.iter().cloned());
     }
 
     /// Inserts a merged window's outputs at `target`.
@@ -107,6 +147,12 @@ impl Compactor {
     /// always opens, so a budget shorter than one window cannot stall the
     /// drain. L0 is drained before L1 in every iteration, which is what makes
     /// this pass's own L1 outputs eligible for L1→L2 in the same pass.
+    ///
+    /// Every window step holds the storage compaction gate for exactly that
+    /// step (load + merge + replacement marker + source removal) and releases
+    /// it before the next one, so flush, retention, snapshot, and catalog
+    /// refresh can interleave between windows instead of waiting for a full
+    /// round.
     pub(in crate::engine) fn compact_once_with_changes(&self) -> Result<CompactionOutcome> {
         // Skip before any disk access: the background compaction thread wakes up
         // before the inventory provider is injected, and must not fall back to an
@@ -127,17 +173,27 @@ impl Compactor {
                 break;
             }
 
-            match self.merge_one_window(&mut working, &tombstones, &mut outcome)? {
-                WindowStep::Merged | WindowStep::Retired => {}
-                WindowStep::Converged | WindowStep::NoOutput => break,
+            // `parking_lot::Mutex` is not reentrant: no caller may hold this
+            // gate around the pass (see the background worker and shutdown
+            // call sites). The guard is dropped before the loop continues.
+            let step = {
+                let _guard = self.gate.as_ref().map(|gate| gate.lock());
+                self.merge_one_window(&mut working, &tombstones, &mut outcome)?
+            };
+
+            match step {
+                WindowStep::Merged | WindowStep::Retired | WindowStep::NoOutput => {}
+                WindowStep::Converged => break,
             }
         }
 
         // A level that is still at or above its trigger after the loop (budget
         // exhausted, or a window that could not be merged) needs the next pass
-        // to run immediately rather than park a full interval.
-        outcome.stats.source_above_trigger = working.count(CompactionLevel::L0) >= self.l0_trigger
-            || working.count(CompactionLevel::L1) >= self.l1_trigger;
+        // to run immediately rather than park a full interval. Windows skipped
+        // for producing no output still count: their sources are still on disk.
+        outcome.stats.source_above_trigger = working
+            .above_trigger(CompactionLevel::L0, self.l0_trigger)
+            || working.above_trigger(CompactionLevel::L1, self.l1_trigger);
 
         Ok(outcome)
     }
@@ -157,9 +213,10 @@ impl Compactor {
 
     /// Merges at most one window of the selected source level.
     ///
-    /// Every step either merges a window (strictly shrinking the source level)
-    /// or retires a vanished root (also strictly shrinking it), so the loop
-    /// cannot revisit the same state.
+    /// Every step either merges a window (strictly shrinking the selectable
+    /// source level), retires a vanished root (also strictly shrinking it), or
+    /// skips a zero-output window out of this pass's selection (again strictly
+    /// shrinking it), so the loop cannot revisit the same state.
     fn merge_one_window(
         &self,
         working: &mut WorkingInventory,
@@ -186,7 +243,8 @@ impl Compactor {
         .collect::<Vec<_>>();
 
         let (segments, retired_roots) = load_window_members(&window)?;
-        if !retired_roots.is_empty() {
+        let retired_any = !retired_roots.is_empty();
+        if retired_any {
             warn!(
                 roots = ?retired_roots,
                 "Compaction window members vanished before load; retiring them from the planning inventory"
@@ -199,6 +257,18 @@ impl Compactor {
             // Only ghosts were left in this window. Their eviction already
             // shrank the source level, so the next iteration re-selects from
             // the surviving candidates instead of merging this window.
+            if !retired_any {
+                // Selection always yields at least two members and every member
+                // either loads or is retired, so reaching here means the
+                // invariant broke. Fail loudly instead of spinning the drain
+                // loop over the same unmergeable window forever.
+                return Err(TsinkError::DataCorruption(format!(
+                    "compaction window of {} candidates yielded {} loadable segments \
+                     and no retired roots",
+                    window.len(),
+                    segments.len()
+                )));
+            }
             return Ok(WindowStep::Retired);
         }
 
@@ -206,6 +276,13 @@ impl Compactor {
         let window_outcome =
             self.compact_segments(level_to_u8(target), &segment_refs, tombstones)?;
         if !window_outcome.stats.compacted {
+            // Zero output: every point of the window was tombstoned. The
+            // sources stay on disk (there is nothing to publish in their
+            // place), so they cannot be absorbed — but the pass must not
+            // re-select the same window either. Skip them for the rest of this
+            // pass so the remaining windows drain; they keep counting toward
+            // `source_above_trigger`, and the next pass retries them.
+            working.skip_roots(source, &window_outcome.source_roots);
             return Ok(WindowStep::NoOutput);
         }
 
