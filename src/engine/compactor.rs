@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs;
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -142,6 +142,24 @@ pub struct Compactor {
     /// `None` for standalone compactors (tests, one-shot maintenance) where no
     /// other thread contends for the storage's cross-subsystem ordering.
     gate: Option<Arc<Mutex<()>>>,
+    /// In-flight claim for this lane's round.
+    ///
+    /// The close path's `compact_until_settled` and the background worker both
+    /// run rounds on the same compactor. Per-window gate acquisition no longer
+    /// serializes whole rounds, so without this claim two rounds can plan from
+    /// the same inventory and select the same window (duplicate work and index
+    /// entries), and a marker temp file can be finalized by the other round.
+    /// `Arc`-shared because `Compactor` is cloned into the worker.
+    round_running: Arc<AtomicBool>,
+}
+
+/// Releases the round claim on every exit path, including panics.
+struct CompactionRoundClaim(Arc<AtomicBool>);
+
+impl Drop for CompactionRoundClaim {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Compactor {
@@ -155,6 +173,7 @@ impl Compactor {
             next_segment_id: None,
             source: None,
             gate: None,
+            round_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -172,6 +191,7 @@ impl Compactor {
             next_segment_id: Some(next_segment_id),
             source: None,
             gate: None,
+            round_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -190,6 +210,7 @@ impl Compactor {
             next_segment_id: Some(next_segment_id),
             source: Some(source),
             gate: None,
+            round_running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -213,6 +234,19 @@ impl Compactor {
     #[cfg(test)]
     pub(in crate::engine) fn set_pass_wall_budget(&mut self, budget: Duration) {
         self.pass_wall_budget = budget;
+    }
+
+    /// Claims this lane's round, or reports that another one is already
+    /// draining it.
+    ///
+    /// A contended round returns `Ok(default stats)` to its caller: the other
+    /// round is doing the work, and the caller's park loop re-arms, so the
+    /// backlog is not lost. The claim is held for the whole round.
+    fn try_claim_round(&self) -> Option<CompactionRoundClaim> {
+        self.round_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| CompactionRoundClaim(Arc::clone(&self.round_running)))
     }
 
     /// Inventory to plan this round from.

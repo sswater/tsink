@@ -443,9 +443,72 @@ fn finalize_pending_replacements_removes_marked_source_segments() {
 }
 
 #[test]
+fn finalize_pending_replacements_ignores_dot_prefixed_temp_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let registry = SeriesRegistry::new();
+
+    let series_id = registry
+        .resolve_or_insert("cpu", &[Label::new("host", "a")])
+        .unwrap()
+        .series_id;
+
+    let mut l0_chunks = HashMap::new();
+    l0_chunks.insert(series_id, vec![make_numeric_chunk(series_id, &[(1, 1.0)])]);
+    SegmentWriter::new(temp_dir.path(), 0, 1)
+        .unwrap()
+        .write_segment(&registry, &l0_chunks)
+        .unwrap();
+
+    let mut l1_chunks = HashMap::new();
+    l1_chunks.insert(series_id, vec![make_numeric_chunk(series_id, &[(1, 2.0)])]);
+    SegmentWriter::new(temp_dir.path(), 1, 2)
+        .unwrap()
+        .write_segment(&registry, &l1_chunks)
+        .unwrap();
+
+    let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+    let l1 = load_segments_for_level(temp_dir.path(), 1).unwrap();
+    let source_root = l0[0].root.clone();
+    let output_root = l1[0].root.clone();
+    let marker_path = execution::write_compaction_replacement_marker(
+        temp_dir.path(),
+        std::slice::from_ref(&source_root),
+        std::slice::from_ref(&output_root),
+    )
+    .unwrap();
+
+    // A partially written marker temp file lives in the same directory and is
+    // dot-prefixed by construction; it must never be treated as a marker.
+    let temp_marker = temp_dir
+        .path()
+        .join(".compaction-replacements")
+        .join(".replace-deadbeef.tmp-1-0000000000000000");
+    fs::write(&temp_marker, b"{ not a complete marker").unwrap();
+
+    finalize_pending_compaction_replacements(temp_dir.path()).unwrap();
+
+    assert!(
+        !source_root.exists(),
+        "the real marker must still be applied"
+    );
+    assert!(
+        output_root.exists(),
+        "replacement output should be preserved"
+    );
+    assert!(
+        !marker_path.exists(),
+        "the real marker should be removed after apply"
+    );
+    assert!(
+        temp_marker.exists(),
+        "a dot-prefixed temp file must be ignored, not consumed as a marker"
+    );
+}
+
+#[test]
 fn compactor_skips_round_until_inventory_source_is_set() {
     let temp_dir = TempDir::new().unwrap();
-    write_overlapping_l0_segments(temp_dir.path(), 6);
+    write_disjoint_l0_segments(temp_dir.path(), 6);
 
     let compactor = Compactor::new_with_inventory_source(
         temp_dir.path(),
@@ -466,9 +529,72 @@ fn compactor_skips_round_until_inventory_source_is_set() {
 }
 
 #[test]
+fn concurrent_rounds_on_the_same_compactor_do_not_overlap() {
+    use std::sync::mpsc;
+
+    let temp_dir = TempDir::new().unwrap();
+    write_non_overlapping_l0_segments(temp_dir.path(), 6);
+
+    let scan_root = temp_dir.path().to_path_buf();
+    let source = CompactionInventorySource::default();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let release_rx = Mutex::new(release_rx);
+    source.set(Arc::new(move || {
+        // Signal that the first round is inside its round, then hold it there
+        // until the test has attempted the contended round.
+        let _ = entered_tx.send(());
+        let _ = release_rx.lock().unwrap().recv();
+        scan_inventory_from_disk(&scan_root).unwrap()
+    }));
+
+    let compactor = Arc::new(Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source,
+    ));
+
+    let holder = {
+        let compactor = Arc::clone(&compactor);
+        std::thread::spawn(move || compactor.compact_once_with_stats())
+    };
+    entered_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the first round must reach the inventory provider");
+
+    let contended = compactor.compact_once_with_stats().unwrap();
+    assert!(
+        !contended.compacted,
+        "the contended round must not run concurrently"
+    );
+    assert_eq!(
+        contended.windows_merged, 0,
+        "the contended round must return immediately while the other drains"
+    );
+
+    release_tx.send(()).unwrap();
+    let winner = holder.join().unwrap().unwrap();
+    assert!(winner.compacted, "the claiming round must do the work");
+    assert_eq!(winner.windows_merged, 1);
+
+    // Exactly one round's output: 6 disjoint L0, trigger 4 -> one window of 4.
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 0).unwrap().len(),
+        2,
+        "a duplicate round would have consumed the remaining segments"
+    );
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 1).unwrap().len(),
+        1,
+        "a duplicate round would have published a second L1 output"
+    );
+}
+
+#[test]
 fn disk_scan_inventory_fills_lane_and_tier() {
     let temp_dir = TempDir::new().unwrap();
-    write_overlapping_l0_segments(temp_dir.path(), 2);
+    write_disjoint_l0_segments(temp_dir.path(), 2);
 
     let registry = SeriesRegistry::new();
     let series_id = registry
@@ -512,7 +638,7 @@ fn disk_scan_inventory_fills_lane_and_tier() {
 #[test]
 fn injected_inventory_source_falls_through_to_existing_planning() {
     let temp_dir = TempDir::new().unwrap();
-    write_overlapping_l0_segments(temp_dir.path(), 6);
+    write_disjoint_l0_segments(temp_dir.path(), 6);
 
     let source = CompactionInventorySource::default();
     let compactor = Compactor::new_with_inventory_source(
@@ -1588,7 +1714,9 @@ impl RoundCapture {
     }
 }
 
-fn write_overlapping_l0_segments(root: &std::path::Path, count: u64) {
+/// Writes `count` disjoint one-point L0 segments (helpers that do not need
+/// overlapping ranges; the name is disjoint because `overlap=false`).
+fn write_disjoint_l0_segments(root: &std::path::Path, count: u64) {
     let _ = write_l0_segment_roots(root, count, false);
 }
 

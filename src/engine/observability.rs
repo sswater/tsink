@@ -208,6 +208,7 @@ impl From<&CompactionObservabilityCounters> for CompactionObservabilitySnapshot 
             output_chunks_total: counters.output_chunks_total.load(Ordering::Relaxed),
             source_points_total: counters.source_points_total.load(Ordering::Relaxed),
             output_points_total: counters.output_points_total.load(Ordering::Relaxed),
+            windows_merged_total: counters.windows_merged_total.load(Ordering::Relaxed),
             duration_nanos_total: counters.duration_nanos_total.load(Ordering::Relaxed),
         }
     }
@@ -423,6 +424,20 @@ impl ChunkStorage {
                     .health
                     .maintenance_errors_total
                     .load(Ordering::Relaxed),
+                transient_disappearances_total: self
+                    .observability
+                    .health
+                    .transient_disappearances_total
+                    .load(Ordering::Relaxed),
+                pending_persisted_segment_diff_entries: self
+                    .observability
+                    .health
+                    .pending_persisted_segment_diff_entries
+                    .load(Ordering::Relaxed),
+                registry_contribution_entries: u64::try_from(
+                    self.persisted.registry_contributions.entry_count(),
+                )
+                .unwrap_or(u64::MAX),
                 degraded: self
                     .observability
                     .health

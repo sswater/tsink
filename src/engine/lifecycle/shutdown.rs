@@ -39,6 +39,7 @@ impl<'a> LifecycleShutdownContext<'a> {
                     ChunkStorage::merge_published_window(
                         self.pending_persisted_segment_diff,
                         self.persisted_index_dirty,
+                        self.observability,
                         window,
                     );
                 },
@@ -89,9 +90,15 @@ impl ChunkStorage {
     pub(in super::super) fn merge_published_window(
         pending_persisted_segment_diff: &Mutex<PendingPersistedSegmentDiff>,
         persisted_index_dirty: &AtomicBool,
+        observability: &StorageObservabilityCounters,
         window: PendingPersistedSegmentDiff,
     ) {
-        pending_persisted_segment_diff.lock().merge(window);
+        let (added, removed) = {
+            let mut pending = pending_persisted_segment_diff.lock();
+            pending.merge(window);
+            (pending.added_roots.len(), pending.removed_roots.len())
+        };
+        observability.record_pending_persisted_segment_diff_len(added, removed);
         persisted_index_dirty.store(true, Ordering::SeqCst);
     }
 

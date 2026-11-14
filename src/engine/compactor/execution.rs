@@ -222,6 +222,13 @@ pub(in crate::engine) fn finalize_pending_compaction_replacements(data_path: &Pa
                 });
             }
         };
+        // Temp files written by `tmp_path_for` are dot-prefixed and live inside
+        // this same directory. Listing one would parse a partial marker (or let
+        // the other thread apply and delete it, making this writer's rename
+        // fail and leaking its outputs), so only real markers are considered.
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         // A concurrent finalize on the same lane can delete an entry between
         // the directory read and this stat; the marker it names is either gone
         // (nothing left to apply) or about to be handled by that applier.

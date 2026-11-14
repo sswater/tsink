@@ -1577,22 +1577,13 @@ fn runtime_refresh_disappearance_is_transient_and_does_not_fence_writes() {
     // refresh worker loads it: the root is already gone from disk.
     crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&published_root).unwrap();
 
-    let err = storage
+    storage
         .sync_persisted_segments_from_disk_if_dirty()
-        .unwrap_err();
-    assert!(
-        crate::engine::segment::is_runtime_refresh_disappearance_error(&err),
-        "the seeded interleaving must produce the runtime-refresh disappearance error, got: {err}"
-    );
+        .unwrap();
 
-    // Drive the error through the worker's real error handling. This is the
-    // exact classification the persisted-refresh thread applies (src/engine/runtime.rs).
-    let worker_would_exit =
-        storage.handle_background_worker_result_for_tests("persisted_refresh", Err(err));
-    assert!(
-        !worker_would_exit,
-        "a transient segment disappearance must not stop the refresh worker under fail-fast"
-    );
+    // The vanished added root is retired, not failed and not restored: the
+    // refresh converges even when the compaction's own removal has not landed
+    // in the pending diff yet.
     let health = storage.observability_snapshot().health;
     assert!(
         health.fail_fast_enabled,
@@ -1606,17 +1597,30 @@ fn runtime_refresh_disappearance_is_transient_and_does_not_fence_writes() {
         health.background_errors_total, 0,
         "a transient disappearance must not be counted as a background failure"
     );
+    assert_eq!(
+        health.transient_disappearances_total, 1,
+        "the skip must be visible on the health gauge"
+    );
     assert!(
         health.last_background_error.is_none(),
         "a transient disappearance must not be reported as the last background error"
     );
     assert!(
-        storage.has_known_persisted_segment_changes(),
-        "the failed apply must restore the drained diff into pending state"
+        !storage.has_known_persisted_segment_changes(),
+        "the skipped root is retired, not restored into the pending diff"
+    );
+    assert!(
+        !storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .contains_key(&published_root),
+        "the deleted root must never enter the persisted index"
     );
 
-    // Compaction's own removal lands in the same pending diff — the convergent
-    // merged state the next tick applies.
+    // Compaction's own removal can also land after the skip; the retried pass
+    // applies it and settles.
     storage
         .persisted
         .pending_persisted_segment_diff
@@ -1649,6 +1653,136 @@ fn runtime_refresh_disappearance_is_transient_and_does_not_fence_writes() {
     assert!(
         points.contains(&DataPoint::new(3, 3.0)),
         "a write after the transient disappearance must succeed and be readable"
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
+fn vanished_added_root_removal_landing_after_drain_is_not_resurrected() {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+    let metric = "reverse_order_diff_resurrection_metric";
+
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert(metric, &labels)
+        .unwrap()
+        .series_id;
+
+    write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+
+    let storage = Arc::new(new_raw_numeric_storage(lane_path.clone(), 2));
+    storage
+        .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap(), false)
+        .unwrap();
+
+    // A flush publishes R and records it as pending added.
+    let published_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 2, &[(2, 2.0)]);
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(std::iter::once(published_root.clone()), std::iter::empty());
+    storage
+        .persisted
+        .persisted_index_dirty
+        .store(true, Ordering::SeqCst);
+
+    // Compaction removes R from disk before the refresh can load it.
+    crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(&published_root).unwrap();
+
+    // The reverse of the existing transient test's ordering: the removal lands
+    // in pending AFTER the refresh drained the +R diff. On the unfixed code the
+    // failed load restores (+R) and record_changes' add-before-remove ordering
+    // cancels the pending -R, resurrecting a root that no longer exists.
+    {
+        let weak = Arc::downgrade(&storage);
+        let removed_root = published_root.clone();
+        storage.set_known_dirty_load_hook(move || {
+            if let Some(storage) = weak.upgrade() {
+                storage
+                    .persisted
+                    .pending_persisted_segment_diff
+                    .lock()
+                    .record_changes(std::iter::empty(), std::iter::once(removed_root.clone()));
+            }
+        });
+    }
+
+    let apply = storage.sync_persisted_segments_from_disk_if_dirty();
+    storage.clear_known_dirty_load_hook();
+    assert!(
+        apply.is_ok(),
+        "a vanished added root must not fail the pass: {apply:?}"
+    );
+
+    {
+        let pending = storage.persisted.pending_persisted_segment_diff.lock();
+        assert!(
+            !pending.added_roots.contains(&published_root),
+            "the vanished root must not be resurrected onto the added side: {:?}",
+            pending.added_roots
+        );
+        assert!(
+            pending.removed_roots.contains(&published_root),
+            "the compacted removal must survive on the removed side: {:?}",
+            pending.removed_roots
+        );
+    }
+
+    let health = storage.observability_snapshot().health;
+    assert!(
+        !health.fail_fast_triggered,
+        "a vanished added root is a transient retirement, not a fenced failure"
+    );
+    assert_eq!(
+        health.background_errors_total, 0,
+        "the vanished root must not be counted as a background failure"
+    );
+
+    // The next pass applies the removal and settles.
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+    assert!(
+        !storage.has_known_persisted_segment_changes(),
+        "the retried pass must drain the pending removal"
+    );
+    assert!(
+        !storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst),
+        "the retried pass must settle the dirty flag"
+    );
+    assert!(
+        !storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .contains_key(&published_root),
+        "the deleted root must never enter the persisted index"
+    );
+
+    // Service is not fenced.
+    storage
+        .insert_rows(&[Row::with_labels(
+            metric,
+            labels.clone(),
+            DataPoint::new(3, 3.0),
+        )])
+        .unwrap();
+    let points = storage.select(metric, &labels, 0, 10).unwrap();
+    assert!(
+        points.contains(&DataPoint::new(3, 3.0)),
+        "a write after the reverse-order race must succeed and be readable"
     );
 
     storage.close().unwrap();
@@ -4097,6 +4231,7 @@ fn window_diff_is_merged_into_pending_diff_immediately() {
             ChunkStorage::merge_published_window(
                 storage.persisted.pending_persisted_segment_diff.as_ref(),
                 storage.persisted.persisted_index_dirty.as_ref(),
+                storage.observability.as_ref(),
                 window,
             );
             // The contract the background worker and close path rely on: the
@@ -4156,6 +4291,19 @@ fn window_diff_is_merged_into_pending_diff_immediately() {
             .len(),
         12,
         "all twelve L0 sources must be pending removal"
+    );
+
+    // Observability: the round's window count and the live pending-diff gauge.
+    let snapshot = storage.observability_snapshot();
+    assert_eq!(
+        snapshot.compaction.windows_merged_total,
+        u64::from(stats.windows_merged),
+        "windows_merged_total must track the round's stats"
+    );
+    assert_eq!(
+        snapshot.health.pending_persisted_segment_diff_entries,
+        3 + 12,
+        "the pending-diff gauge must reflect added + removed roots"
     );
 
     // Apply the merged diff before closing: the close pipeline plans from the
@@ -4258,6 +4406,7 @@ fn blob_lane_failure_keeps_the_numeric_lane_windows_already_merged() {
             ChunkStorage::merge_published_window(
                 storage.persisted.pending_persisted_segment_diff.as_ref(),
                 storage.persisted.persisted_index_dirty.as_ref(),
+                storage.observability.as_ref(),
                 window,
             );
         },
@@ -4462,7 +4611,7 @@ fn memory_built_catalog_matches_disk_built_catalog() {
                 crate::engine::segment::load_segment_series_metadata(&source.root).unwrap();
             (
                 source.root.clone(),
-                super::super::registry_contributions::SeriesRun::from_series(&series),
+                contributions.series_run_from_series(&series),
             )
         })
         .collect::<Vec<_>>();
@@ -4477,6 +4626,106 @@ fn memory_built_catalog_matches_disk_built_catalog() {
         serde_json::to_vec_pretty(&disk).unwrap(),
         serde_json::to_vec_pretty(&memory).unwrap(),
         "the memory-built catalog must be byte-identical to the disk-built catalog"
+    );
+}
+
+/// Over the absolute entry budget, the write must degrade to the disk path —
+/// never to wrong output — and produce the same catalog bytes.
+#[test]
+fn contribution_entry_budget_falls_back_to_disk_with_identical_catalog() {
+    use crate::engine::fs_utils::{count_segment_file_reads_under, CountingSegmentReads};
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+
+    let storage = new_raw_numeric_storage(lane_path.clone(), 1);
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "budget_fallback",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1, 1.0),
+            ),
+            Row::with_labels(
+                "budget_fallback",
+                vec![Label::new("host", "b")],
+                DataPoint::new(2, 2.0),
+            ),
+        ])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "budget_fallback",
+                vec![Label::new("host", "a")],
+                DataPoint::new(3, 3.0),
+            ),
+            Row::with_labels(
+                "budget_fallback_second",
+                vec![Label::new("host", "c")],
+                DataPoint::new(4, 4.0),
+            ),
+        ])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    storage.close().unwrap();
+
+    let inventory =
+        super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
+            .unwrap();
+    let sources = super::super::registry_catalog::inventory_sources(&inventory);
+    let contributions = super::super::registry_contributions::RegistryContributions::new();
+    let primed = sources
+        .iter()
+        .map(|source| {
+            let series =
+                crate::engine::segment::load_segment_series_metadata(&source.root).unwrap();
+            (
+                source.root.clone(),
+                contributions.series_run_from_series(&series),
+            )
+        })
+        .collect::<Vec<_>>();
+    contributions.prime(&primed);
+
+    let disk = super::super::registry_catalog::build_catalog_from_disk(&sources).unwrap();
+    let disk_bytes = serde_json::to_vec_pretty(&disk).unwrap();
+
+    // Under budget the cache answers the whole write from memory.
+    let guard = CountingSegmentReads::install(temp_dir.path());
+    let cached = super::super::registry_catalog::build_catalog_from_memory_with_budget(
+        &sources,
+        &contributions,
+        usize::MAX,
+    )
+    .unwrap();
+    let cached_reads = count_segment_file_reads_under(temp_dir.path());
+    drop(guard);
+    assert_eq!(
+        cached_reads, 0,
+        "a primed cache under budget must not re-read segment files"
+    );
+    assert_eq!(serde_json::to_vec_pretty(&cached).unwrap(), disk_bytes);
+
+    // Over budget the write re-derives the fingerprint from disk.
+    let guard = CountingSegmentReads::install(temp_dir.path());
+    let budgeted = super::super::registry_catalog::build_catalog_from_memory_with_budget(
+        &sources,
+        &contributions,
+        1,
+    )
+    .unwrap();
+    let budgeted_reads = count_segment_file_reads_under(temp_dir.path());
+    drop(guard);
+    assert!(
+        budgeted_reads > 0,
+        "over the entry budget the disk fallback must read series.bin"
+    );
+    assert_eq!(
+        serde_json::to_vec_pretty(&budgeted).unwrap(),
+        disk_bytes,
+        "the budget fallback must still produce the exact catalog"
     );
 }
 
@@ -4951,6 +5200,14 @@ fn startup_primes_registry_contributions_from_segment_series_files() {
             .is_some(),
         "a failed-free prime leaves the root cached"
     );
+    assert_eq!(
+        storage
+            .observability_snapshot()
+            .health
+            .registry_contribution_entries,
+        2,
+        "the health snapshot must expose the contribution cache footprint"
+    );
 
     // A catalog write after priming costs no segment reads: entries come from
     // the persisted index and the fingerprint from the cache.
@@ -4975,7 +5232,7 @@ fn startup_primes_registry_contributions_from_segment_series_files() {
 /// to the disk path for that write, so an over-priced cache can never produce a
 /// fingerprint that disagrees with the segments.
 #[test]
-fn oversized_contribution_footprint_falls_back_to_the_disk_fingerprint() {
+fn over_budget_contribution_falls_back_to_the_disk_fingerprint() {
     let temp_dir = TempDir::new().unwrap();
     let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
 
@@ -5012,16 +5269,22 @@ fn oversized_contribution_footprint_falls_back_to_the_disk_fingerprint() {
         )]),
     );
 
-    let at_ceiling = super::super::registry_catalog::build_series_fingerprint_from_contributions(
-        &vec![source.clone(); 4],
-        &contributions,
-    )
-    .unwrap();
-    let over_ceiling = super::super::registry_catalog::build_series_fingerprint_from_contributions(
-        &vec![source.clone(); 5],
-        &contributions,
-    )
-    .unwrap();
+    // Four copies of the same source price four entries.
+    let sources = vec![source.clone(); 4];
+    let at_budget =
+        super::super::registry_catalog::build_series_fingerprint_from_contributions_with_budget(
+            &sources,
+            &contributions,
+            4,
+        )
+        .unwrap();
+    let over_budget =
+        super::super::registry_catalog::build_series_fingerprint_from_contributions_with_budget(
+            &sources,
+            &contributions,
+            3,
+        )
+        .unwrap();
 
     let cache_only = super::super::registry_catalog::fingerprint_series_fields([(
         series_id,
@@ -5029,16 +5292,16 @@ fn oversized_contribution_footprint_falls_back_to_the_disk_fingerprint() {
         [].as_slice(),
     )]);
     assert_eq!(
-        at_ceiling, cache_only,
-        "at the ceiling the cache is trusted"
+        at_budget, cache_only,
+        "at the entry budget the cache is trusted"
     );
     assert_eq!(
-        over_ceiling,
+        over_budget,
         super::super::registry_catalog::build_series_fingerprint_from_sources(
             std::slice::from_ref(&source),
         )
         .unwrap(),
-        "over the ceiling the write re-reads the segments"
+        "over the entry budget the write re-reads the segments"
     );
-    assert_ne!(over_ceiling, cache_only);
+    assert_ne!(over_budget, cache_only);
 }

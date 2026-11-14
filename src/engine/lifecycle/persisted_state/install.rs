@@ -1,5 +1,4 @@
 use super::*;
-use crate::engine::storage_engine::registry_contributions;
 
 impl ChunkStorage {
     pub(super) fn accumulate_max_timestamp(current: &mut Option<i64>, candidate: Option<i64>) {
@@ -350,10 +349,9 @@ impl ChunkStorage {
         // series payload stays unprimed and the catalog build reads it from
         // disk on demand.
         if indexed_segment.series.len() == segment_series_count {
-            self.persisted.registry_contributions.replace_root(
-                &root,
-                registry_contributions::SeriesRun::from_series(&indexed_segment.series),
-            );
+            self.persisted
+                .registry_contributions
+                .replace_root_from_series(&root, &indexed_segment.series);
         }
 
         Ok((

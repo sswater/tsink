@@ -20,14 +20,17 @@ use tracing::warn;
 const REGISTRY_CATALOG_FILE_NAME: &str = "series_index.catalog.json";
 const REGISTRY_CATALOG_VERSION: u32 = 2;
 
-/// Cache footprint ceiling, as a multiple of the distinct series count.
+/// Absolute budget for the series-entry set one catalog write may merge from the
+/// contribution cache.
 ///
-/// The contribution cache holds one run per segment, so its footprint is
-/// O(Σ per-segment series). While the same series sits in several levels that
-/// ratio stays small (one per level); a ratio above this ceiling means the
-/// in-memory union is pricing far more entries than it produces, so that
-/// write falls back to the disk path instead of trusting the cache.
-const CONTRIBUTION_FOOTPRINT_LIMIT_RATIO: usize = 4;
+/// The cache now interns `(metric, labels)` payloads, so its remaining footprint
+/// is the per-segment `SeriesId` entries. A write whose merged runs exceed this
+/// many entries falls back to the disk path instead of paying an unbounded
+/// in-memory merge (and holding the maintenance gate longer). The budget is an
+/// absolute count, not a ratio to the distinct series count: a ratio fires on
+/// the normal multi-level skew and silently reintroduces O(N) `series.bin`
+/// reads on every debounced write.
+pub(super) const DEFAULT_CONTRIBUTION_ENTRY_BUDGET: usize = 2_000_000;
 
 /// One persisted segment the catalog must describe.
 ///
@@ -197,12 +200,23 @@ pub(super) fn build_catalog_from_memory(
     sources: &[PersistedRegistryCatalogSource],
     contributions: &RegistryContributions,
 ) -> Result<PersistedRegistryCatalogFile> {
+    build_catalog_from_memory_with_budget(sources, contributions, DEFAULT_CONTRIBUTION_ENTRY_BUDGET)
+}
+
+/// Budget-parameterized memory build; tests lower the budget to pin the disk
+/// fallback without allocating millions of entries.
+pub(super) fn build_catalog_from_memory_with_budget(
+    sources: &[PersistedRegistryCatalogSource],
+    contributions: &RegistryContributions,
+    entry_budget: usize,
+) -> Result<PersistedRegistryCatalogFile> {
     Ok(PersistedRegistryCatalogFile {
         version: REGISTRY_CATALOG_VERSION,
         segments: build_catalog_entries(sources)?,
-        series_fingerprint: Some(build_series_fingerprint_from_contributions(
+        series_fingerprint: Some(build_series_fingerprint_from_contributions_with_budget(
             sources,
             contributions,
+            entry_budget,
         )?),
     })
 }
@@ -332,6 +346,18 @@ pub(super) fn build_series_fingerprint_from_contributions(
     sources: &[PersistedRegistryCatalogSource],
     contributions: &RegistryContributions,
 ) -> Result<PersistedRegistrySeriesFingerprint> {
+    build_series_fingerprint_from_contributions_with_budget(
+        sources,
+        contributions,
+        DEFAULT_CONTRIBUTION_ENTRY_BUDGET,
+    )
+}
+
+pub(super) fn build_series_fingerprint_from_contributions_with_budget(
+    sources: &[PersistedRegistryCatalogSource],
+    contributions: &RegistryContributions,
+    entry_budget: usize,
+) -> Result<PersistedRegistrySeriesFingerprint> {
     let mut runs = Vec::<Arc<SeriesRun>>::with_capacity(sources.len());
 
     for source in sources {
@@ -339,7 +365,7 @@ pub(super) fn build_series_fingerprint_from_contributions(
             Some(run) => runs.push(run),
             None => match load_segment_series_metadata(&source.root) {
                 Ok(series) => {
-                    let run = Arc::new(SeriesRun::from_series(&series));
+                    let run = Arc::new(contributions.series_run_from_series(&series));
                     contributions.replace_root_shared(&source.root, Arc::clone(&run));
                     runs.push(run);
                 }
@@ -356,25 +382,21 @@ pub(super) fn build_series_fingerprint_from_contributions(
     }
 
     let contribution_count = runs.iter().map(|run| run.len()).sum::<usize>();
-    let borrowed = runs.iter().map(|run| run.as_ref()).collect::<Vec<_>>();
-    let fingerprint = merge_series_runs(&borrowed)?;
 
-    // Bounded degradation: never emit a fingerprint from a cache that is
-    // repricing far more entries than distinct series; re-derive it from the
-    // segments instead so the output is still exact.
-    if contribution_count
-        > CONTRIBUTION_FOOTPRINT_LIMIT_RATIO.saturating_mul(fingerprint.series_count)
-    {
+    // Bounded degradation: never price an unbounded in-memory merge; re-derive
+    // the fingerprint from the segments instead so the output is still exact.
+    if contribution_count > entry_budget {
         warn!(
             contributions = contribution_count,
             cache_entries = contributions.entry_count(),
-            distinct_series = fingerprint.series_count,
-            "Registry contribution cache exceeds its footprint ceiling; re-reading segment series for this catalog write"
+            entry_budget,
+            "Registry contribution cache exceeds its entry budget; re-reading segment series for this catalog write"
         );
         return build_series_fingerprint_from_sources(sources);
     }
 
-    Ok(fingerprint)
+    let borrowed = runs.iter().map(|run| run.as_ref()).collect::<Vec<_>>();
+    merge_series_runs(&borrowed)
 }
 
 pub(super) fn build_series_fingerprint_from_sources(

@@ -204,6 +204,13 @@ impl Compactor {
         &self,
         on_window: &mut dyn FnMut(PendingPersistedSegmentDiff),
     ) -> Result<CompactionRunStats> {
+        // Close and the background worker share this compactor. Refuse to start
+        // a second round rather than planning the same inventory twice: the
+        // other round is draining, and the caller re-arms on its next tick.
+        let Some(_round_claim) = self.try_claim_round() else {
+            return Ok(CompactionRunStats::default());
+        };
+
         // Skip before any disk access: the background compaction thread wakes up
         // before the inventory provider is injected, and must not fall back to an
         // O(N) scan in that window.

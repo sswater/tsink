@@ -12,10 +12,11 @@
 //! immutable segment root, so it never needs invalidation: segment roots are
 //! unique per (level, segment id) and are never rewritten in place.
 //!
-//! Footprint: O(Σ per-segment series), i.e. it can exceed the distinct series
-//! count while the same series lives in several levels. Callers that notice the
-//! skew (see [`super::registry_catalog`]) bound it by falling back to the disk
-//! path for that write instead of trusting an oversized cache.
+//! Footprint: the payload of a `(metric, labels)` key is interned per storage, so
+//! identical keys across segments and levels share one allocation. The remaining
+//! cost is the per-segment `SeriesId` entries, i.e. O(Σ per-segment series). A
+//! write whose runs exceed [`super::registry_catalog::DEFAULT_CONTRIBUTION_ENTRY_BUDGET`]
+//! falls back to the disk path instead of trusting an oversized cache.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -31,10 +32,15 @@ use crate::engine::segment::{load_segment_series_metadata, IndexedSegment, Persi
 use crate::engine::series::SeriesId;
 use crate::Label;
 
+/// `(metric, labels)` identity of one series.
+pub(in crate::engine::storage_engine) type SeriesKey = (String, Vec<Label>);
+
+/// Interned, `Arc`-shared series identity payload.
+pub(in crate::engine::storage_engine) type InternedSeriesKey = Arc<SeriesKey>;
+
 /// One series identity contributed by a persisted segment: its id plus the
 /// `Arc`-shared `(metric, labels)` key.
-pub(in crate::engine::storage_engine) type SeriesContribution =
-    (SeriesId, Arc<(String, Vec<Label>)>);
+pub(in crate::engine::storage_engine) type SeriesContribution = (SeriesId, InternedSeriesKey);
 
 /// One persisted segment's series keys, sorted by [`SeriesId`].
 ///
@@ -46,22 +52,6 @@ pub(in crate::engine::storage_engine) struct SeriesRun(
 );
 
 impl SeriesRun {
-    /// Builds a run from segment series metadata (`series.bin`). `value_family`
-    /// is deliberately dropped: the catalog fingerprint only covers identity.
-    pub(in crate::engine::storage_engine) fn from_series(series: &[PersistedSeries]) -> Self {
-        let mut entries = series
-            .iter()
-            .map(|series| {
-                (
-                    series.series_id,
-                    Arc::new((series.metric.clone(), series.labels.clone())),
-                )
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|(series_id, _)| *series_id);
-        Self(entries)
-    }
-
     pub(in crate::engine::storage_engine) fn len(&self) -> usize {
         self.0.len()
     }
@@ -80,11 +70,45 @@ struct ContributionsInner {
     /// Σ per-segment series entries, kept in step with `runs` so replacement and
     /// eviction stay exact without walking the map.
     entry_count: usize,
+    /// Interned `(metric, labels)` payloads. Every run's key `Arc` points into
+    /// this map, so a series repeated across segments and levels occupies one
+    /// payload instead of one per segment. Bounded by the distinct series ever
+    /// published into this storage and dropped wholesale by [`RegistryContributions::clear`].
+    interned: HashMap<SeriesKey, InternedSeriesKey>,
 }
 
 impl RegistryContributions {
     pub(in crate::engine::storage_engine) fn new() -> Self {
         Self::default()
+    }
+
+    /// Builds a run from segment series metadata (`series.bin`), interning each
+    /// identity `(metric, labels)` payload so equal keys share one allocation.
+    ///
+    /// `value_family` is deliberately dropped: the catalog fingerprint only
+    /// covers identity.
+    pub(in crate::engine::storage_engine) fn series_run_from_series(
+        &self,
+        series: &[PersistedSeries],
+    ) -> SeriesRun {
+        let mut inner = self.inner.lock();
+        let mut entries = series
+            .iter()
+            .map(|series| {
+                let key = (series.metric.clone(), series.labels.clone());
+                let shared = match inner.interned.get(&key) {
+                    Some(shared) => Arc::clone(shared),
+                    None => {
+                        let shared = Arc::new(key.clone());
+                        inner.interned.insert(key, Arc::clone(&shared));
+                        shared
+                    }
+                };
+                (series.series_id, shared)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(series_id, _)| *series_id);
+        SeriesRun(entries)
     }
 
     /// Installs runs discovered outside the publish path (bootstrap priming).
@@ -97,6 +121,17 @@ impl RegistryContributions {
     /// Records (or replaces) one segment root's contribution.
     pub(in crate::engine::storage_engine) fn replace_root(&self, root: &Path, run: SeriesRun) {
         self.replace_root_shared(root, Arc::new(run));
+    }
+
+    /// Builds and records a root's contribution from its series payload,
+    /// interning the key bodies.
+    pub(in crate::engine::storage_engine) fn replace_root_from_series(
+        &self,
+        root: &Path,
+        series: &[PersistedSeries],
+    ) {
+        let run = self.series_run_from_series(series);
+        self.replace_root(root, run);
     }
 
     pub(in crate::engine::storage_engine) fn replace_root_shared(
@@ -128,6 +163,15 @@ impl RegistryContributions {
         let mut inner = self.inner.lock();
         inner.runs.clear();
         inner.entry_count = 0;
+        inner.interned.clear();
+    }
+
+    /// Number of distinct interned `(metric, labels)` payloads, i.e. the payload
+    /// allocation count the cache currently holds. Test-only observability for
+    /// the interning contract.
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn interned_payload_count(&self) -> usize {
+        self.inner.lock().interned.len()
     }
 
     pub(in crate::engine::storage_engine) fn run_for_root(
@@ -160,7 +204,7 @@ pub(in crate::engine::storage_engine) fn merge_series_runs(
     }
 
     let mut merged: Vec<SeriesContribution> = Vec::new();
-    let mut series_id_by_key = HashMap::<Arc<(String, Vec<Label>)>, SeriesId>::new();
+    let mut series_id_by_key = HashMap::<InternedSeriesKey, SeriesId>::new();
 
     while let Some(Reverse((series_id, run_index, position))) = cursors.pop() {
         let run = runs[run_index];
@@ -240,7 +284,11 @@ impl ChunkStorage {
             }
             match load_segment_series_metadata(&root) {
                 Ok(series) => {
-                    primed.push((root, SeriesRun::from_series(&series)));
+                    let run = self
+                        .persisted
+                        .registry_contributions
+                        .series_run_from_series(&series);
+                    primed.push((root, run));
                 }
                 Err(err) => warn!(
                     path = %root.display(),
@@ -268,7 +316,7 @@ impl ChunkStorage {
             }
             self.persisted
                 .registry_contributions
-                .replace_root(&segment.root, SeriesRun::from_series(&segment.series));
+                .replace_root_from_series(&segment.root, &segment.series);
         }
     }
 }
@@ -291,7 +339,7 @@ mod tests {
     }
 
     fn run(series: &[PersistedSeries]) -> SeriesRun {
-        SeriesRun::from_series(series)
+        RegistryContributions::new().series_run_from_series(series)
     }
 
     /// The merged fingerprint must equal the disk path's fingerprint over the
@@ -413,5 +461,47 @@ mod tests {
             fingerprint,
             fingerprint_series_fields(std::iter::empty::<(SeriesId, &str, &[Label])>())
         );
+    }
+
+    /// The same series contributed by several segments must share one payload
+    /// allocation. Without interning the cache retains one `(metric, labels)`
+    /// copy per segment per level, which is what made the footprint unbounded.
+    #[test]
+    fn identical_series_keys_share_one_payload_across_segments() {
+        let contributions = RegistryContributions::new();
+        let payload = vec![
+            series(1, "cpu", &[("host", "a")]),
+            series(2, "mem", &[("host", "a"), ("zone", "z")]),
+        ];
+
+        let first = contributions.series_run_from_series(&payload);
+        let second = contributions.series_run_from_series(&payload);
+        let third = contributions.series_run_from_series(&payload);
+
+        assert_eq!(
+            contributions.interned_payload_count(),
+            2,
+            "two distinct keys must intern to two payloads"
+        );
+        for index in 0..payload.len() {
+            assert!(
+                Arc::ptr_eq(&first.0[index].1, &second.0[index].1),
+                "the same key must share its payload across runs"
+            );
+            assert!(
+                Arc::ptr_eq(&first.0[index].1, &third.0[index].1),
+                "the same key must share its payload across runs"
+            );
+        }
+
+        contributions.replace_root(Path::new("/seg/one"), first);
+        contributions.replace_root(Path::new("/seg/two"), second);
+        contributions.replace_root(Path::new("/seg/three"), third);
+        assert_eq!(
+            contributions.entry_count(),
+            6,
+            "per-segment entries are still counted exactly"
+        );
+        assert_eq!(contributions.interned_payload_count(), 2);
     }
 }

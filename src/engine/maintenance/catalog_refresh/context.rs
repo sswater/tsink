@@ -50,12 +50,21 @@ impl<'a> CatalogRefreshContext<'a> {
     }
 
     pub(super) fn take_known_persisted_segment_changes(self) -> PendingPersistedSegmentDiff {
-        std::mem::take(&mut *self.pending_persisted_segment_diff.lock())
+        let taken = std::mem::take(&mut *self.pending_persisted_segment_diff.lock());
+        self.observability
+            .record_pending_persisted_segment_diff_len(0, 0);
+        taken
     }
 
     pub(super) fn restore_known_persisted_segment_changes(self, diff: PendingPersistedSegmentDiff) {
         if !diff.is_empty() {
-            self.pending_persisted_segment_diff.lock().merge(diff);
+            let (added, removed) = {
+                let mut pending = self.pending_persisted_segment_diff.lock();
+                pending.merge(diff);
+                (pending.added_roots.len(), pending.removed_roots.len())
+            };
+            self.observability
+                .record_pending_persisted_segment_diff_len(added, removed);
         }
     }
 
@@ -89,6 +98,19 @@ impl<'a> CatalogRefreshContext<'a> {
             .full_inventory_scan_hook
             .read()
             .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Runs between draining the known diff and loading its added roots.
+    ///
+    /// Deterministic interleaving seam for the reverse-ordering regression: a
+    /// test merges a concurrent removal into the (now empty) pending diff here,
+    /// exactly where compaction can land it after the drain.
+    #[cfg(test)]
+    pub(super) fn invoke_known_dirty_load_hook(self) {
+        let hook = self.persist_test_hooks.known_dirty_load_hook.read().clone();
         if let Some(hook) = hook {
             hook();
         }
@@ -164,6 +186,10 @@ impl<'a> CatalogRefreshContext<'a> {
 
     pub(super) fn persisted_segment_inventory(self) -> SegmentInventory {
         SegmentInventory::from_persisted_index(&self.persisted_index.read())
+    }
+
+    pub(super) fn observability_counters(self) -> &'a StorageObservabilityCounters {
+        self.observability
     }
 
     fn capture_persisted_catalog_refresh_snapshot(self) -> Result<PersistedCatalogRefreshSnapshot> {
@@ -349,6 +375,19 @@ impl ChunkStorage {
     #[cfg(test)]
     pub(in crate::engine::storage_engine) fn clear_full_inventory_scan_hook(&self) {
         *self.persist_test_hooks.full_inventory_scan_hook.write() = None;
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn set_known_dirty_load_hook<F>(&self, hook: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        *self.persist_test_hooks.known_dirty_load_hook.write() = Some(Arc::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::storage_engine) fn clear_known_dirty_load_hook(&self) {
+        *self.persist_test_hooks.known_dirty_load_hook.write() = None;
     }
 
     pub(in crate::engine::storage_engine) fn load_segment_index_for_runtime_refresh(

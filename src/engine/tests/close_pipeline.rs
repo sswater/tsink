@@ -193,6 +193,16 @@ fn close_defers_compaction_when_a_visible_manifest_is_unreadable() {
     corrupted_manifest[0] ^= 0xff;
     std::fs::write(&corrupted_manifest_path, corrupted_manifest).unwrap();
 
+    // The contribution cache holds this root's series identity from before the
+    // corruption, so the in-memory fingerprint would otherwise be derivable and
+    // the catalog writable. Evict it to model a root that was never primed: its
+    // fingerprint has to read the (now corrupt) manifest, which is exactly the
+    // "catalog cannot be rebuilt" case this test pins.
+    storage
+        .persisted
+        .registry_contributions
+        .remove_root(&roots[7]);
+
     let close_result = storage.close();
 
     std::fs::write(&corrupted_manifest_path, original_manifest).unwrap();

@@ -19,6 +19,9 @@ pub(super) struct PersistTestHooks {
     pub(super) crash_after_samples_persisted: AtomicBool,
     pub(super) crash_before_publish_persisted: AtomicBool,
     pub(super) full_inventory_scan_hook: RwLock<Option<Arc<IngestCommitHook>>>,
+    /// Runs after a known-dirty diff has been drained and before its added
+    /// roots are loaded, so a test can land a concurrent removal in the gap.
+    pub(super) known_dirty_load_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) post_flush_maintenance_stage_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_all_series_seed_hook: RwLock<Option<Arc<IngestCommitHook>>>,
     pub(super) metadata_all_series_postings_hook: RwLock<Option<Arc<IngestCommitHook>>>,

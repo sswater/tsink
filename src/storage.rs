@@ -441,6 +441,7 @@ pub struct CompactionObservabilitySnapshot {
     pub output_chunks_total: u64,
     pub source_points_total: u64,
     pub output_points_total: u64,
+    pub windows_merged_total: u64,
     pub duration_nanos_total: u64,
 }
 
@@ -532,6 +533,14 @@ impl Default for RemoteStorageObservabilitySnapshot {
 pub struct StorageHealthSnapshot {
     pub background_errors_total: u64,
     pub maintenance_errors_total: u64,
+    /// Segment disappearances the runtime refresh classified as transient
+    /// (concurrent compaction/retention retirement). Warn-only, never fencing.
+    pub transient_disappearances_total: u64,
+    /// Current size of the pending persisted-segment diff (added + removed
+    /// roots). A growing value means the refresh path cannot keep up.
+    pub pending_persisted_segment_diff_entries: u64,
+    /// Σ per-segment series entries held by the registry contribution cache.
+    pub registry_contribution_entries: u64,
     pub degraded: bool,
     pub fail_fast_enabled: bool,
     pub fail_fast_triggered: bool,

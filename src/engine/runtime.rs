@@ -93,12 +93,15 @@ impl<'a> BackgroundWorkerControl<'a> {
         match result {
             Ok(_) => BackgroundWorkerFlow::Continue,
             Err(err) if is_runtime_refresh_disappearance_error(&err) => {
-                // The runtime-refresh apply path already restored the drained
-                // diff into pending state and re-armed the dirty flag, and the
-                // concurrent compaction's removal lands in that same pending
-                // diff, so the next pass applies the convergent merged state.
-                // Fencing service here would turn a self-healing race into a
-                // permanent outage, so this is warned about but never poisoned.
+                self.observability.record_transient_disappearance();
+                // The runtime-refresh apply path restores any diff it drained
+                // into pending state; it does not re-arm the dirty flag, so the
+                // retry is driven by `has_known_persisted_segment_changes()`.
+                // The concurrent compaction's removal lands in that same
+                // pending diff, so the next pass applies the convergent merged
+                // state. Fencing service here would turn a self-healing race
+                // into a permanent outage, so this is warned about but never
+                // poisoned.
                 tracing::warn!(
                     worker,
                     error = %err,
@@ -303,6 +306,7 @@ impl ChunkStorage {
                                     ChunkStorage::merge_published_window(
                                         pending_persisted_segment_diff.as_ref(),
                                         persisted_index_dirty.as_ref(),
+                                        observability.as_ref(),
                                         window,
                                     );
                                 },

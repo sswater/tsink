@@ -175,8 +175,10 @@ pub(crate) fn is_vanished_source_error(err: &TsinkError) -> bool {
 /// A segment that disappears between an inventory snapshot and the runtime
 /// refresh load that follows it was retired by a concurrent compaction or
 /// retention pass. For the runtime-refresh worker this is a transient race:
-/// the drained diff is restored into pending state and re-armed as dirty, and
-/// the next pass applies the convergent merged state. It must therefore not
+/// callers skip the vanished root while the concurrent remover's removal lands
+/// in the same pending diff, so the next pass applies the convergent merged
+/// state. Restoring a drained diff does **not** re-arm the dirty flag; retries
+/// are driven by `has_known_persisted_segment_changes()`. It must therefore not
 /// fence service the way a real background failure does.
 pub(crate) fn is_runtime_refresh_disappearance_error(err: &TsinkError) -> bool {
     matches!(

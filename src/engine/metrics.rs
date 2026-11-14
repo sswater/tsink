@@ -67,6 +67,9 @@ impl StorageObservabilityCounters {
             saturating_u64_from_usize(stats.output_points),
             Ordering::Relaxed,
         );
+        self.compaction
+            .windows_merged_total
+            .fetch_add(u64::from(stats.windows_merged), Ordering::Relaxed);
         if stats.compacted {
             self.compaction
                 .success_total
@@ -121,6 +124,27 @@ impl StorageObservabilityCounters {
             .maintenance_errors_total
             .fetch_add(1, Ordering::Relaxed);
         *self.health.last_maintenance_error.write() = Some(format!("{operation}: {error}"));
+    }
+
+    /// Counts a segment disappearance the runtime refresh classified as
+    /// transient (concurrent compaction/retention retirement).
+    ///
+    /// These are warn-only and never poison the engine, so without this counter
+    /// a real lost segment would be invisible to health monitoring.
+    pub(super) fn record_transient_disappearance(&self) {
+        self.health
+            .transient_disappearances_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publishes the current pending persisted-segment diff size (added +
+    /// removed roots) as the health gauge. Called wherever the diff changes so
+    /// the gauge tracks it instead of only the last merge.
+    pub(super) fn record_pending_persisted_segment_diff_len(&self, added: usize, removed: usize) {
+        self.health.pending_persisted_segment_diff_entries.store(
+            saturating_u64_from_usize(added.saturating_add(removed)),
+            Ordering::Relaxed,
+        );
     }
 
     pub(super) fn record_remote_catalog_refresh_success(&self, refreshed_at_unix_ms: u64) {
@@ -246,6 +270,7 @@ pub(super) struct CompactionObservabilityCounters {
     pub(super) output_chunks_total: AtomicU64,
     pub(super) source_points_total: AtomicU64,
     pub(super) output_points_total: AtomicU64,
+    pub(super) windows_merged_total: AtomicU64,
     pub(super) duration_nanos_total: AtomicU64,
 }
 
@@ -345,6 +370,8 @@ impl Default for RemoteStorageObservabilityState {
 pub(super) struct HealthObservabilityState {
     pub(super) background_errors_total: AtomicU64,
     pub(super) maintenance_errors_total: AtomicU64,
+    pub(super) transient_disappearances_total: AtomicU64,
+    pub(super) pending_persisted_segment_diff_entries: AtomicU64,
     pub(super) fail_fast_triggered: AtomicBool,
     pub(super) last_background_error: RwLock<Option<String>>,
     pub(super) last_maintenance_error: RwLock<Option<String>>,
