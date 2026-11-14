@@ -1,13 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh64::Xxh64;
 
+use super::registry_contributions::{merge_series_runs, RegistryContributions, SeriesRun};
 use super::tiering::SegmentLaneFamily;
 use super::*;
 use crate::engine::fs_utils::{path_exists_no_follow, write_file_atomically_and_sync_parent};
-use crate::engine::segment::{is_vanished_source_error, IndexedSegment};
+use crate::engine::segment::{
+    is_vanished_source_error, load_segment_series_metadata, read_segment_manifest_fingerprint,
+    IndexedSegment, ManifestFileEntry, SegmentManifest, MANIFEST_FILE_ENTRY_COUNT,
+};
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::Label;
 use tracing::warn;
@@ -15,14 +20,31 @@ use tracing::warn;
 const REGISTRY_CATALOG_FILE_NAME: &str = "series_index.catalog.json";
 const REGISTRY_CATALOG_VERSION: u32 = 2;
 
+/// Cache footprint ceiling, as a multiple of the distinct series count.
+///
+/// The contribution cache holds one run per segment, so its footprint is
+/// O(Σ per-segment series). While the same series sits in several levels that
+/// ratio stays small (one per level); a ratio above this ceiling means the
+/// in-memory union is pricing far more entries than it produces, so that
+/// write falls back to the disk path instead of trusting the cache.
+const CONTRIBUTION_FOOTPRINT_LIMIT_RATIO: usize = 4;
+
+/// One persisted segment the catalog must describe.
+///
+/// `manifest`/`files` carry what the inventory (or a just-verified publish)
+/// already knows, so a catalog write does not re-read the segment. Sources that
+/// only know lane + root (e.g. a shared catalog file) leave them `None` and pay
+/// exactly one bounded manifest re-read.
 #[derive(Debug, Clone)]
 pub(super) struct PersistedRegistryCatalogSource {
     pub(super) lane: SegmentLaneFamily,
     pub(super) root: PathBuf,
+    pub(super) manifest: Option<SegmentManifest>,
+    pub(super) files: Option<[ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PersistedRegistryCatalogFile {
+pub(super) struct PersistedRegistryCatalogFile {
     version: u32,
     segments: Vec<PersistedRegistryCatalogEntry>,
     #[serde(default)]
@@ -30,7 +52,7 @@ struct PersistedRegistryCatalogFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PersistedRegistryCatalogEntry {
+pub(super) struct PersistedRegistryCatalogEntry {
     lane: SegmentLaneFamily,
     level: u8,
     segment_id: u64,
@@ -53,8 +75,8 @@ struct PersistedRegistryCatalogEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct PersistedRegistrySeriesFingerprint {
-    series_count: usize,
-    series_hash64: u64,
+    pub(in crate::engine::storage_engine) series_count: usize,
+    pub(in crate::engine::storage_engine) series_hash64: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +91,11 @@ pub(super) fn catalog_path(snapshot_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(REGISTRY_CATALOG_FILE_NAME))
 }
 
+/// Compares the catalog sidecar against the expected segment entries.
+///
+/// The expectation is inventory-driven: sources that carry their manifest
+/// `files` are compared from memory, so validation costs no segment reads for
+/// segments the startup scan already parsed.
 pub(super) fn validate_registry_catalog(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
@@ -89,12 +116,14 @@ pub(super) fn validate_registry_catalog(
     }))
 }
 
+/// Writes the catalog from the in-memory inventory + contribution cache.
 pub(super) fn persist_registry_catalog(
     snapshot_path: &Path,
     sources: &[PersistedRegistryCatalogSource],
+    contributions: &RegistryContributions,
 ) -> Result<()> {
     let path = catalog_path(snapshot_path);
-    let bytes = serde_json::to_vec_pretty(&build_catalog(sources)?)?;
+    let bytes = serde_json::to_vec_pretty(&build_catalog_from_memory(sources, contributions)?)?;
     write_file_atomically_and_sync_parent(&path, &bytes)
 }
 
@@ -107,6 +136,8 @@ pub(super) fn inventory_sources(
         .map(|entry| PersistedRegistryCatalogSource {
             lane: entry.lane,
             root: entry.root.clone(),
+            manifest: Some(entry.manifest.clone()),
+            files: entry.files,
         })
         .collect()
 }
@@ -127,14 +158,61 @@ pub(super) fn validate_registry_snapshot(
     ))
 }
 
-fn build_catalog(
+/// Memory catalog build: entries come from the source inventory, the series
+/// fingerprint from the contribution cache. Output must be byte-identical to
+/// [`build_catalog_from_disk`] for the same segment set.
+pub(super) fn build_catalog_from_memory(
     sources: &[PersistedRegistryCatalogSource],
+    contributions: &RegistryContributions,
 ) -> Result<PersistedRegistryCatalogFile> {
     Ok(PersistedRegistryCatalogFile {
         version: REGISTRY_CATALOG_VERSION,
         segments: build_catalog_entries(sources)?,
-        series_fingerprint: Some(build_series_fingerprint_from_sources(sources)?),
+        series_fingerprint: Some(build_series_fingerprint_from_contributions(
+            sources,
+            contributions,
+        )?),
     })
+}
+
+/// Disk catalog build: every field is re-read from the segment roots.
+///
+/// Kept as the byte-identical reference for the memory build in tests; the
+/// production fallback is bounded to the series fingerprint
+/// ([`build_series_fingerprint_from_sources`]), because entries never need a
+/// full re-read beyond their per-source manifest fallback.
+#[cfg(test)]
+pub(super) fn build_catalog_from_disk(
+    sources: &[PersistedRegistryCatalogSource],
+) -> Result<PersistedRegistryCatalogFile> {
+    let disk_sources = sources
+        .iter()
+        .map(|source| PersistedRegistryCatalogSource {
+            manifest: None,
+            files: None,
+            ..source.clone()
+        })
+        .collect::<Vec<_>>();
+    Ok(PersistedRegistryCatalogFile {
+        version: REGISTRY_CATALOG_VERSION,
+        segments: build_catalog_entries(&disk_sources)?,
+        series_fingerprint: Some(build_series_fingerprint_from_sources(&disk_sources)?),
+    })
+}
+
+/// Catalog entries for an inventory snapshot.
+///
+/// The `contributions` handle is part of the in-memory build contract: the
+/// entries and the fingerprint halves of one catalog are always produced from
+/// the same inventory/contributions pair. Entries themselves are fully
+/// inventory-driven and only fall back to one manifest read per entry whose
+/// inventory source lacks the recorded file fingerprints.
+#[allow(dead_code)] // inventory-entry contract for the in-memory build
+pub(super) fn build_catalog_entries_from_inventory(
+    inventory: &super::tiering::SegmentInventory,
+    _contributions: &RegistryContributions,
+) -> Result<Vec<PersistedRegistryCatalogEntry>> {
+    build_catalog_entries(&inventory_sources(inventory))
 }
 
 /// A catalog source that vanished (root directory removed, or its required
@@ -170,19 +248,38 @@ fn build_catalog_entries(
 fn build_catalog_entry(
     source: &PersistedRegistryCatalogSource,
 ) -> Result<PersistedRegistryCatalogEntry> {
-    let fingerprint = crate::engine::segment::read_segment_manifest_fingerprint(&source.root)?;
-    let [chunks, chunk_index, series, postings] = fingerprint.files;
-    Ok(PersistedRegistryCatalogEntry {
-        lane: source.lane,
-        level: fingerprint.manifest.level,
-        segment_id: fingerprint.manifest.segment_id,
-        chunk_count: fingerprint.manifest.chunk_count,
-        point_count: fingerprint.manifest.point_count,
-        series_count: fingerprint.manifest.series_count,
-        min_ts: fingerprint.manifest.min_ts,
-        max_ts: fingerprint.manifest.max_ts,
-        wal_highwater_segment: fingerprint.manifest.wal_highwater.segment,
-        wal_highwater_frame: fingerprint.manifest.wal_highwater.frame,
+    match (&source.manifest, source.files) {
+        (Some(manifest), Some(files)) => Ok(catalog_entry(source.lane, manifest, &files)),
+        _ => {
+            // Bounded fallback: a source whose inventory only knows the root
+            // (shared catalog file) or a legacy/test constructor.
+            let fingerprint = read_segment_manifest_fingerprint(&source.root)?;
+            Ok(catalog_entry(
+                source.lane,
+                &fingerprint.manifest,
+                &fingerprint.files,
+            ))
+        }
+    }
+}
+
+fn catalog_entry(
+    lane: SegmentLaneFamily,
+    manifest: &SegmentManifest,
+    files: &[ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT],
+) -> PersistedRegistryCatalogEntry {
+    let [chunks, chunk_index, series, postings] = files;
+    PersistedRegistryCatalogEntry {
+        lane,
+        level: manifest.level,
+        segment_id: manifest.segment_id,
+        chunk_count: manifest.chunk_count,
+        point_count: manifest.point_count,
+        series_count: manifest.series_count,
+        min_ts: manifest.min_ts,
+        max_ts: manifest.max_ts,
+        wal_highwater_segment: manifest.wal_highwater.segment,
+        wal_highwater_frame: manifest.wal_highwater.frame,
         chunks_len: chunks.file_len,
         chunks_hash64: chunks.hash64,
         chunk_index_len: chunk_index.file_len,
@@ -191,29 +288,83 @@ fn build_catalog_entry(
         series_hash64: series.hash64,
         postings_len: postings.file_len,
         postings_hash64: postings.hash64,
-    })
+    }
 }
 
-fn build_series_fingerprint_from_sources(
+/// Series fingerprint from the contribution cache.
+///
+/// Roots without a cached run (bootstrap priming failed, or a source that was
+/// added without its series payload) are read from `series.bin` once and cached
+/// for the following writes; a root that vanished mid-removal is skipped exactly
+/// like the disk path skips it.
+pub(super) fn build_series_fingerprint_from_contributions(
     sources: &[PersistedRegistryCatalogSource],
+    contributions: &RegistryContributions,
 ) -> Result<PersistedRegistrySeriesFingerprint> {
-    let mut series_by_id = BTreeMap::<SeriesId, crate::engine::segment::PersistedSeries>::new();
-    let mut series_id_by_key = BTreeMap::<(String, Vec<Label>), SeriesId>::new();
+    let mut runs = Vec::<Arc<SeriesRun>>::with_capacity(sources.len());
 
     for source in sources {
-        let series_metadata =
-            match crate::engine::segment::load_segment_series_metadata(&source.root) {
-                Ok(metadata) => metadata,
+        match contributions.run_for_root(&source.root) {
+            Some(run) => runs.push(run),
+            None => match load_segment_series_metadata(&source.root) {
+                Ok(series) => {
+                    let run = Arc::new(SeriesRun::from_series(&series));
+                    contributions.replace_root_shared(&source.root, Arc::clone(&run));
+                    runs.push(run);
+                }
                 Err(err) if is_vanished_catalog_source_error(&err) => {
                     warn!(
                         path = %source.root.display(),
                         error = %err,
                         "Registry catalog source vanished mid-removal; skipping"
                     );
-                    continue;
                 }
                 Err(err) => return Err(err),
-            };
+            },
+        }
+    }
+
+    let contribution_count = runs.iter().map(|run| run.len()).sum::<usize>();
+    let borrowed = runs.iter().map(|run| run.as_ref()).collect::<Vec<_>>();
+    let fingerprint = merge_series_runs(&borrowed)?;
+
+    // Bounded degradation: never emit a fingerprint from a cache that is
+    // repricing far more entries than distinct series; re-derive it from the
+    // segments instead so the output is still exact.
+    if contribution_count
+        > CONTRIBUTION_FOOTPRINT_LIMIT_RATIO.saturating_mul(fingerprint.series_count)
+    {
+        warn!(
+            contributions = contribution_count,
+            cache_entries = contributions.entry_count(),
+            distinct_series = fingerprint.series_count,
+            "Registry contribution cache exceeds its footprint ceiling; re-reading segment series for this catalog write"
+        );
+        return build_series_fingerprint_from_sources(sources);
+    }
+
+    Ok(fingerprint)
+}
+
+pub(super) fn build_series_fingerprint_from_sources(
+    sources: &[PersistedRegistryCatalogSource],
+) -> Result<PersistedRegistrySeriesFingerprint> {
+    let mut series_by_id = BTreeMap::<SeriesId, crate::engine::segment::PersistedSeries>::new();
+    let mut series_id_by_key = BTreeMap::<(String, Vec<Label>), SeriesId>::new();
+
+    for source in sources {
+        let series_metadata = match load_segment_series_metadata(&source.root) {
+            Ok(metadata) => metadata,
+            Err(err) if is_vanished_catalog_source_error(&err) => {
+                warn!(
+                    path = %source.root.display(),
+                    error = %err,
+                    "Registry catalog source vanished mid-removal; skipping"
+                );
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         for series in series_metadata {
             match series_by_id.get(&series.series_id) {
                 Some(existing)
@@ -280,14 +431,29 @@ fn fingerprint_registry_series(
 fn fingerprint_series<'a>(
     series: impl IntoIterator<Item = &'a crate::engine::segment::PersistedSeries>,
 ) -> PersistedRegistrySeriesFingerprint {
+    fingerprint_series_fields(series.into_iter().map(|series| {
+        (
+            series.series_id,
+            series.metric.as_str(),
+            series.labels.as_slice(),
+        )
+    }))
+}
+
+/// The single fingerprint algorithm: `Xxh64` over the series identity in
+/// `SeriesId` order. Both the disk path and the in-memory merge feed this, so the
+/// catalog hash bytes cannot drift between them.
+pub(super) fn fingerprint_series_fields<'a>(
+    series: impl IntoIterator<Item = (SeriesId, &'a str, &'a [Label])>,
+) -> PersistedRegistrySeriesFingerprint {
     let mut count = 0usize;
     let mut hasher = Xxh64::new(0);
-    for series in series {
+    for (series_id, metric, labels) in series {
         count = count.saturating_add(1);
-        hasher.update(&series.series_id.to_le_bytes());
-        update_len_prefixed_bytes(&mut hasher, series.metric.as_bytes());
-        hasher.update(&(series.labels.len() as u64).to_le_bytes());
-        for label in &series.labels {
+        hasher.update(&series_id.to_le_bytes());
+        update_len_prefixed_bytes(&mut hasher, metric.as_bytes());
+        hasher.update(&(labels.len() as u64).to_le_bytes());
+        for label in labels {
             update_len_prefixed_bytes(&mut hasher, label.name.as_bytes());
             update_len_prefixed_bytes(&mut hasher, label.value.as_bytes());
         }
@@ -308,22 +474,58 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn disk_only_source(root: PathBuf) -> PersistedRegistryCatalogSource {
+        PersistedRegistryCatalogSource {
+            lane: SegmentLaneFamily::Numeric,
+            root,
+            manifest: None,
+            files: None,
+        }
+    }
+
     #[test]
     fn catalog_build_skips_sources_that_vanish_mid_removal() {
         let temp_dir = TempDir::new().unwrap();
-        let ghost = PersistedRegistryCatalogSource {
-            lane: SegmentLaneFamily::Numeric,
-            root: temp_dir.path().join("seg-00000000000000ff"),
-        };
+        let ghost = disk_only_source(temp_dir.path().join("seg-00000000000000ff"));
 
         // The root directory does not exist. Before the vanished-source
         // tolerance this surfaced as a bare ENOENT from the manifest
         // fingerprint read and fenced the flush worker while it persisted
         // the registry catalog (production backtrace, 2026-11-01).
-        let entries = build_catalog_entries(&[ghost.clone()]).unwrap();
+        let entries = build_catalog_entries(std::slice::from_ref(&ghost)).unwrap();
         assert!(entries.is_empty());
 
-        let fingerprint = build_series_fingerprint_from_sources(&[ghost]).unwrap();
+        let fingerprint =
+            build_series_fingerprint_from_sources(std::slice::from_ref(&ghost)).unwrap();
         assert_eq!(fingerprint.series_count, 0);
+
+        // The memory path skips the same vanished root from either half.
+        let contributions = RegistryContributions::new();
+        let fingerprint = build_series_fingerprint_from_contributions(
+            std::slice::from_ref(&ghost),
+            &contributions,
+        )
+        .unwrap();
+        assert_eq!(fingerprint.series_count, 0);
+        assert!(
+            contributions.run_for_root(&ghost.root).is_none(),
+            "a vanished root must stay unprimed"
+        );
+    }
+
+    /// The fingerprint hash is part of the on-disk contract; the in-memory path
+    /// must reproduce it exactly, including the label ordering.
+    #[test]
+    fn fingerprint_series_fields_hashes_series_id_then_metric_then_labels() {
+        let labels = vec![Label::new("host", "a"), Label::new("zone", "z")];
+        let fields = fingerprint_series_fields([(42u64, "cpu", labels.as_slice())]);
+
+        let persisted = crate::engine::segment::PersistedSeries {
+            series_id: 42,
+            metric: "cpu".to_string(),
+            labels: labels.clone(),
+            value_family: None,
+        };
+        assert_eq!(fields, fingerprint_series([&persisted]));
     }
 }

@@ -130,6 +130,7 @@ impl StorageStateAssembly {
     ) -> PersistedStorageState {
         PersistedStorageState {
             persisted_index: Arc::new(RwLock::new(PersistedIndexState::default())),
+            registry_contributions: registry_contributions::RegistryContributions::new(),
             persisted_index_dirty,
             numeric_lane_path,
             blob_lane_path,

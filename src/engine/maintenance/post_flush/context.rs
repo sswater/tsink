@@ -151,6 +151,8 @@ impl<'a> RetentionMaintenanceContext<'a> {
                 |(root, segment)| registry_catalog::PersistedRegistryCatalogSource {
                     lane: segment.lane,
                     root: root.clone(),
+                    manifest: Some(segment.manifest.clone()),
+                    files: segment.files,
                 },
             )
             .collect()

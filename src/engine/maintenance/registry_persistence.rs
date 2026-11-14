@@ -16,6 +16,11 @@ impl ChunkStorage {
             )
     }
 
+    /// Catalog sources from the published persisted index.
+    ///
+    /// Manifest fields and per-file fingerprints travel with each source, so
+    /// catalog production does not re-read segments the inventory already
+    /// parsed. Take the read guard only to snapshot; never do I/O under it.
     pub(super) fn persisted_registry_catalog_sources(
         &self,
     ) -> Vec<registry_catalog::PersistedRegistryCatalogSource> {
@@ -27,6 +32,8 @@ impl ChunkStorage {
                 |(root, segment)| registry_catalog::PersistedRegistryCatalogSource {
                     lane: segment.lane,
                     root: root.clone(),
+                    manifest: Some(segment.manifest.clone()),
+                    files: segment.files,
                 },
             )
             .collect()
@@ -47,11 +54,17 @@ impl ChunkStorage {
         }
         for root in added_roots {
             let (lane, _tier) = self.persisted_segment_location_for_root(root)?;
+            // A root published by this pass is not in the persisted index yet,
+            // so it has no inventory manifest: the catalog build pays exactly
+            // one bounded manifest read for it (its series contribution was
+            // already primed from the in-memory loaded segment).
             sources.insert(
                 root.clone(),
                 registry_catalog::PersistedRegistryCatalogSource {
                     lane,
                     root: root.clone(),
+                    manifest: None,
+                    files: None,
                 },
             );
         }
@@ -71,7 +84,11 @@ impl ChunkStorage {
         ) {
             return Ok(());
         }
-        registry_catalog::persist_registry_catalog(checkpoint_path, sources)
+        registry_catalog::persist_registry_catalog(
+            checkpoint_path,
+            sources,
+            &self.persisted.registry_contributions,
+        )
     }
 
     fn persist_series_registry_catalog_index(&self, checkpoint_path: &Path) -> Result<()> {

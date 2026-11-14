@@ -321,6 +321,13 @@ impl ChunkStorage {
             }
         }
 
+        // The verification load already parsed the new segments' series
+        // payload, so their catalog contributions are free here. The catalog
+        // write that follows this stage (recovery metadata) then avoids
+        // re-reading `series.bin` for the fresh roots as well as for every
+        // already known segment.
+        self.prime_registry_contributions_for_segments(&loaded_segments);
+
         Ok(VerifiedFlushPublish {
             published_segment_roots: staged.published_segment_roots,
             loaded_segments,

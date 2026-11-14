@@ -103,6 +103,12 @@ impl ChunkStorage {
             )?;
         }
 
+        // A rebuild replaces the persisted index wholesale, so any cached
+        // contribution that describes a root outside the new index must go
+        // first; the install re-primes every root whose series payload was
+        // loaded.
+        self.persisted.registry_contributions.clear();
+
         let mut prepared_install = self.prepare_persisted_index_install(loaded)?;
         if reconcile_registry_with_persisted {
             self.reconcile_registry_with_persisted_series_ids(
@@ -160,6 +166,9 @@ impl ChunkStorage {
     ) -> Result<()> {
         for root in segment_roots.iter().rev() {
             crate::engine::fs_utils::remove_path_if_exists_and_sync_parent(root)?;
+            // The segment files are gone, so its catalog contribution must not
+            // outlive them.
+            self.persisted.registry_contributions.remove_root(root);
         }
 
         Ok(())

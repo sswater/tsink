@@ -1,4 +1,5 @@
 use super::*;
+use crate::engine::storage_engine::registry_contributions;
 
 impl ChunkStorage {
     pub(super) fn accumulate_max_timestamp(current: &mut Option<i64>, candidate: Option<i64>) {
@@ -120,6 +121,7 @@ impl ChunkStorage {
                 let mut removed_any = false;
 
                 for root in roots {
+                    self.persisted.registry_contributions.remove_root(root);
                     let (removed_series, removed_from_postings) =
                         Self::remove_segment_root_from_state(persisted_index, root);
                     removed_any |= !removed_series.is_empty();
@@ -232,6 +234,7 @@ impl ChunkStorage {
             return Ok((Vec::new(), None, None));
         }
         let segment_manifest = indexed_segment.manifest;
+        let segment_series_count = segment_manifest.series_count;
         let segment_files = indexed_segment.files;
         let segment_level = segment_manifest.level;
         let chunk_map = Arc::new(indexed_segment.chunks_mmap);
@@ -329,7 +332,7 @@ impl ChunkStorage {
         }
 
         persisted_index.segments_by_root.insert(
-            root,
+            root.clone(),
             state::PersistedSegmentState {
                 segment_slot,
                 lane: segment_lane,
@@ -341,6 +344,17 @@ impl ChunkStorage {
                 chunk_refs_by_series: refs_by_series,
             },
         );
+
+        // The segment was loaded (or just written) with its series payload, so
+        // its catalog contribution is free here. A segment loaded without the
+        // series payload stays unprimed and the catalog build reads it from
+        // disk on demand.
+        if indexed_segment.series.len() == segment_series_count {
+            self.persisted.registry_contributions.replace_root(
+                &root,
+                registry_contributions::SeriesRun::from_series(&indexed_segment.series),
+            );
+        }
 
         Ok((
             affected_series.into_iter().collect(),

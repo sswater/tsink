@@ -59,6 +59,8 @@ mod query_exec;
 mod query_read;
 #[path = "registry_catalog.rs"]
 mod registry_catalog;
+#[path = "registry_contributions.rs"]
+mod registry_contributions;
 #[path = "rollups.rs"]
 mod rollups;
 #[path = "runtime.rs"]
@@ -173,6 +175,11 @@ struct VisibilityState {
 /// Persisted segment inventory, WAL handles, and remote refresh state.
 struct PersistedStorageState {
     persisted_index: Arc<RwLock<PersistedIndexState>>,
+    /// Root-keyed series contributions used to build the registry catalog from
+    /// memory. Kept out of [`PersistedIndexState`] (and out of its lock) because
+    /// catalog production may need a bounded disk read, and disk I/O must never
+    /// happen under the persisted-index lock.
+    registry_contributions: registry_contributions::RegistryContributions,
     persisted_index_dirty: Arc<AtomicBool>,
     numeric_lane_path: Option<PathBuf>,
     blob_lane_path: Option<PathBuf>,

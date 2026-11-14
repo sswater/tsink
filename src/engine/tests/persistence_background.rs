@@ -4099,3 +4099,442 @@ fn persisted_state_carries_manifest_files() {
 
     storage.close().unwrap();
 }
+
+/// Flushes one segment, then returns the single published root.
+fn single_published_root(storage: &ChunkStorage) -> std::path::PathBuf {
+    let index = storage.persisted.persisted_index.read();
+    assert_eq!(
+        index.segments_by_root.len(),
+        1,
+        "the flush should have published exactly one segment"
+    );
+    index
+        .segments_by_root
+        .keys()
+        .next()
+        .expect("flush must publish a segment root")
+        .clone()
+}
+
+fn series_run_tuples(
+    run: &super::super::registry_contributions::SeriesRun,
+) -> Vec<(u64, String, Vec<Label>)> {
+    let mut tuples = run
+        .0
+        .iter()
+        .map(|(series_id, key)| (*series_id, key.0.clone(), key.1.clone()))
+        .collect::<Vec<_>>();
+    tuples.sort_by_key(|(series_id, _, _)| *series_id);
+    tuples
+}
+
+fn disk_series_tuples(root: &std::path::Path) -> Vec<(u64, String, Vec<Label>)> {
+    let mut tuples = crate::engine::segment::load_segment_series_metadata(root)
+        .unwrap()
+        .into_iter()
+        .map(|series| (series.series_id, series.metric, series.labels))
+        .collect::<Vec<_>>();
+    tuples.sort_by_key(|(series_id, _, _)| *series_id);
+    tuples
+}
+
+/// The in-memory catalog build must be byte-identical to the disk build for the
+/// same segment set: the catalog schema and the series fingerprint hash are the
+/// on-disk contract, not an implementation detail of the memory path.
+#[test]
+fn memory_built_catalog_matches_disk_built_catalog() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+
+    let storage = new_raw_numeric_storage(lane_path.clone(), 1);
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "catalog_memory",
+                vec![Label::new("host", "a")],
+                DataPoint::new(1, 1.0),
+            ),
+            Row::with_labels(
+                "catalog_memory",
+                vec![Label::new("host", "b")],
+                DataPoint::new(2, 2.0),
+            ),
+        ])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "catalog_memory",
+                vec![Label::new("host", "a")],
+                DataPoint::new(3, 3.0),
+            ),
+            Row::with_labels(
+                "catalog_memory_second",
+                vec![Label::new("host", "c")],
+                DataPoint::new(4, 4.0),
+            ),
+        ])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    storage.close().unwrap();
+
+    let inventory =
+        super::super::tiering::build_segment_inventory_runtime_strict(Some(&lane_path), None, None)
+            .unwrap();
+    assert_eq!(inventory.entries().len(), 2);
+    assert!(
+        inventory
+            .entries()
+            .iter()
+            .all(|entry| entry.files.is_some()),
+        "a disk scan must carry manifest file entries for the memory build"
+    );
+
+    let sources = super::super::registry_catalog::inventory_sources(&inventory);
+    let contributions = super::super::registry_contributions::RegistryContributions::new();
+    let primed = sources
+        .iter()
+        .map(|source| {
+            let series =
+                crate::engine::segment::load_segment_series_metadata(&source.root).unwrap();
+            (
+                source.root.clone(),
+                super::super::registry_contributions::SeriesRun::from_series(&series),
+            )
+        })
+        .collect::<Vec<_>>();
+    contributions.prime(&primed);
+
+    let disk = super::super::registry_catalog::build_catalog_from_disk(&sources).unwrap();
+    let memory =
+        super::super::registry_catalog::build_catalog_from_memory(&sources, &contributions)
+            .unwrap();
+
+    assert_eq!(
+        serde_json::to_vec_pretty(&disk).unwrap(),
+        serde_json::to_vec_pretty(&memory).unwrap(),
+        "the memory-built catalog must be byte-identical to the disk-built catalog"
+    );
+}
+
+/// A catalog write that follows a publish must not re-read any already known
+/// segment; only the freshly published segment may need bounded disk work.
+#[test]
+fn catalog_write_after_publish_does_not_touch_segment_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+
+    let storage = new_raw_numeric_storage(lane_path, 1);
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_reads_old",
+            vec![Label::new("host", "old")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    let old_root = single_published_root(&storage);
+
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_reads_new",
+            vec![Label::new("host", "new")],
+            DataPoint::new(2, 2.0),
+        )])
+        .unwrap();
+
+    let guard = crate::engine::fs_utils::CountingSegmentReads::install(temp_dir.path());
+    storage.flush_pipeline_once().unwrap();
+    let old_root_reads = crate::engine::fs_utils::count_segment_file_reads_under(&old_root);
+    drop(guard);
+
+    assert_eq!(
+        old_root_reads,
+        0,
+        "catalog build after publish must not read old segment files: {}",
+        old_root.display()
+    );
+
+    let roots = {
+        let index = storage.persisted.persisted_index.read();
+        index.segments_by_root.keys().cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(roots.len(), 2, "the second flush publishes one new segment");
+    for root in &roots {
+        assert!(
+            storage
+                .persisted
+                .registry_contributions
+                .run_for_root(root)
+                .is_some(),
+            "every published root must contribute a series run: {}",
+            root.display()
+        );
+    }
+
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+    let catalog = std::fs::read(super::super::registry_catalog::catalog_path(
+        &checkpoint_path,
+    ))
+    .unwrap();
+    let catalog: serde_json::Value = serde_json::from_slice(&catalog).unwrap();
+    assert_eq!(
+        catalog["segments"].as_array().unwrap().len(),
+        2,
+        "the catalog write after publish must describe both visible segments"
+    );
+
+    storage.close().unwrap();
+}
+
+/// Contributions come from segment series files only. The registry is allowed
+/// to know strictly more (unflushed in-memory series) and that must never leak
+/// into the cached run, otherwise the fingerprint no longer guards the catalog.
+#[test]
+fn contribution_is_sourced_from_segment_series_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+
+    let storage = new_raw_numeric_storage(lane_path, 1);
+    storage
+        .insert_rows(&[
+            Row::with_labels(
+                "catalog_contrib",
+                vec![Label::new("host", "a"), Label::new("zone", "z")],
+                DataPoint::new(1, 1.0),
+            ),
+            Row::with_labels(
+                "catalog_contrib",
+                vec![Label::new("host", "b")],
+                DataPoint::new(2, 2.0),
+            ),
+        ])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    let root = single_published_root(&storage);
+
+    let run = storage
+        .persisted
+        .registry_contributions
+        .run_for_root(&root)
+        .expect("the published segment must contribute its series");
+    assert_eq!(
+        series_run_tuples(&run),
+        disk_series_tuples(&root),
+        "the cached run must equal a direct parse of series.bin"
+    );
+
+    // Registry-only series (written, not yet flushed) must not enter the cache.
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_contrib_unflushed",
+            vec![Label::new("host", "registry-only")],
+            DataPoint::new(3, 3.0),
+        )])
+        .unwrap();
+    let run_after = storage
+        .persisted
+        .registry_contributions
+        .run_for_root(&root)
+        .expect("an unflushed write must not evict the published run");
+    assert!(
+        series_run_tuples(&run_after)
+            .iter()
+            .all(|(_, metric, _)| metric != "catalog_contrib_unflushed"),
+        "contributions must never be re-derived from the registry"
+    );
+    assert_eq!(series_run_tuples(&run_after), disk_series_tuples(&root));
+
+    storage.close().unwrap();
+}
+
+/// E6: bootstrap priming must fill the contribution cache from `series.bin` for
+/// roots the startup scan loaded without their series payload, so the first
+/// catalog write after restart does not re-read segments.
+#[test]
+fn startup_primes_registry_contributions_from_segment_series_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let checkpoint_path = temp_dir.path().join(SERIES_INDEX_FILE_NAME);
+
+    {
+        let storage = new_raw_numeric_storage(lane_path.clone(), 1);
+        storage
+            .insert_rows(&[
+                Row::with_labels(
+                    "catalog_priming",
+                    vec![Label::new("host", "a")],
+                    DataPoint::new(1, 1.0),
+                ),
+                Row::with_labels(
+                    "catalog_priming",
+                    vec![Label::new("host", "b")],
+                    DataPoint::new(2, 2.0),
+                ),
+            ])
+            .unwrap();
+        storage.flush_pipeline_once().unwrap();
+        storage.close().unwrap();
+    }
+
+    // Reopen the way the fast startup path does: the registry snapshot is
+    // restored, the segment indexes are loaded WITHOUT their series payload.
+    let storage = ChunkStorage::new_with_data_path_and_options(
+        2,
+        None,
+        Some(lane_path.clone()),
+        None,
+        2,
+        ChunkStorageOptions {
+            retention_enforced: false,
+            background_threads_enabled: false,
+            ..ChunkStorageOptions::default()
+        },
+    )
+    .unwrap();
+    storage.load_tombstones_index().unwrap();
+    let loaded_registry = SeriesRegistry::load_persisted_state(&checkpoint_path)
+        .unwrap()
+        .expect("a closed store persists its registry snapshot");
+    storage
+        .replace_registry_from_persisted_state(
+            loaded_registry.registry,
+            loaded_registry.delta_series_count,
+        )
+        .unwrap();
+    storage
+        .apply_loaded_segment_indexes(
+            crate::engine::segment::load_segment_indexes_with_series(&lane_path, false).unwrap(),
+            true,
+        )
+        .unwrap();
+
+    let roots = {
+        let index = storage.persisted.persisted_index.read();
+        index.segments_by_root.keys().cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(roots.len(), 1);
+    assert!(
+        storage
+            .persisted
+            .registry_contributions
+            .run_for_root(&roots[0])
+            .is_none(),
+        "an index loaded without series must not fake a contribution"
+    );
+
+    let guard = crate::engine::fs_utils::CountingSegmentReads::install(temp_dir.path());
+    storage.prime_registry_contributions_from_persisted_index();
+    let priming_reads = crate::engine::fs_utils::count_segment_file_reads_under(temp_dir.path());
+    assert!(
+        priming_reads > 0,
+        "priming must read through the instrumented segment read path"
+    );
+    drop(guard);
+
+    for root in &roots {
+        let run = storage
+            .persisted
+            .registry_contributions
+            .run_for_root(root)
+            .expect("bootstrap priming must fill every persisted root");
+        assert_eq!(series_run_tuples(&run), disk_series_tuples(root));
+    }
+    assert!(
+        storage
+            .persisted
+            .registry_contributions
+            .run_for_root(&roots[0])
+            .is_some(),
+        "a failed-free prime leaves the root cached"
+    );
+
+    // A catalog write after priming costs no segment reads: entries come from
+    // the persisted index and the fingerprint from the cache.
+    std::fs::remove_file(super::super::registry_catalog::catalog_path(
+        &checkpoint_path,
+    ))
+    .unwrap();
+    let guard = crate::engine::fs_utils::CountingSegmentReads::install(temp_dir.path());
+    storage.checkpoint_series_registry_index().unwrap();
+    let catalog_reads = crate::engine::fs_utils::count_segment_file_reads_under(temp_dir.path());
+    drop(guard);
+    assert_eq!(
+        catalog_reads, 0,
+        "a primed catalog write must not read any segment file"
+    );
+    assert!(super::super::registry_catalog::catalog_path(&checkpoint_path).exists());
+
+    storage.close().unwrap();
+}
+
+/// The contribution cache is bounded: a footprint above the ceiling falls back
+/// to the disk path for that write, so an over-priced cache can never produce a
+/// fingerprint that disagrees with the segments.
+#[test]
+fn oversized_contribution_footprint_falls_back_to_the_disk_fingerprint() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+
+    let storage = new_raw_numeric_storage(lane_path, 1);
+    storage
+        .insert_rows(&[Row::with_labels(
+            "catalog_footprint",
+            vec![Label::new("host", "a")],
+            DataPoint::new(1, 1.0),
+        )])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+    let root = single_published_root(&storage);
+    let series_id = crate::engine::segment::load_segment_series_metadata(&root)
+        .unwrap()
+        .first()
+        .expect("the published segment carries its series")
+        .series_id;
+
+    let source =
+        super::super::registry_catalog::inventory_sources(&storage.persisted_segment_inventory())
+            .into_iter()
+            .next()
+            .expect("the persisted index describes the published segment");
+
+    let contributions = super::super::registry_contributions::RegistryContributions::new();
+    // Poison the cached key so a cache-derived fingerprint is distinguishable
+    // from the disk-derived one.
+    contributions.replace_root(
+        &root,
+        super::super::registry_contributions::SeriesRun(vec![(
+            series_id,
+            Arc::new(("cache_only".to_string(), Vec::new())),
+        )]),
+    );
+
+    let at_ceiling = super::super::registry_catalog::build_series_fingerprint_from_contributions(
+        &vec![source.clone(); 4],
+        &contributions,
+    )
+    .unwrap();
+    let over_ceiling = super::super::registry_catalog::build_series_fingerprint_from_contributions(
+        &vec![source.clone(); 5],
+        &contributions,
+    )
+    .unwrap();
+
+    let cache_only = super::super::registry_catalog::fingerprint_series_fields([(
+        series_id,
+        "cache_only",
+        [].as_slice(),
+    )]);
+    assert_eq!(
+        at_ceiling, cache_only,
+        "at the ceiling the cache is trusted"
+    );
+    assert_eq!(
+        over_ceiling,
+        super::super::registry_catalog::build_series_fingerprint_from_sources(&[source.clone()])
+            .unwrap(),
+        "over the ceiling the write re-reads the segments"
+    );
+    assert_ne!(over_ceiling, cache_only);
+}

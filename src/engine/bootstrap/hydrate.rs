@@ -51,6 +51,13 @@ impl StartupHydrationPhase {
             loaded_segments,
             registry.reconcile_registry_with_persisted,
         )?;
+        // E6: prime the registry-catalog contributions for every persisted root
+        // the index install could not prime itself (segments loaded without
+        // their series payload). This runs after the index assembly and before
+        // the flush/refresh threads start, reads `series.bin` only, and a
+        // failure leaves the root unprimed for the catalog's disk fallback
+        // rather than failing startup.
+        storage.prime_registry_contributions_from_persisted_index();
         storage.replay_from_wal(replay_highwater, builder.wal_replay_mode())?;
         storage.load_rollup_runtime_state()?;
         storage.refresh_segment_catalog_and_observability_from_persisted_state(&[])?;
