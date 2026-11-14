@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::super::{PersistedIndexState, BLOB_LANE_ROOT, NUMERIC_LANE_ROOT};
-use crate::engine::segment::SegmentManifest;
+use crate::engine::segment::{ManifestFileEntry, SegmentManifest, MANIFEST_FILE_ENTRY_COUNT};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +56,11 @@ pub(in crate::engine) struct SegmentInventoryEntry {
     pub(in crate::engine) tier: PersistedSegmentTier,
     pub(in crate::engine) root: PathBuf,
     pub(in crate::engine) manifest: SegmentManifest,
+    /// Per-file manifest entries (`kind`, `file_len`, `hash64`) that came with
+    /// the manifest read or persisted state. `None` when the inventory source
+    /// only knows the manifest fields (e.g. a persisted catalog file); consumers
+    /// that need fingerprints may fall back to a bounded manifest re-read.
+    pub(in crate::engine) files: Option<[ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT]>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -98,6 +103,7 @@ impl SegmentInventory {
                 tier: state.tier,
                 root: root.clone(),
                 manifest: state.manifest.clone(),
+                files: state.files.clone(),
             })
             .collect::<Vec<_>>();
         Self::from_entries(entries)

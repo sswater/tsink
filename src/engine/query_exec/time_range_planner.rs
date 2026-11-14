@@ -186,6 +186,7 @@ mod tests {
                 max_ts: Some(max_ts),
                 wal_highwater: WalHighWatermark::default(),
             },
+            files: None,
             time_bucket_postings,
             series_time_summaries: HashMap::new(),
             chunk_refs_by_series,

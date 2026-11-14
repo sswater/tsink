@@ -26,11 +26,13 @@ pub use self::writer::SegmentWriter;
 pub(crate) use self::format::chunk_payload_from_record;
 #[cfg(test)]
 pub(crate) use self::format::CHUNK_FLAG_PAYLOAD_ZSTD;
+pub(crate) use self::format::{ManifestFileEntry, MANIFEST_FILE_ENTRY_COUNT};
 
 pub(crate) use self::loader::{
     load_segment_indexes_from_dirs_startup_recoverable_with_series,
     load_segment_root_for_compaction, load_segment_series_metadata, load_segments_runtime_strict,
-    read_segment_manifest_fingerprint, verify_segment_fingerprint,
+    read_segment_manifest_fingerprint, read_segment_manifest_with_files,
+    verify_segment_fingerprint,
 };
 pub(crate) use self::types::SegmentContentFingerprint;
 pub(crate) use self::validation::{

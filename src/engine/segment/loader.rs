@@ -15,12 +15,13 @@ use super::format::{
     decode_persisted_series, parse_chunk_index_file, parse_chunks_file, parse_manifest,
     parse_postings_file, parse_series_file, segment_manifest_from_parsed,
     validate_chunk_index_against_chunks_file, verify_file_manifest_entry, ChunkRecordMeta,
-    FILE_KIND_CHUNKS, FILE_KIND_CHUNK_INDEX, FILE_KIND_POSTINGS, FILE_KIND_SERIES,
+    ManifestFileEntry, FILE_KIND_CHUNKS, FILE_KIND_CHUNK_INDEX, FILE_KIND_POSTINGS,
+    FILE_KIND_SERIES, MANIFEST_FILE_ENTRY_COUNT,
 };
 use super::postings::SegmentPostingsIndex;
 use super::types::{
     IndexedSegment, LoadedSegment, LoadedSegmentIndexes, LoadedSegments, PersistedSeries,
-    SegmentContentFingerprint, SegmentFileFingerprint, SegmentLayout, SegmentManifest,
+    SegmentContentFingerprint, SegmentLayout, SegmentManifest,
 };
 use super::validation::{
     handle_segment_dir_load_error, is_not_found_error, is_vanished_source_error,
@@ -40,6 +41,7 @@ struct ParsedSegment {
 struct ParsedIndexedSegment {
     root: PathBuf,
     manifest: SegmentManifest,
+    files: [ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT],
     series: Vec<PersistedSeries>,
     postings: SegmentPostingsIndex,
     chunk_index: ChunkIndex,
@@ -177,6 +179,7 @@ pub fn load_segment_index_with_series(
     Ok(IndexedSegment {
         root: segment.root,
         manifest: segment.manifest,
+        files: segment.files,
         series: segment.series,
         postings: segment.postings,
         chunk_index: segment.chunk_index,
@@ -277,13 +280,31 @@ pub fn read_segment_manifest(path: impl AsRef<Path>) -> Result<SegmentManifest> 
 pub(crate) fn read_segment_manifest_fingerprint(
     path: impl AsRef<Path>,
 ) -> Result<SegmentContentFingerprint> {
+    let (manifest, files) = read_segment_manifest_with_files(path)?;
+    Ok(SegmentContentFingerprint { manifest, files })
+}
+
+/// Reads a segment manifest and exposes the per-file entries it records
+/// (`kind`, `file_len`, `hash64`) without touching any segment payload file.
+///
+/// This is the single-read source for inventories that need the manifest's
+/// content fingerprints (catalog building) in addition to the manifest fields.
+pub(crate) fn read_segment_manifest_with_files(
+    path: impl AsRef<Path>,
+) -> Result<(
+    SegmentManifest,
+    [ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT],
+)> {
     let root = path.as_ref();
     let layout = SegmentLayout::from_root(root.to_path_buf());
     #[cfg(test)]
     crate::engine::fs_utils::notify_segment_file_read(&layout.manifest_path);
     let manifest_bytes = read_required_segment_file(root, &layout.manifest_path)?;
     let parsed_manifest = parse_manifest(&manifest_bytes)?;
-    Ok(segment_fingerprint_from_parsed_manifest(parsed_manifest))
+    Ok((
+        segment_manifest_from_parsed(&parsed_manifest),
+        parsed_manifest.files,
+    ))
 }
 
 pub(crate) fn verify_segment_fingerprint(
@@ -359,6 +380,7 @@ fn finalize_loaded_segment_indexes(
         indexed_segments.push(IndexedSegment {
             root: segment.root,
             manifest: segment.manifest,
+            files: segment.files,
             series: segment.series,
             postings: segment.postings,
             chunk_index: segment.chunk_index,
@@ -722,6 +744,7 @@ fn load_segment_dir_indexed(path: &Path, load_series: bool) -> Result<ParsedInde
     Ok(ParsedIndexedSegment {
         root: path.to_path_buf(),
         manifest: segment_manifest_from_parsed(&parsed_manifest),
+        files: parsed_manifest.files,
         series,
         postings,
         chunk_index,
@@ -824,10 +847,6 @@ fn segment_fingerprint_from_parsed_manifest(
 ) -> SegmentContentFingerprint {
     SegmentContentFingerprint {
         manifest: segment_manifest_from_parsed(&parsed_manifest),
-        files: parsed_manifest.files.map(|entry| SegmentFileFingerprint {
-            kind: entry.kind,
-            file_len: entry.file_len,
-            hash64: entry.hash64,
-        }),
+        files: parsed_manifest.files,
     }
 }

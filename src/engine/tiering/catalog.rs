@@ -128,6 +128,9 @@ fn catalog_entry_to_inventory_entry(
         tier: entry.tier,
         root: base_path.join(relative_path),
         manifest,
+        // A catalog file only carries manifest counters; fingerprints need a
+        // bounded manifest re-read by consumers that require them.
+        files: None,
     })
 }
 

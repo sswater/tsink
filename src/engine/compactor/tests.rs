@@ -19,7 +19,7 @@ use crate::engine::fs_utils::{
 };
 use crate::engine::segment::{
     load_segment_root_for_compaction, load_segments, load_segments_for_level,
-    read_segment_manifest, SegmentWriter, WalHighWatermark,
+    read_segment_manifest_with_files, SegmentWriter, WalHighWatermark,
 };
 use crate::engine::series::{SeriesRegistry, SeriesValueFamily};
 use crate::engine::storage_engine::tiering::{
@@ -1603,11 +1603,13 @@ fn apply_diff_to_inventory(
         .entries()
         .to_vec();
     for root in &diff.added_roots {
+        let (manifest, files) = read_segment_manifest_with_files(root).unwrap();
         entries.push(SegmentInventoryEntry {
             lane,
             tier: PersistedSegmentTier::Hot,
             root: root.clone(),
-            manifest: read_segment_manifest(root).unwrap(),
+            manifest,
+            files: Some(files),
         });
     }
     SegmentInventory::from_entries(entries)

@@ -232,6 +232,7 @@ impl ChunkStorage {
             return Ok((Vec::new(), None, None));
         }
         let segment_manifest = indexed_segment.manifest;
+        let segment_files = indexed_segment.files;
         let segment_level = segment_manifest.level;
         let chunk_map = Arc::new(indexed_segment.chunks_mmap);
         let chunk_entries = indexed_segment.chunk_index.entries;
@@ -334,6 +335,7 @@ impl ChunkStorage {
                 lane: segment_lane,
                 tier: segment_tier,
                 manifest: segment_manifest,
+                files: Some(segment_files),
                 time_bucket_postings,
                 series_time_summaries,
                 chunk_refs_by_series: refs_by_series,

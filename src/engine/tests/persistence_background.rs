@@ -4046,3 +4046,56 @@ fn blob_lane_failure_keeps_the_numeric_lane_windows_already_merged() {
         .unwrap();
     storage.close().unwrap();
 }
+
+#[test]
+fn persisted_state_carries_manifest_files() {
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "files")];
+
+    let storage = new_raw_numeric_storage(lane_path, 1);
+    storage
+        .insert_rows(&[
+            Row::with_labels("inventory_files", labels.clone(), DataPoint::new(1, 1.0)),
+            Row::with_labels("inventory_files", labels, DataPoint::new(2, 2.0)),
+        ])
+        .unwrap();
+    storage.flush_pipeline_once().unwrap();
+
+    let (root, persisted_manifest, persisted_files) = {
+        let index = storage.persisted.persisted_index.read();
+        assert_eq!(
+            index.segments_by_root.len(),
+            1,
+            "the flush should have published exactly one segment"
+        );
+        let (root, state) = index
+            .segments_by_root
+            .iter()
+            .next()
+            .expect("flush must publish a segment root");
+        (
+            root.clone(),
+            state.manifest.clone(),
+            state
+                .files
+                .expect("published segments must carry manifest file entries"),
+        )
+    };
+
+    let (manifest, files) =
+        crate::engine::segment::read_segment_manifest_with_files(&root).unwrap();
+    assert_eq!(manifest, persisted_manifest);
+    assert_eq!(
+        files.map(|entry| (entry.kind, entry.file_len, entry.hash64)),
+        persisted_files.map(|entry| (entry.kind, entry.file_len, entry.hash64)),
+        "persisted files must match a direct manifest read"
+    );
+    assert_eq!(
+        files.map(|entry| entry.kind),
+        [1, 2, 3, 4],
+        "manifest entries stay ordered chunks, chunk_index, series, postings"
+    );
+
+    storage.close().unwrap();
+}

@@ -44,7 +44,7 @@ const SERIES_HEADER_LEN: usize = 28;
 pub(super) const POSTINGS_HEADER_LEN: usize = 16;
 const MANIFEST_HEADER_LEN: usize = 80;
 const MANIFEST_FILE_ENTRY_LEN: usize = 20;
-pub(super) const MANIFEST_FILE_ENTRY_COUNT: usize = 4;
+pub(crate) const MANIFEST_FILE_ENTRY_COUNT: usize = 4;
 
 type BuildChunksAndIndexOutput = (Vec<u8>, ChunkIndex, usize, usize, Option<i64>, Option<i64>);
 type BuildSeriesFileOutput = (Vec<u8>, usize);
@@ -55,11 +55,11 @@ pub(super) struct ChunkRecordMeta {
     pub(super) chunk: Chunk,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct ManifestFileEntry {
-    pub(super) kind: u8,
-    pub(super) file_len: u64,
-    pub(super) hash64: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManifestFileEntry {
+    pub(crate) kind: u8,
+    pub(crate) file_len: u64,
+    pub(crate) hash64: u64,
 }
 
 #[derive(Debug, Clone)]

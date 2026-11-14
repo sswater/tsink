@@ -5,8 +5,8 @@ use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
 use crate::engine::segment::{
-    is_vanished_source_error, list_segment_dirs, read_segment_manifest, segment_validation_error,
-    SegmentValidationContext,
+    is_vanished_source_error, list_segment_dirs, read_segment_manifest_with_files,
+    segment_validation_error, SegmentValidationContext,
 };
 use crate::engine::storage_engine::tiering::{
     PersistedSegmentTier, SegmentInventory, SegmentInventoryEntry, SegmentLaneFamily,
@@ -55,12 +55,13 @@ pub(in crate::engine) fn scan_inventory_from_disk(lane_root: &Path) -> Result<Se
     let mut entries = Vec::new();
 
     for root in list_segment_dirs(lane_root)? {
-        match read_segment_manifest(&root) {
-            Ok(manifest) => entries.push(SegmentInventoryEntry {
+        match read_segment_manifest_with_files(&root) {
+            Ok((manifest, files)) => entries.push(SegmentInventoryEntry {
                 lane,
                 tier: PersistedSegmentTier::Hot,
                 root,
                 manifest,
+                files: Some(files),
             }),
             Err(err) if is_vanished_source_error(&err) => {
                 warn!(

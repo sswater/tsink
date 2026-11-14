@@ -59,6 +59,7 @@ mod tests {
             tier,
             root: PathBuf::from(format!("/segments/{segment_id}")),
             manifest: manifest(segment_id, min_ts, max_ts),
+            files: None,
         }
     }
 

@@ -36,6 +36,7 @@ fn inventory_entry(root: impl Into<PathBuf>, segment_id: u64) -> SegmentInventor
             max_ts: Some(1),
             wal_highwater: WalHighWatermark::default(),
         },
+        files: None,
     }
 }
 

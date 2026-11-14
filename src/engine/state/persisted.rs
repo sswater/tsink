@@ -5,7 +5,7 @@ use roaring::RoaringTreemap;
 use super::super::tiering::{PersistedSegmentTier, SegmentLaneFamily};
 use super::super::*;
 use crate::engine::encoder::TimestampSearchIndex;
-use crate::engine::segment::SegmentManifest;
+use crate::engine::segment::{ManifestFileEntry, SegmentManifest, MANIFEST_FILE_ENTRY_COUNT};
 
 const PERSISTED_SEGMENT_TIME_BUCKET_TARGET_COUNT: usize = 32;
 
@@ -118,6 +118,12 @@ pub(in crate::engine::storage_engine) struct PersistedSegmentState {
     pub(in crate::engine::storage_engine) lane: SegmentLaneFamily,
     pub(in crate::engine::storage_engine) tier: PersistedSegmentTier,
     pub(in crate::engine::storage_engine) manifest: SegmentManifest,
+    /// Per-file manifest entries (`kind`, `file_len`, `hash64`) captured when the
+    /// segment was loaded or published. `None` only for legacy/test constructors
+    /// that build the state without a manifest read; catalog building may fall
+    /// back to a bounded manifest read for those roots.
+    pub(in crate::engine::storage_engine) files:
+        Option<[ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT]>,
     pub(in crate::engine::storage_engine) time_bucket_postings:
         Option<PersistedSegmentTimeBucketIndex>,
     pub(in crate::engine::storage_engine) series_time_summaries:

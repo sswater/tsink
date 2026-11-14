@@ -118,6 +118,7 @@ impl<'a> RetentionMaintenanceContext<'a> {
                 tier: state.tier,
                 root: root.clone(),
                 manifest: state.manifest.clone(),
+                files: state.files.clone(),
             })
             .collect::<Vec<_>>();
         SegmentInventory::from_entries(entries)
@@ -315,7 +316,8 @@ impl<'a> RetentionMaintenanceContext<'a> {
         let mut tier_moves = 0usize;
 
         for output_root in outcome.output_roots {
-            let manifest = crate::engine::segment::read_segment_manifest(&output_root)?;
+            let (manifest, files) =
+                crate::engine::segment::read_segment_manifest_with_files(&output_root)?;
             let Some(desired_tier) = policy.desired_tier_for_manifest(&manifest) else {
                 self.record_expired_segment_if_removed(&output_root)?;
                 continue;
@@ -345,6 +347,7 @@ impl<'a> RetentionMaintenanceContext<'a> {
                 tier: final_tier,
                 root: final_root,
                 manifest,
+                files: Some(files),
             });
         }
 
@@ -418,6 +421,7 @@ impl<'a> RetentionMaintenanceContext<'a> {
                         tier: move_action.target_tier,
                         root: final_root,
                         manifest: entry.manifest.clone(),
+                        files: entry.files.clone(),
                     },
                 );
                 retired_roots.push(RetiredPostFlushRoot {

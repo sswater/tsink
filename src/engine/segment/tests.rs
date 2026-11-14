@@ -10,7 +10,8 @@ use super::{
     chunk_payload_from_record, collect_expired_segment_dirs, load_segment_index_with_series,
     load_segment_indexes_from_dirs_strict_with_series, load_segment_series_metadata, load_segments,
     load_segments_for_level, load_segments_runtime_strict, read_segment_manifest,
-    read_segment_manifest_fingerprint, verify_segment_fingerprint, SegmentWriter, WalHighWatermark,
+    read_segment_manifest_fingerprint, read_segment_manifest_with_files,
+    verify_segment_fingerprint, SegmentLayout, SegmentWriter, WalHighWatermark,
     CHUNK_FLAG_PAYLOAD_ZSTD,
 };
 use crate::engine::chunk::{
@@ -161,6 +162,43 @@ fn metadata_helpers_round_trip_manifest_series_and_fingerprint() {
     assert_eq!(fingerprint.manifest, manifest);
     assert_eq!(fingerprint.files.len(), 4);
     assert_eq!(fingerprint.files[0].kind, 1);
+}
+
+#[test]
+fn read_segment_manifest_with_files_matches_fingerprint() {
+    let tmp = TempDir::new().unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+
+    let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+    let manifest = writer.write_segment(&registry, &chunks_by_series).unwrap();
+    let root = writer.layout().root.clone();
+
+    let (read_manifest, files) = read_segment_manifest_with_files(&root).unwrap();
+    let fingerprint = read_segment_manifest_fingerprint(&root).unwrap();
+    let layout = SegmentLayout::from_root(root.clone());
+
+    assert_eq!(read_manifest, manifest);
+    assert_eq!(read_manifest, fingerprint.manifest);
+    assert_eq!(
+        files.map(|entry| (entry.kind, entry.file_len, entry.hash64)),
+        fingerprint
+            .files
+            .map(|entry| (entry.kind, entry.file_len, entry.hash64)),
+        "the with-files read must expose the same manifest entries as the fingerprint read"
+    );
+    for (entry, path) in files.iter().zip([
+        &layout.chunks_path,
+        &layout.chunk_index_path,
+        &layout.series_path,
+        &layout.postings_path,
+    ]) {
+        assert_eq!(
+            entry.file_len,
+            fs::metadata(path).unwrap().len(),
+            "manifest file_len must match the on-disk file for kind {}",
+            entry.kind
+        );
+    }
 }
 
 #[test]

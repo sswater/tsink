@@ -8,6 +8,7 @@ use crate::engine::series::{SeriesId, SeriesValueFamily};
 use crate::mmap::PlatformMmap;
 use crate::Label;
 
+use super::format::{ManifestFileEntry, MANIFEST_FILE_ENTRY_COUNT};
 use super::postings::SegmentPostingsIndex;
 
 #[derive(Debug, Clone)]
@@ -57,14 +58,7 @@ pub struct SegmentManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SegmentContentFingerprint {
     pub(crate) manifest: SegmentManifest,
-    pub(crate) files: [SegmentFileFingerprint; super::format::MANIFEST_FILE_ENTRY_COUNT],
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SegmentFileFingerprint {
-    pub(crate) kind: u8,
-    pub(crate) file_len: u64,
-    pub(crate) hash64: u64,
+    pub(crate) files: [ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT],
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +87,7 @@ pub struct LoadedSegment {
 pub struct IndexedSegment {
     pub root: PathBuf,
     pub manifest: SegmentManifest,
+    pub(crate) files: [ManifestFileEntry; MANIFEST_FILE_ENTRY_COUNT],
     pub series: Vec<PersistedSeries>,
     pub(crate) postings: SegmentPostingsIndex,
     pub chunk_index: ChunkIndex,

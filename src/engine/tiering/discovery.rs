@@ -8,7 +8,7 @@ use super::inventory::SegmentInventoryAccumulator;
 use super::layout::SegmentScanTarget;
 use super::{SegmentInventory, SegmentInventoryEntry, SegmentPathResolver};
 use crate::engine::segment::{
-    list_segment_dirs, quarantine_invalid_startup_segment, read_segment_manifest,
+    list_segment_dirs, quarantine_invalid_startup_segment, read_segment_manifest_with_files,
     segment_validation_error, segment_validation_error_message, SegmentValidationContext,
     StartupQuarantinedSegment,
 };
@@ -73,8 +73,8 @@ fn scan_segment_roots(
     deduped: &mut SegmentInventoryAccumulator,
 ) -> Result<()> {
     for root in list_segment_dirs(&target.base_path)? {
-        let manifest = match read_segment_manifest(&root) {
-            Ok(manifest) => manifest,
+        let (manifest, files) = match read_segment_manifest_with_files(&root) {
+            Ok(entry) => entry,
             Err(err) if is_not_found_error(&err) => {
                 warn!(
                     path = %root.display(),
@@ -102,6 +102,7 @@ fn scan_segment_roots(
             tier: target.tier,
             root,
             manifest,
+            files: Some(files),
         });
     }
 
@@ -114,8 +115,8 @@ fn scan_startup_segment_roots_recoverable(
     quarantined: &mut Vec<StartupQuarantinedSegment>,
 ) -> Result<()> {
     for root in list_segment_dirs(&target.base_path)? {
-        let manifest = match read_segment_manifest(&root) {
-            Ok(manifest) => manifest,
+        let (manifest, files) = match read_segment_manifest_with_files(&root) {
+            Ok(entry) => entry,
             Err(err) if is_not_found_error(&err) => {
                 warn!(
                     path = %root.display(),
@@ -138,6 +139,7 @@ fn scan_startup_segment_roots_recoverable(
             tier: target.tier,
             root,
             manifest,
+            files: Some(files),
         });
     }
 
