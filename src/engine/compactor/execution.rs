@@ -72,8 +72,20 @@ pub(super) fn write_compaction_replacement_marker(
     Ok(marker_path)
 }
 
-fn parse_compaction_replacement_marker(path: &Path) -> Result<CompactionReplacementMarker> {
-    let bytes = fs::read(path)?;
+/// Reads and validates a replacement marker.
+///
+/// `Ok(None)` means the marker file is gone: with per-window gate acquisition
+/// two compaction passes on the same lane may overlap, and the other pass's
+/// `finalize_pending_compaction_replacements` can apply and delete this marker
+/// between our listing and this read. That retirement is the same one this
+/// caller would perform, so a vanished marker is a completed replacement, not
+/// damage.
+fn parse_compaction_replacement_marker(path: &Path) -> Result<Option<CompactionReplacementMarker>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
     let marker: CompactionReplacementMarker = serde_json::from_slice(&bytes)?;
     if marker.version != COMPACTION_REPLACEMENT_VERSION {
         return Err(TsinkError::DataCorruption(format!(
@@ -86,11 +98,21 @@ fn parse_compaction_replacement_marker(path: &Path) -> Result<CompactionReplacem
             "compaction replacement marker has empty segment sets".to_string(),
         ));
     }
-    Ok(marker)
+    Ok(Some(marker))
 }
 
+/// Applies one replacement marker, or returns success if a concurrent pass
+/// already applied and deleted it.
+///
+/// Re-applying is safe by construction (source removal tolerates missing roots,
+/// the output check tolerates superseded outputs, and the marker deletion
+/// tolerates `NotFound`), so the only interleaving that needs explicit
+/// tolerance is the marker vanishing between the caller's listing and this
+/// read: the other applier already completed the same retirement.
 fn apply_compaction_replacement_marker(data_path: &Path, marker_path: &Path) -> Result<()> {
-    let marker = parse_compaction_replacement_marker(marker_path)?;
+    let Some(marker) = parse_compaction_replacement_marker(marker_path)? else {
+        return Ok(());
+    };
 
     let output_segments = marker
         .output_segments
@@ -200,8 +222,19 @@ pub(in crate::engine) fn finalize_pending_compaction_replacements(data_path: &Pa
                 });
             }
         };
-        if !entry.file_type()?.is_file() {
-            continue;
+        // A concurrent finalize on the same lane can delete an entry between
+        // the directory read and this stat; the marker it names is either gone
+        // (nothing left to apply) or about to be handled by that applier.
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_file() => {}
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(TsinkError::IoWithPath {
+                    path: entry.path(),
+                    source: err,
+                });
+            }
         }
         marker_paths.push(entry.path());
     }
@@ -733,5 +766,19 @@ mod replacement_marker_tests {
         fs::remove_file(tmp.path().join(OUTPUT_REL).join("manifest.bin")).unwrap();
         apply_compaction_replacement_marker(tmp.path(), &marker_path).unwrap();
         assert_sources_retired(tmp.path(), &marker_path);
+    }
+
+    #[test]
+    fn apply_tolerates_marker_deleted_by_concurrent_finalize() {
+        let tmp = TempDir::new().unwrap();
+        // Per-window gate acquisition lets two passes on the same lane overlap,
+        // so a marker can be applied and deleted by the other pass between our
+        // listing and this read. Its retirement is already done: success, not
+        // an error that would fail the whole close/compaction pass.
+        let marker_path = compaction_replacement_dir(tmp.path()).join("marker-gone.json");
+        fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
+
+        apply_compaction_replacement_marker(tmp.path(), &marker_path).unwrap();
+        assert!(!marker_path.exists());
     }
 }
