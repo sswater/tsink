@@ -283,6 +283,7 @@ impl Compactor {
                 },
                 source_roots,
                 output_roots: Vec::new(),
+                retired_roots: Vec::new(),
             });
         }
 
@@ -381,6 +382,7 @@ impl Compactor {
                 },
                 source_roots,
                 output_roots,
+                retired_roots: Vec::new(),
             });
         }
 
@@ -405,6 +407,7 @@ impl Compactor {
             },
             source_roots,
             output_roots,
+            retired_roots: Vec::new(),
         })
     }
 

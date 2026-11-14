@@ -4,16 +4,15 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::durability::WalHighWatermark;
 use crate::engine::encoder::Encoder;
 use crate::engine::fs_utils::{remove_dir_if_exists, write_file_atomically_and_sync_parent};
 use crate::engine::segment::{
-    is_vanished_source_error, list_segment_dirs, load_segment_root_for_compaction,
-    load_segments_runtime_strict, read_segment_manifest, segment_validation_error, LoadedSegment,
-    PersistedSeries, SegmentValidationContext, SegmentWriter,
+    load_segment_root_for_compaction, load_segments_runtime_strict, read_segment_manifest,
+    LoadedSegment, PersistedSeries, SegmentWriter,
 };
 use crate::engine::series::{SeriesId, SeriesRegistry};
 use crate::engine::storage_engine::tiering::SegmentInventory;
@@ -39,6 +38,13 @@ const DEFAULT_L0_TRIGGER: usize = 4;
 const DEFAULT_L1_TRIGGER: usize = 4;
 const DEFAULT_SOURCE_WINDOW_SEGMENTS: usize = 8;
 const DEFAULT_OUTPUT_SEGMENT_CHUNK_MULTIPLIER: usize = 512;
+/// Wall-clock budget one compaction pass may spend opening new windows.
+///
+/// The budget is a flush-starvation guard, not a drain-rate bound: an open
+/// window always runs to completion, and a backlogged source level always
+/// drains at least one window per pass. Back-to-back passes (not a bigger
+/// budget) are what keep the drain rate up.
+const DEFAULT_COMPACTION_PASS_WALL_BUDGET: Duration = Duration::from_secs(1);
 const COMPACTION_REPLACEMENT_DIR: &str = ".compaction-replacements";
 const COMPACTION_REPLACEMENT_VERSION: u16 = 1;
 static COMPACTION_REPLACEMENT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -68,12 +74,16 @@ pub struct CompactionRunStats {
     pub source_above_trigger: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 pub(super) struct CompactionOutcome {
     pub(super) stats: CompactionRunStats,
     pub(super) source_roots: Vec<PathBuf>,
     pub(super) output_roots: Vec<PathBuf>,
+    /// Roots the inventory listed but that vanished before they could be
+    /// loaded. They are already gone from disk; they must still leave the
+    /// planning inventory and the catalog, so the caller folds them into the
+    /// pass's `removed_roots`.
+    pub(super) retired_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +99,7 @@ pub struct Compactor {
     point_cap: usize,
     l0_trigger: usize,
     l1_trigger: usize,
+    pass_wall_budget: Duration,
     next_segment_id: Option<Arc<AtomicU64>>,
     source: Option<CompactionInventorySource>,
 }
@@ -100,6 +111,7 @@ impl Compactor {
             point_cap: point_cap.clamp(1, u16::MAX as usize),
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
+            pass_wall_budget: DEFAULT_COMPACTION_PASS_WALL_BUDGET,
             next_segment_id: None,
             source: None,
         }
@@ -115,6 +127,7 @@ impl Compactor {
             point_cap: point_cap.clamp(1, u16::MAX as usize),
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
+            pass_wall_budget: DEFAULT_COMPACTION_PASS_WALL_BUDGET,
             next_segment_id: Some(next_segment_id),
             source: None,
         }
@@ -131,9 +144,19 @@ impl Compactor {
             point_cap: point_cap.clamp(1, u16::MAX as usize),
             l0_trigger: DEFAULT_L0_TRIGGER,
             l1_trigger: DEFAULT_L1_TRIGGER,
+            pass_wall_budget: DEFAULT_COMPACTION_PASS_WALL_BUDGET,
             next_segment_id: Some(next_segment_id),
             source: Some(source),
         }
+    }
+
+    /// Overrides the per-pass wall-clock budget.
+    ///
+    /// Tests set [`Duration::ZERO`] to pin the min-1 guarantee: an exhausted
+    /// budget must still let the first window of a backlogged level open.
+    #[cfg(test)]
+    pub(in crate::engine) fn set_pass_wall_budget(&mut self, budget: Duration) {
+        self.pass_wall_budget = budget;
     }
 
     /// Inventory to plan this round from.

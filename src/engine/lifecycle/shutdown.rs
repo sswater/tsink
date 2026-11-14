@@ -99,8 +99,13 @@ impl ChunkStorage {
                     obs.record_compaction_result(stats, elapsed_nanos_u64(started));
                 }
                 let mut changes = PendingPersistedSegmentDiff::default();
-                if stats.compacted {
-                    changes.record_changes(outcome.output_roots, outcome.source_roots);
+                if stats.compacted || !outcome.retired_roots.is_empty() {
+                    // Vanished window members are already gone from disk, but
+                    // they must still leave the inventory and the catalog,
+                    // otherwise every pass re-selects the same ghosts.
+                    let mut removed = outcome.source_roots;
+                    removed.extend(outcome.retired_roots);
+                    changes.record_changes(outcome.output_roots, removed);
                 }
                 Ok(changes)
             }

@@ -1,23 +1,28 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tempfile::TempDir;
 
 use super::{
     execution, finalize_pending_compaction_replacements, scan_inventory_from_disk,
-    CompactionInventorySource, Compactor,
+    CompactionInventorySource, CompactionOutcome, Compactor,
 };
 use crate::engine::chunk::{Chunk, ChunkHeader, ChunkPoint, ValueLane};
 use crate::engine::encoder::Encoder;
-use crate::engine::fs_utils::{count_segment_file_reads_under, CountingSegmentReads};
+use crate::engine::fs_utils::{
+    count_segment_file_reads_under, set_segment_file_read_hook, CountingSegmentReads,
+};
 use crate::engine::segment::{
-    load_segments, load_segments_for_level, SegmentWriter, WalHighWatermark,
+    load_segments, load_segments_for_level, read_segment_manifest, SegmentWriter, WalHighWatermark,
 };
 use crate::engine::series::{SeriesRegistry, SeriesValueFamily};
-use crate::engine::storage_engine::tiering::{PersistedSegmentTier, SegmentLaneFamily};
+use crate::engine::storage_engine::tiering::{
+    PersistedSegmentTier, SegmentInventory, SegmentInventoryEntry, SegmentLaneFamily,
+};
 use crate::engine::tombstone::{persist_tombstones, TombstoneRange, TOMBSTONES_FILE_NAME};
 use crate::{
     HistogramBucketSpan, HistogramCount, HistogramResetHint, Label, NativeHistogram, Value,
@@ -313,6 +318,11 @@ fn compactor_purges_tombstoned_points() {
 
 #[test]
 fn compaction_fails_when_any_source_segment_is_corrupted() {
+    // Historical name, narrowed semantics: a pass only loads the members of the
+    // selected *window* (plus, on the standalone disk-scan fallback used here,
+    // the manifests it plans from). This test pins that a corrupt source fails
+    // the round instead of being skipped like a vanished one; the injected
+    // inventory path is covered by `corrupt_window_member_still_fails_the_round`.
     let temp_dir = TempDir::new().unwrap();
     let registry = SeriesRegistry::new();
 
@@ -677,32 +687,237 @@ fn planning_reads_scale_with_window_not_inventory_size() {
 
     let source = CompactionInventorySource::default();
     source.set(Arc::new(move || inventory.clone()));
-    let compactor = Compactor::new_with_inventory_source(
+    let mut compactor = Compactor::new_with_inventory_source(
         temp_dir.path(),
         8,
         Arc::new(AtomicU64::new(100)),
         source,
     );
+    // One window per pass: this test measures what *planning a window* costs.
+    // A full drain of the same 12 segments legitimately loads all 12 (see
+    // `drain_loop_merges_until_below_trigger`), which is a different question.
+    compactor.set_pass_wall_budget(Duration::ZERO);
 
     let _guard = CountingSegmentReads::install(temp_dir.path());
     let outcome = compactor.compact_once_with_changes().unwrap();
     let reads = count_segment_file_reads_under(temp_dir.path());
 
     assert!(outcome.stats.compacted);
+    assert_eq!(outcome.stats.windows_merged, 1);
     assert_eq!(
         outcome.stats.source_segments, 4,
         "the trigger window is the first four candidates"
     );
     assert_eq!(
         reads,
-        4 * 5,
-        "only the four window members' five files may be read; an inventory of \
-         12 must not add scans (observed {reads})"
+        4 * 5 + 1,
+        "only the four window members' five files plus the one absorbed output \
+         manifest may be read; an inventory of 12 must not add scans (observed {reads})"
     );
+}
+
+#[test]
+fn drain_loop_merges_until_below_trigger() {
+    let temp_dir = TempDir::new().unwrap();
+    // Twelve disjoint L0 segments: one 4-segment window is not enough to get
+    // below the trigger line, so a single-window pass would leave a backlog.
+    write_non_overlapping_l0_segments(temp_dir.path(), 12);
+
+    // The wall-clock budget only exists to keep a pass from starving flush;
+    // give these drain assertions room so they do not depend on machine speed.
+    let mut compactor = Compactor::new(temp_dir.path(), 8);
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+    let stats = compactor.compact_once_with_stats().unwrap();
+
+    assert!(stats.compacted);
+    assert!(
+        stats.windows_merged >= 2,
+        "a backlogged L0 must drain over several windows in one pass, merged {}",
+        stats.windows_merged
+    );
+    let l0 = load_segments_for_level(temp_dir.path(), 0).unwrap();
+    assert!(
+        l0.len() < 4,
+        "the pass must end with L0 below the trigger line, {} segments left",
+        l0.len()
+    );
+    assert!(
+        !stats.source_above_trigger,
+        "nothing was left above the trigger line"
+    );
+    assert!(
+        load_segments_for_level(temp_dir.path(), 2)
+            .unwrap()
+            .is_empty(),
+        "three L1 outputs are below the L1 trigger, so nothing may reach L2"
+    );
+}
+
+#[test]
+fn wall_budget_stops_new_windows_but_first_window_always_runs() {
+    let temp_dir = TempDir::new().unwrap();
+    write_non_overlapping_l0_segments(temp_dir.path(), 12);
+
+    let mut compactor = Compactor::new(temp_dir.path(), 8);
+    compactor.set_pass_wall_budget(Duration::ZERO);
+    let stats = compactor.compact_once_with_stats().unwrap();
+
+    assert!(stats.compacted);
+    assert_eq!(
+        stats.windows_merged, 1,
+        "an exhausted budget must still open the first window (min-1 guarantee)"
+    );
+    assert!(
+        stats.source_above_trigger,
+        "eight L0 segments are still above the trigger after one window"
+    );
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 0).unwrap().len(),
+        8,
+        "exactly one window's worth of L0 segments may be consumed"
+    );
+}
+
+#[test]
+fn vanished_member_is_evicted_and_round_converges() {
+    let temp_dir = TempDir::new().unwrap();
+    let roots = write_non_overlapping_l0_segments(temp_dir.path(), 12);
+    let ghost_root = roots[1].clone();
+
+    // The planning inventory is the persisted index: it still lists the ghost
+    // until this pass's diff retires it. The test stands in for that diff by
+    // removing the reported roots from the inventory between rounds.
+    let live_inventory = Arc::new(Mutex::new(
+        scan_inventory_from_disk(temp_dir.path()).unwrap(),
+    ));
+    fs::remove_file(ghost_root.join("manifest.bin")).unwrap();
+
+    let source = CompactionInventorySource::default();
+    let provider_inventory = Arc::clone(&live_inventory);
+    source.set(Arc::new(move || provider_inventory.lock().unwrap().clone()));
+    let mut compactor = Compactor::new_with_inventory_source(
+        temp_dir.path(),
+        8,
+        Arc::new(AtomicU64::new(100)),
+        source,
+    );
+    // One window for round one, so the backlog survives into round two.
+    compactor.set_pass_wall_budget(Duration::ZERO);
+
+    let ghost_reads = Arc::new(AtomicUsize::new(0));
+    let read_counter = Arc::clone(&ghost_reads);
+    let ghost_prefix = ghost_root.clone();
+    let _hook = set_segment_file_read_hook(Some(Arc::new(move |path: &Path| {
+        if path.starts_with(&ghost_prefix) {
+            read_counter.fetch_add(1, Ordering::SeqCst);
+        }
+    })));
+
+    let first = compactor.compact_once_with_changes().unwrap();
+    assert_eq!(first.stats.windows_merged, 1);
+    assert_eq!(
+        first.retired_roots,
+        vec![ghost_root.clone()],
+        "the vanished member must be reported as a retired root"
+    );
+    assert!(
+        first.stats.source_above_trigger,
+        "the remaining L0 backlog still needs draining"
+    );
+    assert!(
+        ghost_reads.load(Ordering::SeqCst) > 0,
+        "round one had to try loading the ghost before it could retire it"
+    );
+
+    // The pass's diff flows out of the inventory: retired and merged roots
+    // leave, output roots enter.
+    let updated = apply_outcome_to_inventory(
+        live_inventory.lock().unwrap().clone(),
+        &first,
+        SegmentLaneFamily::Numeric,
+    );
+    *live_inventory.lock().unwrap() = updated;
+
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+    ghost_reads.store(0, Ordering::SeqCst);
+
+    let second = compactor.compact_once_with_changes().unwrap();
+    assert_eq!(
+        ghost_reads.load(Ordering::SeqCst),
+        0,
+        "an already-retired ghost must not be touched again"
+    );
+    assert!(
+        second.retired_roots.is_empty(),
+        "round two has no ghosts left: {:?}",
+        second.retired_roots
+    );
+    assert!(
+        second.stats.windows_merged >= 1,
+        "round two must drain the remaining L0 backlog"
+    );
+    assert!(!second.stats.source_above_trigger);
+    assert_eq!(
+        load_segments_for_level(temp_dir.path(), 0).unwrap().len(),
+        0,
+        "the backlog is fully drained and the ghost no longer loads"
+    );
+}
+
+#[test]
+fn same_pass_l1_outputs_are_visible_to_l1_to_l2() {
+    let temp_dir = TempDir::new().unwrap();
+    // Four L0 windows of four segments each produce four L1 outputs, which is
+    // exactly the L1 trigger: the same pass must then compact L1→L2 using the
+    // outputs it just wrote.
+    write_non_overlapping_l0_segments(temp_dir.path(), 16);
+
+    let mut compactor = Compactor::new(temp_dir.path(), 8);
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+    let stats = compactor.compact_once_with_stats().unwrap();
+
+    assert_eq!(
+        stats.windows_merged, 5,
+        "four L0 windows plus one L1→L2 window over their outputs"
+    );
+    assert!(load_segments_for_level(temp_dir.path(), 0)
+        .unwrap()
+        .is_empty());
+    assert!(load_segments_for_level(temp_dir.path(), 1)
+        .unwrap()
+        .is_empty());
+    let l2 = load_segments_for_level(temp_dir.path(), 2).unwrap();
+    assert_eq!(l2.len(), 1);
+    assert_eq!(l2[0].manifest.point_count, 16);
 }
 
 fn write_overlapping_l0_segments(root: &std::path::Path, count: u64) {
     let _ = write_l0_segment_roots(root, count, false);
+}
+
+/// Applies a pass outcome to an inventory the way `record_changes` does:
+/// retired and merged roots leave, output roots enter.
+fn apply_outcome_to_inventory(
+    inventory: SegmentInventory,
+    outcome: &CompactionOutcome,
+    lane: SegmentLaneFamily,
+) -> SegmentInventory {
+    let excluded = outcome
+        .retired_roots
+        .iter()
+        .chain(outcome.source_roots.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut entries = inventory.without_roots(&excluded).entries().to_vec();
+    for root in &outcome.output_roots {
+        entries.push(SegmentInventoryEntry {
+            lane,
+            tier: PersistedSegmentTier::Hot,
+            root: root.clone(),
+            manifest: read_segment_manifest(root).unwrap(),
+        });
+    }
+    SegmentInventory::from_entries(entries)
 }
 
 /// Writes `count` L0 segments whose time ranges all overlap.
