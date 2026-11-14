@@ -1456,6 +1456,73 @@ fn backlog_drain_keeps_up_with_write_triggered_production() {
     assert_eq!(stats.windows_merged, 0, "nothing is left to merge");
 }
 
+#[test]
+fn published_window_diff_survives_an_unreadable_absorbed_output() {
+    let temp_dir = TempDir::new().unwrap();
+    // Two windows of four: both publish, so both must report a diff.
+    write_non_overlapping_l0_segments(temp_dir.path(), 8);
+
+    // An explicit id allocator, like the storage path: the standalone
+    // `Compactor::new` fallback would allocate the next id with a strict
+    // full-lane load, which is a different (and here unwanted) way to notice
+    // the deliberately broken output.
+    let mut compactor =
+        Compactor::new_with_segment_id_allocator(temp_dir.path(), 8, Arc::new(AtomicU64::new(9)));
+    compactor.set_pass_wall_budget(Duration::from_secs(60));
+
+    // The only fallible in-memory step between "published on disk" and the diff
+    // callback is the planning view's read of a just-written output manifest.
+    // The read hook fires *before* the read, so deleting the file there makes
+    // that read fail exactly where production code has to stay best-effort.
+    let deletions = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&deletions);
+    let lane_root = temp_dir.path().to_path_buf();
+    let _hook = set_segment_file_read_hook(Some(Arc::new(move |path: &Path| {
+        let is_l1_manifest = path.starts_with(&lane_root)
+            && path.to_string_lossy().contains("/L1/")
+            && path.ends_with("manifest.bin");
+        if is_l1_manifest && counter.swap(1, Ordering::SeqCst) == 0 {
+            let _ = fs::remove_file(path);
+        }
+    })));
+
+    let capture = RoundCapture::run(&compactor).unwrap();
+
+    assert_eq!(
+        deletions.load(Ordering::SeqCst),
+        1,
+        "the fixture must have broken exactly one absorbed output"
+    );
+    assert_eq!(
+        capture.stats.windows_merged, 2,
+        "an unreadable absorbed output must not fail the round"
+    );
+    assert_eq!(
+        capture.windows.len(),
+        2,
+        "every published window must deliver its diff, even when absorbing its \
+         output into the planning view fails"
+    );
+    for (index, window) in capture.windows.iter().enumerate() {
+        assert_eq!(
+            window.removed_roots.len(),
+            4,
+            "window {index} must still report its sources as removed"
+        );
+        assert_eq!(
+            window.added_roots.len(),
+            1,
+            "window {index} must still report its replacement as added"
+        );
+    }
+    assert!(
+        load_segments_for_level(temp_dir.path(), 0)
+            .unwrap()
+            .is_empty(),
+        "both windows really were published on disk"
+    );
+}
+
 /// One round's outcome, rebuilt from the per-window callback.
 ///
 /// The round API reports each published window as it happens, so the tests can

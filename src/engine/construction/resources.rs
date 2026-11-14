@@ -140,3 +140,46 @@ impl ChunkStorage {
             })
     }
 }
+
+#[cfg(test)]
+mod pending_diff_tests {
+    use super::*;
+
+    const ROOT: &str = "lane_numeric/segments/L1/seg-0000000000000042";
+
+    /// The same-pass L0→L1→L2 chain hands the intermediate L1 root to two
+    /// different windows: the L0→L1 window adds it, the L1→L2 window removes it.
+    ///
+    /// The removed side must win, otherwise the persisted index keeps a
+    /// catalog entry for a segment this pass already deleted.
+    #[test]
+    fn removal_wins_for_a_root_added_by_an_earlier_window() {
+        let root = PathBuf::from(ROOT);
+        let mut diff = PendingPersistedSegmentDiff::default();
+
+        diff.record_changes([root.clone()], std::iter::empty());
+        assert_eq!(diff.added_roots, BTreeSet::from([root.clone()]));
+
+        diff.record_changes(std::iter::empty(), [root.clone()]);
+        assert!(
+            diff.added_roots.is_empty(),
+            "a removed root must leave the added side: {:?}",
+            diff.added_roots
+        );
+        assert_eq!(diff.removed_roots, BTreeSet::from([root]));
+    }
+
+    /// Within one call the ordering is explicit: every added root is inserted
+    /// first, then every removed root, so a root named in both lists ends up
+    /// removed.
+    #[test]
+    fn within_one_call_removed_wins_over_added_for_the_same_root() {
+        let root = PathBuf::from(ROOT);
+        let mut diff = PendingPersistedSegmentDiff::default();
+
+        diff.record_changes([root.clone()], [root.clone()]);
+
+        assert!(diff.added_roots.is_empty());
+        assert_eq!(diff.removed_roots, BTreeSet::from([root]));
+    }
+}

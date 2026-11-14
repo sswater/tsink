@@ -122,20 +122,55 @@ impl WorkingInventory {
     /// L2 outputs are not tracked because nothing in this pass plans from L2.
     /// Each L1 output costs one manifest read — bounded by the window size,
     /// never by the inventory size.
+    ///
+    /// All-or-nothing: every manifest is read before the working copy is
+    /// touched, so a failed read leaves the planning view exactly as it was
+    /// instead of half-applying the window. Callers on the publication path
+    /// treat the error as best effort (see [`absorb_published_outputs`]).
     fn absorb_outputs(&mut self, target: CompactionLevel, output_roots: &[PathBuf]) -> Result<()> {
         if !matches!(target, CompactionLevel::L1) {
             return Ok(());
         }
 
+        let mut absorbed = Vec::with_capacity(output_roots.len());
         for root in output_roots {
-            self.l1.push(PlanningCandidate {
+            absorbed.push(PlanningCandidate {
                 root: root.clone(),
                 manifest: read_segment_manifest(root)?,
             });
         }
+        self.l1.extend(absorbed);
         self.l1
             .sort_by_key(|candidate| candidate.manifest.segment_id);
         Ok(())
+    }
+}
+
+/// Absorbs a just-published window's outputs into the planning view, best effort.
+///
+/// By the time this runs the window is already published on disk (replacement
+/// marker applied, sources removed, outputs synced), so a failed manifest read
+/// here must not fail the round: doing so would drop the window's diff and
+/// leave the caller listing deleted sources — exactly the disk/index divergence
+/// this round's per-window callback exists to prevent.
+///
+/// Skipping the outputs only costs this pass: the same pass's later L1→L2 stage
+/// may not see them, and the next round plans from the refreshed persisted index
+/// (which received the diff and re-reads the manifests under its own error
+/// handling, surfacing real corruption there).
+fn absorb_published_outputs(
+    working: &mut WorkingInventory,
+    target: CompactionLevel,
+    output_roots: &[PathBuf],
+) {
+    if let Err(err) = working.absorb_outputs(target, output_roots) {
+        warn!(
+            target_level = ?target,
+            outputs = ?output_roots,
+            error = %err,
+            "Compaction window is published but its outputs could not be absorbed into \
+             the planning view; continuing without them so the window's diff is delivered"
+        );
     }
 }
 
@@ -308,7 +343,10 @@ impl Compactor {
         }
 
         working.remove_roots(source, &window_outcome.source_roots);
-        working.absorb_outputs(target, &window_outcome.output_roots)?;
+        // Best effort, and deliberately without `?`: the window is already
+        // published at this point, so a failed manifest read must not drop its
+        // diff. See `absorb_published_outputs`.
+        absorb_published_outputs(working, target, &window_outcome.output_roots);
 
         stats.compacted = true;
         stats.source_level.get_or_insert(level_to_u8(source));
@@ -321,11 +359,12 @@ impl Compactor {
         stats.output_points += window_outcome.stats.output_points;
         stats.windows_merged = stats.windows_merged.saturating_add(1);
 
-        // `record_changes` adds before it removes, so a root this window both
-        // published and consumed (the same L1 output in a later window) ends up
-        // on the removed side. That ordering is what lets L0→L1→L2 ride one
-        // accumulating diff: the intermediate L1 roots are added by their L0
-        // window and removed by the L1→L2 window.
+        // `record_changes` adds before it removes (pinned by the unit test in
+        // `construction::resources`), so a root this window both published and
+        // consumed ends up on the removed side. Cross-window, that is what lets
+        // L0→L1→L2 ride one accumulating diff: the intermediate L1 roots are
+        // added by their L0 window and removed by the L1→L2 window (pinned by
+        // `same_pass_intermediate_l1_roots_are_removed_after_being_added`).
         let mut diff = PendingPersistedSegmentDiff::default();
         let mut removed_roots = window_outcome.source_roots;
         removed_roots.append(&mut retired_roots);
@@ -522,5 +561,76 @@ pub(super) fn level_to_u8(level: CompactionLevel) -> u8 {
         CompactionLevel::L0 => 0,
         CompactionLevel::L1 => 1,
         CompactionLevel::L2 => 2,
+    }
+}
+
+#[cfg(test)]
+mod absorb_tests {
+    use super::*;
+
+    fn empty_working_inventory() -> WorkingInventory {
+        WorkingInventory {
+            l0: Vec::new(),
+            l1: Vec::new(),
+            skipped_l0: Vec::new(),
+            skipped_l1: Vec::new(),
+        }
+    }
+
+    /// The window is already published when this runs, so a manifest read
+    /// failure may not propagate: it must degrade to "not absorbed" and let the
+    /// caller deliver the window's diff.
+    #[test]
+    fn absorb_published_outputs_tolerates_unreadable_output() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let missing_root = temp_dir.path().join("segments/L1/seg-0000000000000099");
+
+        let mut working = empty_working_inventory();
+        absorb_published_outputs(
+            &mut working,
+            CompactionLevel::L1,
+            std::slice::from_ref(&missing_root),
+        );
+
+        assert!(
+            working.l1.is_empty(),
+            "a failed absorb must leave the planning view unchanged"
+        );
+    }
+
+    /// The same failure in the middle of a multi-output window must not
+    /// half-apply it: `absorb_outputs` reads every manifest before it touches
+    /// the working copy.
+    #[test]
+    fn absorb_published_outputs_is_all_or_nothing() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let missing_a = temp_dir.path().join("segments/L1/seg-0000000000000098");
+        let missing_b = temp_dir.path().join("segments/L1/seg-0000000000000099");
+
+        let mut working = empty_working_inventory();
+        let roots = [missing_a, missing_b];
+        absorb_published_outputs(&mut working, CompactionLevel::L1, &roots);
+
+        assert!(
+            working.l1.is_empty(),
+            "no output of a failed absorb may be partially applied"
+        );
+    }
+
+    /// L2 targets keep the early return: nothing in this pass plans from L2, so
+    /// there is nothing to absorb and nothing to read.
+    #[test]
+    fn absorb_published_outputs_skips_l2_targets() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let missing_root = temp_dir.path().join("segments/L2/seg-0000000000000097");
+
+        let mut working = empty_working_inventory();
+        absorb_published_outputs(
+            &mut working,
+            CompactionLevel::L2,
+            std::slice::from_ref(&missing_root),
+        );
+
+        assert!(working.l1.is_empty());
     }
 }
