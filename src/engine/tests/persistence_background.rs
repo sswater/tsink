@@ -1458,6 +1458,71 @@ fn dirty_known_diff_refresh_skips_full_inventory_scans_at_large_segment_counts()
 }
 
 #[test]
+fn stranded_known_diff_is_refreshed_without_dirty_flag() {
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let lane_path = temp_dir.path().join(NUMERIC_LANE_ROOT);
+    let labels = vec![Label::new("host", "a")];
+
+    let registry = SeriesRegistry::new();
+    let series_id = registry
+        .resolve_or_insert("stranded_known_diff_refresh_metric", &labels)
+        .unwrap()
+        .series_id;
+
+    write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 1, &[(1, 1.0)]);
+
+    let storage = new_raw_numeric_storage(lane_path.clone(), 2);
+    storage
+        .apply_loaded_segment_indexes(load_segment_indexes(&lane_path).unwrap(), false)
+        .unwrap();
+
+    let added_root =
+        write_numeric_segment_to_path(&lane_path, &registry, series_id, 0, 2, &[(2, 2.0)]);
+
+    // Reproduce the stranded state left behind when a producer merges a diff after
+    // the refresh path has already claimed the known diff: the diff is pending but
+    // the dirty flag is clear.
+    storage
+        .persisted
+        .pending_persisted_segment_diff
+        .lock()
+        .record_changes(std::iter::once(added_root.clone()), std::iter::empty());
+    assert!(
+        !storage
+            .persisted
+            .persisted_index_dirty
+            .load(Ordering::SeqCst),
+        "the stranded state must have the dirty flag clear",
+    );
+    assert!(
+        storage.has_known_persisted_segment_changes(),
+        "the stranded state must carry a known pending diff",
+    );
+
+    storage
+        .sync_persisted_segments_from_disk_if_dirty()
+        .unwrap();
+
+    assert!(
+        storage
+            .persisted
+            .persisted_index
+            .read()
+            .segments_by_root
+            .contains_key(&added_root),
+        "a known diff pending without the dirty flag must still be applied",
+    );
+    assert!(
+        !storage.has_known_persisted_segment_changes(),
+        "the stranded refresh should drain the pending root diff",
+    );
+
+    storage.close().unwrap();
+}
+
+#[test]
 fn dirty_persisted_refresh_waits_for_inflight_tombstone_visibility_publication() {
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;

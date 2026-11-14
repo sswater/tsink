@@ -200,14 +200,14 @@ impl ChunkStorage {
             }
         }
 
-        if !ctx.persisted_index_dirty() {
+        if !ctx.persisted_index_dirty() && !ctx.has_known_persisted_segment_changes() {
             return Ok(());
         }
 
         let Some(_refresh_claim) = ctx.try_claim_persisted_refresh() else {
             return Ok(());
         };
-        if !ctx.persisted_index_dirty() {
+        if !ctx.persisted_index_dirty() && !ctx.has_known_persisted_segment_changes() {
             return Ok(());
         }
 
