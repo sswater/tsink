@@ -87,6 +87,142 @@ where
     DirectorySyncHookGuard { _lock: lock }
 }
 
+#[cfg(test)]
+type SegmentFileReadHook = dyn Fn(&Path) + Send + Sync + 'static;
+
+#[cfg(test)]
+type SegmentFileReadHookSlot = std::sync::Mutex<Option<std::sync::Arc<SegmentFileReadHook>>>;
+
+/// RAII guard for the segment file read hook slot. Dropping it clears the
+/// installed hook and any counting state and releases the cross-test lock, so
+/// one test's instrumentation can never leak into another test.
+#[cfg(test)]
+pub(crate) struct ReadHookGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ReadHookGuard {
+    fn drop(&mut self) {
+        *segment_file_read_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+        *segment_read_counter_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+fn segment_file_read_hook_slot() -> &'static SegmentFileReadHookSlot {
+    static SEGMENT_FILE_READ_HOOK: std::sync::OnceLock<SegmentFileReadHookSlot> =
+        std::sync::OnceLock::new();
+    SEGMENT_FILE_READ_HOOK.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+fn segment_read_test_lock() -> &'static std::sync::Mutex<()> {
+    static SEGMENT_READ_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+    SEGMENT_READ_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
+struct SegmentReadCountingState {
+    prefix: PathBuf,
+    touched: std::collections::BTreeSet<PathBuf>,
+}
+
+#[cfg(test)]
+fn segment_read_counter_slot() -> &'static std::sync::Mutex<Option<SegmentReadCountingState>> {
+    static SEGMENT_READ_COUNTER: std::sync::OnceLock<
+        std::sync::Mutex<Option<SegmentReadCountingState>>,
+    > = std::sync::OnceLock::new();
+    SEGMENT_READ_COUNTER.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn notify_segment_file_read(path: &Path) {
+    let hook = segment_file_read_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_segment_file_read_hook(
+    hook: Option<std::sync::Arc<dyn Fn(&Path) + Send + Sync>>,
+) -> ReadHookGuard {
+    let lock = segment_read_test_lock()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *segment_file_read_hook_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = hook;
+    *segment_read_counter_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner()) = None;
+    ReadHookGuard { _lock: lock }
+}
+
+/// Counting variant of the segment file read hook: installs a hook that records
+/// which files under `prefix` were read while the returned guard is alive.
+///
+/// A path is counted once per guard no matter how many times it is notified:
+/// the loader notifies from its per-file chokepoint (`read_required_segment_file`)
+/// and from its higher-level entry points, so the metric means "these files were
+/// touched", which is what the planning/catalog "does not touch disk" assertions
+/// need.
+#[cfg(test)]
+pub(crate) struct CountingSegmentReads;
+
+#[cfg(test)]
+impl CountingSegmentReads {
+    pub(crate) fn install(prefix: &Path) -> ReadHookGuard {
+        let lock = segment_read_test_lock()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *segment_read_counter_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(SegmentReadCountingState {
+            prefix: prefix.to_path_buf(),
+            touched: std::collections::BTreeSet::new(),
+        });
+        *segment_file_read_hook_slot()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) =
+            Some(std::sync::Arc::new(|path: &Path| {
+                let mut slot = segment_read_counter_slot()
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if let Some(state) = slot.as_mut() {
+                    if path.starts_with(&state.prefix) {
+                        state.touched.insert(path.to_path_buf());
+                    }
+                }
+            }));
+        ReadHookGuard { _lock: lock }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn count_segment_file_reads_under(prefix: &Path) -> usize {
+    let slot = segment_read_counter_slot()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    match slot.as_ref() {
+        Some(state) => state
+            .touched
+            .iter()
+            .filter(|path| path.starts_with(prefix))
+            .count(),
+        None => 0,
+    }
+}
+
 pub(crate) fn path_exists_no_follow(path: &Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -651,5 +787,71 @@ mod transient_removal_tests {
             source: std::io::Error::from_raw_os_error(16),
         }));
         assert!(!is_transient_removal_busy_tsink_error(&TsinkError::MetricRequired));
+    }
+}
+
+#[cfg(test)]
+mod segment_read_hook_tests {
+    use super::*;
+
+    #[test]
+    fn counting_guard_counts_reads_under_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.bin"), b"x").unwrap();
+        let _guard = CountingSegmentReads::install(tmp.path());
+        // A plain `std::fs::read` does not go through the instrumented loader
+        // paths, so drive the hook directly to prove the guard is wired up.
+        let _ = std::fs::read(tmp.path().join("a.bin"));
+        super::notify_segment_file_read(&tmp.path().join("manifest.bin"));
+        assert_eq!(super::count_segment_file_reads_under(tmp.path()), 1);
+    }
+
+    #[test]
+    fn counting_guard_counts_each_touched_path_once() {
+        // The loader notifies from both its per-file chokepoint and its
+        // higher-level entry points, so the counter is a "which files were
+        // touched" set, not a raw event counter.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _guard = CountingSegmentReads::install(tmp.path());
+
+        let manifest = tmp.path().join("manifest.bin");
+        super::notify_segment_file_read(&manifest);
+        super::notify_segment_file_read(&manifest);
+        super::notify_segment_file_read(&tmp.path().join("series.bin"));
+        super::notify_segment_file_read(Path::new("/elsewhere/manifest.bin"));
+
+        assert_eq!(super::count_segment_file_reads_under(tmp.path()), 2);
+        assert_eq!(
+            super::count_segment_file_reads_under(&tmp.path().join("nested")),
+            0
+        );
+    }
+
+    #[test]
+    fn read_hook_guard_clears_hook_on_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let sink = Arc::clone(&calls);
+            let _guard = set_segment_file_read_hook(Some(Arc::new(move |_: &Path| {
+                sink.fetch_add(1, Ordering::SeqCst);
+            })));
+            notify_segment_file_read(Path::new("/data/seg-1/manifest.bin"));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+
+        notify_segment_file_read(Path::new("/data/seg-1/manifest.bin"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "guard drop must clear the installed hook"
+        );
+        assert_eq!(
+            count_segment_file_reads_under(Path::new("/data")),
+            0,
+            "guard drop must clear the counting state"
+        );
     }
 }

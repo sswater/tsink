@@ -164,6 +164,45 @@ fn metadata_helpers_round_trip_manifest_series_and_fingerprint() {
 }
 
 #[test]
+fn segment_read_paths_notify_the_file_read_hook() {
+    use crate::engine::fs_utils::set_segment_file_read_hook;
+    use std::sync::{Arc, Mutex};
+
+    let tmp = TempDir::new().unwrap();
+    let (registry, chunks_by_series) = sample_segment_input();
+    let writer = SegmentWriter::new(tmp.path(), 0, 1).unwrap();
+    writer.write_segment(&registry, &chunks_by_series).unwrap();
+    let root = writer.layout().root.clone();
+    let layout = writer.layout().clone();
+
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    let _hook = set_segment_file_read_hook(Some(Arc::new(move |path: &std::path::Path| {
+        sink.lock().unwrap().push(path.to_path_buf());
+    })));
+
+    read_segment_manifest(&root).unwrap();
+    read_segment_manifest_fingerprint(&root).unwrap();
+    load_segment_series_metadata(&root).unwrap();
+    load_segments(tmp.path()).unwrap();
+
+    let observed = observed.lock().unwrap().clone();
+    for expected in [
+        &layout.manifest_path,
+        &layout.series_path,
+        &layout.chunks_path,
+        &layout.chunk_index_path,
+        &layout.postings_path,
+    ] {
+        assert!(
+            observed.contains(expected),
+            "missing read notification for {}",
+            expected.display()
+        );
+    }
+}
+
+#[test]
 fn segment_writer_compresses_chunk_payloads_with_zstd() {
     let tmp = TempDir::new().unwrap();
     let registry = SeriesRegistry::new();

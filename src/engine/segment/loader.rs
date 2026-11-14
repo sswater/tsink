@@ -157,6 +157,8 @@ pub fn load_segment_index_with_series(
 pub(crate) fn load_segment_series_metadata(path: impl AsRef<Path>) -> Result<Vec<PersistedSeries>> {
     let root = path.as_ref();
     let layout = SegmentLayout::from_root(root.to_path_buf());
+    #[cfg(test)]
+    crate::engine::fs_utils::notify_segment_file_read(&layout.manifest_path);
     let manifest_bytes = read_required_segment_file(root, &layout.manifest_path)?;
     let parsed_manifest = parse_manifest(&manifest_bytes)?;
     let series_bytes = read_required_segment_file(root, &layout.series_path)?;
@@ -235,6 +237,8 @@ pub(crate) fn load_segment_indexes_from_dirs_startup_recoverable_with_series(
 pub fn read_segment_manifest(path: impl AsRef<Path>) -> Result<SegmentManifest> {
     let root = path.as_ref();
     let layout = SegmentLayout::from_root(root.to_path_buf());
+    #[cfg(test)]
+    crate::engine::fs_utils::notify_segment_file_read(&layout.manifest_path);
     let manifest_bytes = read_required_segment_file(root, &layout.manifest_path)?;
     let parsed_manifest = parse_manifest(&manifest_bytes)?;
     Ok(segment_manifest_from_parsed(&parsed_manifest))
@@ -245,6 +249,8 @@ pub(crate) fn read_segment_manifest_fingerprint(
 ) -> Result<SegmentContentFingerprint> {
     let root = path.as_ref();
     let layout = SegmentLayout::from_root(root.to_path_buf());
+    #[cfg(test)]
+    crate::engine::fs_utils::notify_segment_file_read(&layout.manifest_path);
     let manifest_bytes = read_required_segment_file(root, &layout.manifest_path)?;
     let parsed_manifest = parse_manifest(&manifest_bytes)?;
     Ok(segment_fingerprint_from_parsed_manifest(parsed_manifest))
@@ -587,6 +593,8 @@ fn map_required_segment_file_error(
 }
 
 fn read_required_segment_file(segment_root: &Path, path: &Path) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    crate::engine::fs_utils::notify_segment_file_read(path);
     fs::read(path).map_err(|err| map_required_segment_file_error(segment_root, path, err))
 }
 
