@@ -60,6 +60,7 @@ pub(in crate::engine::storage_engine::tests) use self::fixtures::{
 
 mod admission_control;
 mod capacity;
+mod close_pipeline;
 mod deletion;
 mod failure_modes;
 mod ingest_concurrency;

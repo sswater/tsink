@@ -59,6 +59,11 @@ impl<'a> LifecycleShutdownContext<'a> {
         self.observability
             .record_maintenance_error("close dirty persisted refresh", err);
     }
+
+    fn record_deferred_close_compaction(self, err: &TsinkError) {
+        self.observability
+            .record_maintenance_error("close compaction", err);
+    }
 }
 
 impl ChunkStorage {
@@ -149,7 +154,10 @@ impl ChunkStorage {
     fn execute_close_pipeline(&self) -> Result<()> {
         let shutdown = self.lifecycle_shutdown_context();
         let _background_maintenance_guard = shutdown.background_maintenance_gate();
-        let mut deferred_dirty_refresh = false;
+        // Any deferred step means the visible catalog may no longer match what
+        // compaction/refresh could verify, so the registry checkpoint must
+        // tolerate a catalog index that cannot be rebuilt from it.
+        let mut deferred_close_step = false;
         let _write_permits = shutdown.acquire_close_write_permits()?;
         self.flush_all_active()?;
         self.persist_segment()?;
@@ -157,7 +165,19 @@ impl ChunkStorage {
         if self.memory_budget_value() != usize::MAX {
             self.refresh_memory_usage();
         }
-        shutdown.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES)?;
+        // Compaction is not load-bearing for close: every published window's
+        // diff is already merged (per window, Task 8), the compaction marker
+        // protocol keeps the disk consistent, and restart discovery re-reads
+        // everything. So a failing round is deferred instead of aborting the
+        // pipeline — refresh, tombstones and the registry checkpoint still run.
+        if let Err(err) = shutdown.compact_until_settled(CLOSE_COMPACTION_MAX_PASSES) {
+            shutdown.record_deferred_close_compaction(&err);
+            tracing::warn!(
+                error = %err,
+                "Close deferred compaction; dirty refresh, tombstone persistence and the registry checkpoint continue"
+            );
+            deferred_close_step = true;
+        }
         if shutdown.persisted_index_dirty() || self.has_known_persisted_segment_changes() {
             if let Err(err) = self.refresh_dirty_persisted_segments_claimed() {
                 if Self::close_should_defer_dirty_refresh_error(&err) {
@@ -166,14 +186,14 @@ impl ChunkStorage {
                         error = %err,
                         "Close deferred dirty persisted refresh and kept the last visible catalog"
                     );
-                    deferred_dirty_refresh = true;
+                    deferred_close_step = true;
                 } else {
                     return Err(err);
                 }
             }
         }
         self.persist_tombstones_index()?;
-        if deferred_dirty_refresh {
+        if deferred_close_step {
             self.checkpoint_series_registry_index_allow_invalid_catalog()?;
         } else {
             self.checkpoint_series_registry_index()?;
